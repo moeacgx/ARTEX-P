@@ -79,14 +79,10 @@ type skillZipEntry struct {
 	name string
 }
 
-// skillZipEntries lists the archive's real files (no directory entries, no archiver
-// junk) with their names decoded to UTF-8.
+// skillZipEntries 保留文件与目录，去除打包软件残留，并将名称解码为 UTF-8。
 func skillZipEntries(zr *zip.Reader) []skillZipEntry {
 	out := make([]skillZipEntry, 0, len(zr.File))
 	for _, f := range zr.File {
-		if f.FileInfo().IsDir() {
-			continue
-		}
 		name := zipEntryName(f)
 		if strings.HasPrefix(name, "__MACOSX/") || strings.Contains(name, "/__MACOSX/") ||
 			path.Base(name) == ".DS_Store" {

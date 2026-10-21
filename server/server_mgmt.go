@@ -1325,7 +1325,7 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 	var skillMD *skillZipEntry
 	for i := range entriesAll {
 		e := &entriesAll[i]
-		if path.Base(e.name) != "SKILL.md" {
+		if e.f.FileInfo().IsDir() || path.Base(e.name) != "SKILL.md" {
 			continue
 		}
 		if skillMD == nil || strings.Count(e.name, "/") < strings.Count(skillMD.name, "/") {
@@ -1405,6 +1405,13 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dst := filepath.Join(tmp, clean)
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(dst, 0o755); err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+			continue
+		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			writeErr(w, 500, err.Error())
 			return

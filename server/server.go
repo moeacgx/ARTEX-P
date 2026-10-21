@@ -1017,6 +1017,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/skills", s.fsListSkills)
 	mux.HandleFunc("POST /api/skills", s.fsCreateSkill)
 	mux.HandleFunc("POST /api/skills/upload", s.fsUploadSkill)
+	mux.HandleFunc("GET /api/skills/{name}/download", s.fsDownloadSkill)
 	mux.HandleFunc("DELETE /api/skills/{name}", s.fsDeleteSkill)
 	mux.HandleFunc("GET /api/skills/missing", s.fsMissingSkills)   // 未命中(想调但不存在)的 skill 名
 	mux.HandleFunc("GET /api/skills/{name}/usage", s.fsSkillUsage) // 单个 skill 的最近调用

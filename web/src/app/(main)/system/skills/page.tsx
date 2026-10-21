@@ -45,6 +45,8 @@ import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import type { Agent, SkillItem, MCPServer, SkillCall, MissingSkill } from "@/lib/types";
 
+import { SkillDownloadButton, useSkillDownload } from "./skill-download-button";
+
 function fmtTime(ts?: string) {
   if (!ts) return "从未调用";
   return new Date(ts).toLocaleString("zh-CN", {
@@ -294,6 +296,7 @@ function SkillsOverview({
 
 // ── Page ──────────────────────────────────────────────────────────────────
 export default function SkillsPage() {
+  const { downloadSkill, downloadingSkills } = useSkillDownload();
   const [skills, setSkills] = React.useState<SkillItem[]>([]);
   const [agents, setAgents] = React.useState<Agent[]>([]);
   const [selected, setSelected] = React.useState<Selected | null>(null);
@@ -847,6 +850,11 @@ export default function SkillsPage() {
             <div className="max-w-5xl space-y-5">
               <div>
                 <h2 className="font-mono text-base font-semibold">{selectedSkill.name}</h2>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <SkillDownloadButton name={selectedSkill.name}
+                    downloading={downloadingSkills.has(selectedSkill.name)} onDownload={downloadSkill} />
+                  <span className="text-xs text-muted-foreground">整个技能目录打包为 ZIP，仅包含已保存的内容</span>
+                </div>
                 {selectedSkill.description && (
                   <p className="mt-1 text-sm text-muted-foreground">{selectedSkill.description}</p>
                 )}
@@ -961,14 +969,19 @@ export default function SkillsPage() {
 
           {selected && selected.path !== null && (
             <div className="flex h-full flex-col gap-2">
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                 <span className="font-medium text-foreground">{selected.skill}</span>
                 <span>/</span>
                 <span className="font-mono">{selected.path}</span>
-                <Button size="sm" className="ml-auto" onClick={saveFile} disabled={!dirty || saving}>
+                <span className="ml-auto">
+                  <SkillDownloadButton name={selected.skill}
+                    downloading={downloadingSkills.has(selected.skill)} onDownload={downloadSkill} />
+                </span>
+                <Button size="sm" onClick={saveFile} disabled={!dirty || saving}>
                   {saving ? "保存中…" : "保存"}
                 </Button>
               </div>
+              <p className="text-xs text-muted-foreground">打包下载整个技能目录，仅包含已保存的内容{dirty ? "；当前文件有未保存的修改" : ""}。</p>
               {fileLoading ? (
                 <p className="text-xs text-muted-foreground">加载中…</p>
               ) : (

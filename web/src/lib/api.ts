@@ -7,6 +7,7 @@ import type { ChatMention } from "@/lib/chat-mentions";
 import { type LLMProxyRequest, llmProxyWire } from "@/lib/llm-proxy";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
+import { downloadSkillArchive } from "@/lib/skill-download";
 import { type TaskProxyInput, validProxyRevision } from "@/lib/task-proxy";
 import type {
   ActiveFindingRetest,
@@ -1279,6 +1280,7 @@ export const api = {
 
   // ---- skills (文件系统) ----
   skills: () => get<{ skills: SkillItem[] }>("/skills").then((r) => arr(r.skills)),
+  downloadSkill: (name: string) => downloadSkillArchive(name, getToken()),
   createSkill: (s: {
     name: string;
     description: string;

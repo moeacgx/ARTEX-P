@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	builtinskills "github.com/Autumn-27/artex/skills"
 )
 
 // 在独立 schema 中验证首次安装与升级，避免改变测试数据库中的 Agent 偏好。
@@ -40,6 +41,78 @@ INSERT INTO agents(key) VALUES ('worker'),('auto'),('pentest'),('mainagent'),('p
 		t.Fatal(err)
 	}
 	return &Server{m: &Manager{pg: &db.DB{DB: pg}}, skillDir: filepath.Join(t.TempDir(), "skills")}
+}
+
+func TestBuiltinFOFASkillContentMigrationPreservesChoices(t *testing.T) {
+	for _, present := range []bool{false, true} {
+		t.Run(fmt.Sprintf("file_present_%v", present), func(t *testing.T) {
+			s := builtinSkillTestServer(t)
+			if err := s.m.pg.SetSetting(settingBuiltinFOFASkill, "done"); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(s.skillDir, "fofa-search", "SKILL.md")
+			const userBody = "用户保留的 FOFA 操作流程"
+			if present {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(userBody), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.seedFOFASkill(); err != nil {
+				t.Fatal(err)
+			}
+			if value, ok, err := s.m.pg.GetSetting(settingBuiltinFOFASkillContentV2); err != nil || !ok || value != "done" {
+				t.Fatalf("迁移未记录完成: value=%q present=%v err=%v", value, ok, err)
+			}
+			if present {
+				got, err := os.ReadFile(path)
+				if err != nil || string(got) != userBody {
+					t.Fatal("内容迁移覆盖了用户版本")
+				}
+			} else if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatal("内容迁移恢复了用户删除的 Skill")
+			}
+			var bindings int
+			if err := s.m.pg.QueryRow(`SELECT count(*) FROM agent_skill_visibility WHERE skill_name='fofa-search'`).Scan(&bindings); err != nil || bindings != 0 {
+				t.Fatalf("内容迁移恢复了用户解绑: count=%d err=%v", bindings, err)
+			}
+		})
+	}
+}
+
+func TestBuiltinFOFASkillContentMigrationFailureCanRetry(t *testing.T) {
+	s := builtinSkillTestServer(t)
+	if err := s.m.pg.SetSetting(settingBuiltinFOFASkill, "done"); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.skillDir, "fofa-search", "SKILL.md")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.seedFOFASkill(); err == nil {
+		t.Fatal("错误路径应使内容迁移失败")
+	}
+	if _, ok, err := s.m.pg.GetSetting(settingBuiltinFOFASkillContentV2); err != nil || ok {
+		t.Fatalf("失败迁移不能记录完成: present=%v err=%v", ok, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := builtinskills.InstallFOFA(s.skillDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.seedFOFASkill(); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok, err := s.m.pg.GetSetting(settingBuiltinFOFASkillContentV2); err != nil || !ok || value != "done" {
+		t.Fatalf("重试迁移未记录完成: value=%q present=%v err=%v", value, ok, err)
+	}
+	var bindings int
+	if err := s.m.pg.QueryRow(`SELECT count(*) FROM agent_skill_visibility WHERE skill_name='fofa-search'`).Scan(&bindings); err != nil || bindings != 0 {
+		t.Fatalf("重试迁移恢复了用户解绑: count=%d err=%v", bindings, err)
+	}
 }
 
 func assertFOFASkillSeeded(t *testing.T, s *Server) {

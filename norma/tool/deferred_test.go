@@ -72,12 +72,73 @@ func TestSearchExtraTools(t *testing.T) {
 	if !strings.Contains(r.Content[0].Text, "## echo") {
 		t.Fatalf("keyword search failed:\n%s", r.Content[0].Text)
 	}
-	// non-deferred name → not found (registry has it but it is not in deferred list)
+	// 非延迟工具应说明可以直接调用，不能错误地要求通过延迟工具入口执行。
 	reg2 := NewRegistry(echoTool())
 	search2 := NewSearchExtraTools(reg2, []string{"other"})
 	r, _ = search2.Call(context.Background(), json.RawMessage(`{"query":"select:echo"}`), nil)
-	if !strings.Contains(r.Content[0].Text, "No matching") {
-		t.Fatalf("non-deferred should not surface:\n%s", r.Content[0].Text)
+	if !strings.Contains(r.Content[0].Text, "## echo") || !strings.Contains(r.Content[0].Text, "直接调用") || !strings.Contains(r.Content[0].Text, "不要通过 "+ExecuteExtraToolName) {
+		t.Fatalf("原生工具应返回 schema 与直接调用说明:\n%s", r.Content[0].Text)
+	}
+}
+
+type namedDiscoveryTool struct {
+	CoreTool
+	name, description string
+}
+
+func (t namedDiscoveryTool) Name() string        { return t.name }
+func (t namedDiscoveryTool) Description() string { return t.description }
+
+func TestSearchExtraToolsFindsNativeBySelectAndKeywords(t *testing.T) {
+	native := namedDiscoveryTool{CoreTool: echoTool(), name: "fofa_search", description: "Search FOFA public assets"}
+	reg := NewRegistry(native, echoTool())
+	search := NewSearchExtraTools(reg, []string{"echo"})
+	for _, query := range []string{"select:fofa_search", "select:FOFA_SEARCH", "select:fofa", "fofa", "FOFA assets"} {
+		t.Run(query, func(t *testing.T) {
+			input, _ := json.Marshal(map[string]string{"query": query})
+			result, err := search.Call(context.Background(), input, nil)
+			text := result.Flatten()
+			if err != nil || result.IsError || !strings.Contains(text, "## fofa_search") || !strings.Contains(text, `"required":["msg"]`) || !strings.Contains(text, "直接调用") || !strings.Contains(text, "不要通过 "+ExecuteExtraToolName) {
+				t.Fatalf("原生工具检索错误: err=%v result=%s", err, text)
+			}
+		})
+	}
+	// 多词查询仍要求所有词命中，不因搜索原生工具而改变原有匹配规则。
+	result, _ := search.Call(context.Background(), json.RawMessage(`{"query":"fofa unavailable"}`), nil)
+	if strings.Contains(result.Flatten(), "## fofa_search") {
+		t.Fatal("多词查询错误地采用了任意词命中")
+	}
+}
+
+func TestSearchExtraToolsPrefersDeferredAndDoesNotUnlockNative(t *testing.T) {
+	native := namedDiscoveryTool{CoreTool: echoTool(), name: "fofa_search", description: "FOFA assets"}
+	deferred := namedDiscoveryTool{CoreTool: echoTool(), name: "mcp__assets__fofa", description: "FOFA assets"}
+	reg := NewRegistry(native, deferred)
+	search := NewSearchExtraTools(reg, []string{deferred.Name()})
+	for _, query := range []string{"fofa", "select:fofa_search,mcp__assets__fofa"} {
+		input, _ := json.Marshal(map[string]string{"query": query})
+		result, _ := search.Call(context.Background(), input, nil)
+		if !strings.Contains(result.Flatten(), "## mcp__assets__fofa") || strings.Contains(result.Flatten(), "## fofa_search") {
+			t.Fatalf("存在延迟工具匹配时应保持优先: %s", result.Flatten())
+		}
+	}
+	unlock := NewUnlockSet(deferred.Name())
+	result, _ := search.Call(context.Background(), json.RawMessage(`{"query":"select:fofa_search"}`), nil)
+	if !strings.Contains(result.Flatten(), "## fofa_search") {
+		t.Fatalf("精确原生工具查询失败: %s", result.Flatten())
+	}
+	result, _ = NewExecuteExtraTool(reg, unlock).Call(context.Background(), json.RawMessage(`{"tool_name":"fofa_search","params":{"msg":"test"}}`), nil)
+	if !result.IsError || !strings.Contains(result.Flatten(), "not unlocked") || unlock.Has(native.Name()) {
+		t.Fatalf("搜索原生工具不应扩大延迟工具执行权限: %s", result.Flatten())
+	}
+}
+
+func TestSearchExtraToolsMissingDoesNotInferCredentialState(t *testing.T) {
+	search := NewSearchExtraTools(NewRegistry(echoTool()), []string{"echo"})
+	result, err := search.Call(context.Background(), json.RawMessage(`{"query":"fofa"}`), nil)
+	text := result.Flatten()
+	if err != nil || result.IsError || !strings.Contains(text, "当前工具名单") || !strings.Contains(text, "不能据此推断 API Key") {
+		t.Fatalf("未匹配结果需要准确说明证据边界: err=%v result=%s", err, text)
 	}
 }
 

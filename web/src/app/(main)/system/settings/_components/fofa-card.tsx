@@ -13,14 +13,22 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { type FofaConfig, fofaAPI, fofaConnectionTestInput, fofaSettingsPatch } from "@/lib/fofa-api";
+import {
+  type FofaConfig,
+  fofaAPI,
+  fofaConnectionTestInput,
+  fofaSettingsPatch,
+  fofaSettingsStatus,
+} from "@/lib/fofa-api";
 
 export function FofaCard() {
   const [config, setConfig] = React.useState<FofaConfig | null>(null);
   const [enabled, setEnabled] = React.useState(false);
   const [apiKey, setApiKey] = React.useState("");
   const [loadError, setLoadError] = React.useState("");
-  const [action, setAction] = React.useState<"load" | "save" | "clear" | "test" | null>("load");
+  const [action, setAction] = React.useState<"load" | "save" | "save-enable" | "enable" | "clear" | "test" | null>(
+    "load",
+  );
   const locked = React.useRef(false);
 
   const applyConfig = React.useCallback((value: FofaConfig) => {
@@ -49,16 +57,36 @@ export function FofaCard() {
     void load();
   }, [load]);
 
-  const save = async () => {
+  const save = async (activate = false) => {
     if (locked.current || !config) return;
     locked.current = true;
-    setAction("save");
+    setAction(activate ? "save-enable" : "save");
     try {
-      const patch = fofaSettingsPatch(config, enabled, apiKey);
-      applyConfig(await fofaAPI.save(patch));
-      toast.success("已保存 FOFA 配置");
+      const patch = fofaSettingsPatch(config, activate || enabled, apiKey);
+      const value = await fofaAPI.save(patch);
+      applyConfig(value);
+      toast.success(value.enabled ? "已保存 FOFA 配置并启用工具" : "已保存 FOFA 配置；工具尚未启用");
     } catch (error) {
       toast.error(`保存失败：${(error as Error).message}`);
+    } finally {
+      locked.current = false;
+      setAction(null);
+    }
+  };
+
+  const enableSaved = async () => {
+    if (locked.current || !config) return;
+    locked.current = true;
+    setAction("enable");
+    try {
+      const value = await fofaAPI.enable(config);
+      setConfig(value);
+      setEnabled(value.enabled);
+      // 启用已保存 Key 时保留尚未保存的新 Key 草稿。
+      if (value.enabled) toast.success("已启用 FOFA；可通过测试连接确认 Key 是否有效");
+      else toast.error("服务端尚未确认启用 FOFA，请重新读取配置");
+    } catch (error) {
+      toast.error(`启用失败：${(error as Error).message}`);
     } finally {
       locked.current = false;
       setAction(null);
@@ -86,7 +114,14 @@ export function FofaCard() {
     setAction("test");
     try {
       const result = await fofaAPI.test(fofaConnectionTestInput(config, apiKey));
-      toast.success(result.message || "FOFA 连接测试成功");
+      const message = result.message || "FOFA 连接测试成功";
+      if (!config.enabled) {
+        toast.success(`${message}；FOFA 尚未启用，请保存并启用，或一键启用已保存的 Key`);
+      } else if (apiKey.trim()) {
+        toast.success(`${message}；本次测试的新 Key 尚未保存`);
+      } else {
+        toast.success(message);
+      }
     } catch (error) {
       toast.error(`连接测试失败：${(error as Error).message}`);
     } finally {
@@ -98,6 +133,8 @@ export function FofaCard() {
   const busy = action !== null;
   const hasKey = !!config?.api_key_set || apiKey.trim() !== "";
   const changed = !!config && (enabled !== config.enabled || apiKey.trim() !== "");
+  const status = config ? fofaSettingsStatus(config) : "unconfigured";
+  const statusLabel = { unconfigured: "未配置", disabled: "Key 已保存，尚未启用", enabled: "已启用" }[status];
 
   return (
     <Card className="mb-4 break-inside-avoid md:mb-6">
@@ -128,6 +165,33 @@ export function FofaCard() {
         )}
         {!loadError && config && (
           <>
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-muted-foreground text-sm">当前已保存状态</span>
+                <Badge variant={status === "enabled" ? "secondary" : "outline"}>{statusLabel}</Badge>
+              </div>
+              {status === "disabled" && (
+                <div
+                  role="status"
+                  className="flex flex-col gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3"
+                >
+                  <p className="text-sm leading-relaxed">
+                    FOFA 总开关已关闭，Agent 目前不能搜索资产。保存 Key 或测试连接不会自动启用工具。
+                  </p>
+                  <Button type="button" onClick={() => void enableSaved()} disabled={busy} className="self-start">
+                    {action === "enable" ? "启用中…" : "一键启用 FOFA"}
+                  </Button>
+                  <p className="text-muted-foreground text-xs">
+                    此操作仅启用已保存的 Key，不保存当前输入，也不执行搜索。
+                  </p>
+                </div>
+              )}
+              {status === "enabled" && (
+                <p className="text-muted-foreground text-xs leading-relaxed">
+                  总开关已开启。API Key 的有效性尚需通过「测试连接」确认，实际搜索还受账号权限与额度限制。
+                </p>
+              )}
+            </div>
             <div className="flex items-center justify-between gap-4">
               <Label htmlFor="fofa-enabled" className="font-normal text-sm">
                 启用 FOFA 工具
@@ -140,14 +204,14 @@ export function FofaCard() {
                 aria-describedby="fofa-key-help"
               />
             </div>
+            {enabled !== config.enabled && (
+              <p className="text-muted-foreground text-xs">开关修改尚未保存，点击「保存配置」后生效。</p>
+            )}
             <div className="flex flex-col gap-2">
               <div className="flex items-center gap-2">
                 <Label htmlFor="fofa-api-key" className="font-normal text-muted-foreground text-sm">
                   API Key
                 </Label>
-                <Badge variant={config.api_key_set ? "secondary" : "outline"}>
-                  {config.api_key_set ? "已配置" : "未配置"}
-                </Badge>
               </div>
               <Input
                 id="fofa-api-key"
@@ -185,7 +249,17 @@ export function FofaCard() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <Button type="button" onClick={() => void save()} disabled={busy || !changed || (enabled && !hasKey)}>
+              {!config.enabled && apiKey.trim() !== "" && (
+                <Button type="button" onClick={() => void save(true)} disabled={busy}>
+                  {action === "save-enable" ? "保存并启用中…" : "保存并启用"}
+                </Button>
+              )}
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void save()}
+                disabled={busy || !changed || (enabled && !hasKey)}
+              >
                 {action === "save" ? "保存中…" : "保存配置"}
               </Button>
               <Button

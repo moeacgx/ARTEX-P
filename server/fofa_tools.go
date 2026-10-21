@@ -17,7 +17,7 @@ func fofaSchema() map[string]any {
 		"query":  strParam("FOFA 查询语句，例如 domain=\"example.com\"；必须符合当前任务范围，最多4096字节"),
 		"page":   map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "default": 1, "description": "页码；仅请求本页，不自动翻页"},
 		"size":   map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "每页数量，默认20，最多100；实际消耗受FOFA账号规则限制"},
-		"fields": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选字段：host,ip,port,protocol,domain,title,server,country,country_name,region,city,as_number,as_organization,icp；默认host,ip,port,protocol,title"},
+		"fields": map[string]any{"type": "array", "minItems": 0, "maxItems": 14, "items": map[string]any{"type": "string"}, "description": "可选字段：host,ip,port,protocol,domain,title,server,country,country_name,region,city,as_number,as_organization,icp；省略或空数组使用默认host,ip,port,protocol,title"},
 	}, "query")
 }
 
@@ -62,24 +62,31 @@ func (s *Server) fofaTool() actool.CoreTool {
 
 // 每轮装配读取配置，保存后无需重启。调用时再次核验，已装配的旧工具也不能越过禁用。
 func (s *Server) fofaTools() []actool.CoreTool {
+	tools := []actool.CoreTool{s.fofaStatusTool()}
 	if s.m == nil || s.m.pg == nil {
-		return nil
+		return tools
 	}
 	c, err := s.m.pg.FOFAConfig()
 	if err != nil || !c.Enabled || c.APIKey == "" {
-		return nil
+		return tools
 	}
-	return []actool.CoreTool{s.fofaTool()}
+	return append(tools, s.fofaTool())
 }
 
 func (s *Server) seedFOFATool() error {
-	t := s.fofaTool()
-	schema, err := json.Marshal(t.InputSchema())
-	if err != nil {
-		return err
+	for _, t := range []actool.CoreTool{s.fofaTool(), s.fofaStatusTool()} {
+		schema, err := json.Marshal(t.InputSchema())
+		if err != nil {
+			return err
+		}
+		if err := s.m.pg.SeedTool(t.Name(), t.Description(), schema, json.RawMessage(`["worker","auto","pentest"]`)); err != nil {
+			return err
+		}
 	}
-	return s.m.pg.SeedTool(t.Name(), t.Description(), schema, json.RawMessage(`["worker","auto","pentest"]`))
+	return nil
 }
+
+func isFOFATool(name string) bool { return name == "fofa_search" || name == "fofa_status" }
 
 // 持有真实 IO 引用到读取和关闭响应结束。只跳过本地明文录制，绝不跳过既有出口策略。
 func (s *Server) admittedFOFAClient(ctx context.Context, key string) (*fofa.Client, func(), error) {
@@ -130,13 +137,17 @@ func (t authorizedFOFATool) Call(ctx context.Context, in json.RawMessage, tc *ac
 	if ctx.Err() != nil {
 		return actool.Errorf("FOFA 查询已取消"), nil
 	}
-	row, err := t.pg.GetTool("fofa_search")
+	row, err := t.pg.GetTool(t.Name())
 	if err != nil || row == nil || !row.System || !row.Enabled || !contains(row.Agents, t.agentKey) {
 		return actool.Errorf("当前 Agent 未获 FOFA 工具权限或工具已禁用"), nil
 	}
 	// 在默认值重编码和计量前验证原始输入，避免重复键或 null 被装饰器消掉。
-	if len(in) > 16384 || decodeProxyToolInput(in, fofaSchema(), nil) != nil {
+	schema := fofaSchema()
+	if t.Name() == "fofa_status" {
+		schema = objSchema(map[string]any{})
+	}
+	if len(in) > 16384 || decodeProxyToolInput(in, schema, nil) != nil {
 		return actool.Errorf("FOFA 查询参数无效；不要传入令牌或自定义接口地址"), nil
 	}
-	return t.CoreTool.Call(ctx, in, tc)
+	return t.CoreTool.Call(context.WithValue(ctx, fofaAgentContextKey{}, t.agentKey), in, tc)
 }

@@ -9,6 +9,7 @@ import (
 )
 
 const settingBuiltinFOFASkill = "builtin_skill_fofa_search_v1"
+const settingBuiltinFOFASkillContentV2 = "builtin_skill_fofa_search_content_v2"
 const builtinFOFASkillLock int64 = 7337741017
 
 // seedFOFASkill 将内置说明安装到实际 SkillDir，并且只在首次成功时绑定默认 Agent。
@@ -30,25 +31,39 @@ func (s *Server) seedFOFASkill() error {
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if value == "done" {
-		return nil
-	}
-	if err := builtinskills.InstallFOFA(s.skillDir); err != nil {
-		return err
-	}
-	for _, key := range []string{"worker", "auto", "pentest"} {
-		var agentID int64
-		if err := tx.QueryRow(`SELECT id FROM agents WHERE key=$1`, key).Scan(&agentID); err != nil {
-			return fmt.Errorf("查询 FOFA Skill 默认 Agent %s: %w", key, err)
+	if value != "done" {
+		if err := builtinskills.InstallFOFA(s.skillDir); err != nil {
+			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO agent_skill_visibility(agent_id,skill_name,enabled)
+		for _, key := range []string{"worker", "auto", "pentest"} {
+			var agentID int64
+			if err := tx.QueryRow(`SELECT id FROM agents WHERE key=$1`, key).Scan(&agentID); err != nil {
+				return fmt.Errorf("查询 FOFA Skill 默认 Agent %s: %w", key, err)
+			}
+			if _, err := tx.Exec(`INSERT INTO agent_skill_visibility(agent_id,skill_name,enabled)
 VALUES ($1,'fofa-search',true) ON CONFLICT (agent_id,skill_name) DO NOTHING`, agentID); err != nil {
-			return fmt.Errorf("绑定 FOFA Skill 到 %s: %w", key, err)
+				return fmt.Errorf("绑定 FOFA Skill 到 %s: %w", key, err)
+			}
+		}
+		if _, err := tx.Exec(`INSERT INTO settings(key,value) VALUES ($1,'done')
+ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, settingBuiltinFOFASkill); err != nil {
+			return err
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO settings(key,value) VALUES ($1,'done')
-ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, settingBuiltinFOFASkill); err != nil {
+	// 内容升级独立于首次绑定，不能借升级恢复用户删除或解绑的 Skill。
+	value = ""
+	err = tx.QueryRow(`SELECT value FROM settings WHERE key=$1`, settingBuiltinFOFASkillContentV2).Scan(&value)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
+	}
+	if value != "done" {
+		if err := builtinskills.UpgradeFOFA(s.skillDir); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO settings(key,value) VALUES ($1,'done')
+ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`, settingBuiltinFOFASkillContentV2); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

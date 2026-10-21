@@ -2,7 +2,9 @@
 
 ## 配置
 
-在「系统设置 → FOFA 资产搜索」填写 API Key，测试连接，开启并保存配置。
+在「系统设置 → FOFA 资产搜索」填写 API Key，点击「保存并启用」。
+也可以仅「保存配置」而不启用；已保存但关闭时，页面会突出显示状态并提供「一键启用 FOFA」。
+一键启用仅修改开关，保留已保存 Key 和尚未保存的输入草稿，不发起搜索。
 只需 API Key，不要求邮箱。测试按钮优先使用当前输入，输入为空时使用已保存的 Key；
 只调用账户接口，不发起资产搜索，也不保存草稿。
 
@@ -12,13 +14,22 @@
 
 ## Agent 与 Skill
 
-`fofa_search` 和 `fofa-search` Skill 首次安装默认绑定 `worker`、`auto`、`pentest`。
+`fofa_search`、`fofa_status` 和 `fofa-search` Skill 首次安装默认绑定 `worker`、`auto`、`pentest`。
 可以在「工具」修改启用/Agent 绑定，在「Skills」管理技能可见性。
-全局开关关闭或未保存 Key 时，运行时不会提供 FOFA 工具；调用已装配的旧工具也会再次检查开关和绑定。
+全局开关关闭或未保存 Key 时，运行时不会提供 `fofa_search`，已绑定的 `fofa_status` 仍可查询原因。
+两个工具都是原生工具，直接调用；`SearchExtraTools` 没有匹配到延迟工具时也会提示匹配的原生工具及其直接调用方式。
+检索无匹配不能证明未配置 Key，历史验收文字也不能代替当前状态。
+调用已装配的旧工具会再次检查目录、启用和绑定；搜索还会重读集成开关。
 配置保存后下一次工具装配生效，无需重启。主 Agent 保持编排角色，需要查询时派发给 Worker。
+
+`fofa_status({})` 只读取本地配置，不联网、不消耗搜索额度，也不返回 Key。
+结果包含 `integration_enabled`、`api_key_set`、`search_tool_enabled`、`agent_bound`、
+`search_tool_available` 和 `reason/message`；可用仅表示本地配置及当前 Agent 绑定满足条件，
+不代表上游鉴权、剩余额度或出口已经验证。读取失败明确返回错误，不伪装成未配置。
 
 技能嵌入二进制，在线更新无需另行复制文件。安装到配置的 SkillDir，安装成功后记录一次性标记；
 后续重启不会覆盖用户修改、重新创建被删除技能或恢复已解绑的默认 Agent。
+本次内容升级仅替换与旧官方正文摘要匹配的未修改文件，兼容 CRLF；内容迁移不重新执行默认绑定。
 文件安装/绑定失败不会登记成功，修正后重启可重试。
 
 ## 查询
@@ -30,6 +41,7 @@
 - 页码为 1–100，默认 1；每页 1–100 条，默认 20。单次只查一页，不自动重试或翻页。
 - 返回 `query/page/size/total/fields/results/has_more`；`total` 是 FOFA 命中总数，`results` 是实际返回的结构化行。
 - 支持 `host/ip/port/protocol/domain/title/server/country/country_name/region/city/as_number/as_organization/icp`。
+- `fields` 接受最多 14 项字符串数组；省略或空数组使用默认字段，`null` 和非字符串元素会明确报参数错误。
 - 固定官方 HTTPS 入口，禁止重定向；30 秒请求上限，响应最多 2 MiB。上游权限与额度限制仍适用。
 - 搜索遵守当前任务范围。收录数据可能过期，仅作为线索；不自动访问命中目标、不自动入库，不能单独当作资产归属或漏洞证据。
 
@@ -47,6 +59,8 @@
 
 新增客户端测试只访问本地受控 TLS 服务。数据库测试使用隔离 PostgreSQL；
 真实工具链回归覆盖任务代理、开启录制但零凭据流量、结束凭证拒绝、绑定撤销、损坏密钥、取消释放及升级安装。
+显式字段回归经过真实装配、参数默认值装饰、权限检查和本地 CONNECT/TLS 上游；
+真实 `Chat` 回归覆盖同会话配置变化、工具重新装配及只读状态调用。
 前端有 API 测试与 `web/src/lib/fofa-settings.browser.mjs` 浏览器模拟交互脚本。
 
 协议来源：FOFA 官方 `fofapro/fofa-py` 的 `fofa/client.py`（`/api/v1/search/all` 与 `/api/v1/info/my`）。

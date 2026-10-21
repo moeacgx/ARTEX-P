@@ -85,7 +85,9 @@ jobs:
         run: |
           timeout 60s go test ./integrations/fofa ./skills -count=1 -timeout 60s
           timeout 60s go test ./db -run '^TestFOFAConfig' -count=1 -timeout 60s
-          timeout 60s go test ./server -run '^(TestFOFA|TestBuiltinFOFASkill)' -count=1 -timeout 60s
+          timeout 60s go test ./server -run '^(TestFOFA|TestBuiltinFOFASkill|TestProxyJSONOptionalConstraints|TestProxyToolsStrictArguments)' -count=1 -timeout 60s
+          cd norma
+          timeout 60s go test ./tool ./agentcore -run '^(TestSearchExtraTools|TestNativeToolDiscoveryKeepsDirectSchemaAndExecutionBoundary|TestExecuteExtraTool|TestDeferred)' -count=1 -timeout 60s
       - name: 重启恢复及出口引用回归
         run: |
           timeout 60s go test ./server -run '^(TestPlannerPGRestart|TestPlannerPGUnavailableResolver|TestPlannerPGProxyRecovers|TestPlannerPGLeaseRecovery|TestPlannerPGRetryHonors|TestPlannerPGGracefulRestart|TestServerShutdown)' -count=1 -timeout 60s

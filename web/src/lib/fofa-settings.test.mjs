@@ -1,11 +1,53 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { fofaAPI, fofaConnectionTestInput, fofaSettingsPatch } from "./fofa-api.ts";
+import * as fofa from "./fofa-api.ts";
+
+const { fofaAPI, fofaConnectionTestInput, fofaSettingsPatch } = fofa;
 
 const originalFetch = globalThis.fetch;
 test.afterEach(() => {
   globalThis.fetch = originalFetch;
+});
+
+test("已保存 Key 但关闭总开关时，状态必须仍为未启用", () => {
+  assert.equal(fofa.fofaSettingsStatus({ enabled: false, api_key_set: true }), "disabled");
+  assert.equal(fofa.fofaSettingsStatus({ enabled: false, api_key_set: false }), "unconfigured");
+  assert.equal(fofa.fofaSettingsStatus({ enabled: true, api_key_set: true }), "enabled");
+  assert.equal(fofa.fofaSettingsStatus({ enabled: true, api_key_set: false }), "unconfigured");
+});
+
+test("单纯保存首个 Key 不自动启用，只有明确保存并启用才开启", async () => {
+  const config = { enabled: false, api_key_set: false };
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push({ url, method: init.method, body });
+    return Response.json({ enabled: body.enabled, api_key_set: true });
+  };
+  const saved = await fofaAPI.save(fofaSettingsPatch(config, false, "synthetic-first-key"));
+  assert.equal(fofa.fofaSettingsStatus(saved), "disabled");
+  const enabled = await fofaAPI.save(fofaSettingsPatch(config, true, "synthetic-first-key"));
+  assert.equal(fofa.fofaSettingsStatus(enabled), "enabled");
+  assert.deepEqual(calls, [
+    { url: "/api/integrations/fofa", method: "PUT", body: { enabled: false, api_key: "synthetic-first-key" } },
+    { url: "/api/integrations/fofa", method: "PUT", body: { enabled: true, api_key: "synthetic-first-key" } },
+  ]);
+});
+
+test("一键启用只提交开关，保留已保存 Key 且不测试或搜索", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, method: init.method, body: JSON.parse(init.body) });
+    return Response.json({ enabled: true, api_key_set: true });
+  };
+  await fofaAPI.enable({ enabled: false, api_key_set: true });
+  assert.deepEqual(calls, [{ url: "/api/integrations/fofa", method: "PUT", body: { enabled: true } }]);
+});
+
+test("配置未知或尚无已保存 Key 时，不能通过一键启用绕过检查", () => {
+  assert.throws(() => fofaAPI.enable(null), /先.*读取/);
+  assert.throws(() => fofaAPI.enable({ enabled: false, api_key_set: false }), /保存.*Key/);
 });
 
 test("读取 FOFA 配置不缓存，只返回开关与密钥存在状态", async () => {

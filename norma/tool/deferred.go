@@ -99,6 +99,7 @@ func RenderDeferredToolsBlock(names []string) string {
 // NewSearchExtraTools builds the always-loaded discovery tool. deferred is the set
 // of tool names whose schemas are withheld; the tool searches those names in reg
 // and returns each match's name + description + params schema.
+// 没有延迟工具匹配时，提示当前注册表中可直接调用的原生工具，不改变解锁权限。
 func NewSearchExtraTools(reg *Registry, deferred []string) CoreTool {
 	deferredSet := make(map[string]bool, len(deferred))
 	for _, n := range deferred {
@@ -109,7 +110,7 @@ func NewSearchExtraTools(reg *Registry, deferred []string) CoreTool {
 	return Build(Spec{
 		Name: SearchExtraToolsName,
 		Description: "Discover deferred tools (not in your tool list) and get their schemas, then invoke via " +
-			ExecuteExtraToolName + ". Query forms: \"select:Name\" exact, \"select:A,B\" multiple, or free keywords to match name/description.",
+			ExecuteExtraToolName + ". If no deferred tool matches, matching native tools already in your tool list are returned with direct-call instructions. Query forms: \"select:Name\" exact, \"select:A,B\" multiple, or free keywords to match name/description.",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -135,8 +136,9 @@ func NewSearchExtraTools(reg *Registry, deferred []string) CoreTool {
 			}
 			var matches []CoreTool
 			seen := map[string]bool{}
+			searchNames, searchSet := ordered, deferredSet
 			addByFullName := func(name string) {
-				if seen[name] || !deferredSet[name] {
+				if seen[name] || !searchSet[name] {
 					return
 				}
 				if t, ok := reg.Get(name); ok {
@@ -160,7 +162,7 @@ func NewSearchExtraTools(reg *Registry, deferred []string) CoreTool {
 				}
 				// 2. suffix / substring match (case-insensitive) for short names
 				lower := strings.ToLower(token)
-				for _, name := range ordered {
+				for _, name := range searchNames {
 					lname := strings.ToLower(name)
 					// match if full name equals, ends with __token, or contains token
 					if lname == lower ||
@@ -170,41 +172,64 @@ func NewSearchExtraTools(reg *Registry, deferred []string) CoreTool {
 					}
 				}
 			}
-			if strings.HasPrefix(q, "select:") {
-				for _, part := range strings.Split(strings.TrimPrefix(q, "select:"), ",") {
-					addByQuery(part)
-				}
-			} else {
-				// Multi-token keyword search: every space-separated token must appear
-				// in the normalised haystack (__ replaced by space for MCP tool names).
-				tokens := strings.Fields(strings.ToLower(q))
-				for _, name := range ordered {
-					t, ok := reg.Get(name)
-					if !ok {
-						continue
+			search := func() {
+				if strings.HasPrefix(q, "select:") {
+					for _, part := range strings.Split(strings.TrimPrefix(q, "select:"), ",") {
+						addByQuery(part)
 					}
-					// normalise __ → space so "scopesentry list_projects" finds
-					// "mcp__scopesentry__list_projects".
-					haystack := strings.ReplaceAll(
-						strings.ToLower(t.Name()+" "+t.Description()), "__", " ")
-					allMatch := true
-					for _, tok := range tokens {
-						if !strings.Contains(haystack, tok) {
-							allMatch = false
-							break
+				} else {
+					// Multi-token keyword search: every space-separated token must appear
+					// in the normalised haystack (__ replaced by space for MCP tool names).
+					tokens := strings.Fields(strings.ToLower(q))
+					for _, name := range searchNames {
+						t, ok := reg.Get(name)
+						if !ok {
+							continue
+						}
+						// normalise __ → space so "scopesentry list_projects" finds
+						// "mcp__scopesentry__list_projects".
+						haystack := strings.ReplaceAll(
+							strings.ToLower(t.Name()+" "+t.Description()), "__", " ")
+						allMatch := true
+						for _, tok := range tokens {
+							if !strings.Contains(haystack, tok) {
+								allMatch = false
+								break
+							}
+						}
+						if allMatch {
+							addByFullName(name)
 						}
 					}
-					if allMatch {
-						addByFullName(name)
-					}
 				}
 			}
+			search()
+			direct := false
 			if len(matches) == 0 {
-				return Text("No matching deferred tools for query: " + q), nil
+				// 只查询已通过装配权限过滤的注册表，不把原生工具加入延迟解锁集合。
+				searchNames = nil
+				searchSet = map[string]bool{}
+				for _, candidate := range reg.List() {
+					if !deferredSet[candidate.Name()] {
+						searchNames = append(searchNames, candidate.Name())
+						searchSet[candidate.Name()] = true
+					}
+				}
+				sort.Strings(searchNames)
+				search()
+				direct = len(matches) > 0
+			}
+			if len(matches) == 0 {
+				return Text("No matching tools in the current tool list for query: " + q +
+					"\n本次仅未匹配当前工具名单，不能据此推断 API Key 配置、账号状态或服务是否可用；历史任务记录也不代表当前配置。"), nil
 			}
 			var b strings.Builder
-			fmt.Fprintf(&b, "Found %d deferred tool(s). Invoke with %s({\"tool_name\":\"<name>\",\"params\":{...}}):\n",
-				len(matches), ExecuteExtraToolName)
+			if direct {
+				fmt.Fprintf(&b, "Found %d directly available native tool(s). These tools are already in your tool list. 直接调用对应原生工具；不要通过 %s 调用，也无需额外解锁:\n", len(matches), ExecuteExtraToolName)
+			} else {
+				fmt.Fprintf(&b, "Found %d deferred tool(s). Invoke with %s({\"tool_name\":\"<name>\",\"params\":{...}}):\n",
+					len(matches), ExecuteExtraToolName)
+			}
 			for _, t := range matches {
 				schemaJSON, _ := json.Marshal(t.InputSchema())
 				fmt.Fprintf(&b, "\n## %s\n%s\nparams schema: %s\n", t.Name(), t.Description(), string(schemaJSON))

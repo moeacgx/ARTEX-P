@@ -4,6 +4,11 @@ export type FofaConfig = { enabled: boolean; api_key_set: boolean };
 export type FofaSettingsPatch = { enabled?: boolean; api_key?: string };
 export type FofaConnectionTestInput = { api_key?: string };
 
+export function fofaSettingsStatus(config: FofaConfig): "unconfigured" | "disabled" | "enabled" {
+  if (!config.api_key_set) return "unconfigured";
+  return config.enabled ? "enabled" : "disabled";
+}
+
 function configResponse(value: unknown): FofaConfig {
   const config = value as Partial<FofaConfig> | null;
   if (typeof config?.enabled !== "boolean" || typeof config.api_key_set !== "boolean") {
@@ -32,6 +37,15 @@ export const fofaAPI = {
   config: () => http<FofaConfig>("/integrations/fofa", { cache: "no-store" }).then(configResponse),
   save: (patch: FofaSettingsPatch) =>
     http<FofaConfig>("/integrations/fofa", { method: "PUT", body: JSON.stringify(patch) }).then(configResponse),
+  enable: (config: FofaConfig | null) => {
+    if (!config) throw new Error("请先成功读取 FOFA 配置");
+    if (!config.api_key_set) throw new Error("请先保存 FOFA API Key");
+    // 独立启用动作只变更总开关，不读取、替换或测试已保存的密钥。
+    return http<FofaConfig>("/integrations/fofa", {
+      method: "PUT",
+      body: JSON.stringify({ enabled: true }),
+    }).then(configResponse);
+  },
   clear: () =>
     http<FofaConfig>("/integrations/fofa", {
       method: "PUT",

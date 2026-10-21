@@ -248,27 +248,42 @@ func validateProxyJSON(v any, s map[string]any) bool {
 		if !ok {
 			return false
 		}
-		props := s["properties"].(map[string]any)
+		props, ok := s["properties"].(map[string]any)
+		if !ok {
+			return false
+		}
 		for key, value := range m {
 			prop, ok := props[key].(map[string]any)
 			if !ok || !validateProxyJSON(value, prop) {
 				return false
 			}
 		}
-		if required, ok := s["required"].([]any); ok {
+		if raw, exists := s["required"]; exists {
+			required, ok := raw.([]any)
+			if !ok {
+				return false
+			}
 			for _, k := range required {
-				if _, ok := m[k.(string)]; !ok {
+				key, ok := k.(string)
+				if !ok {
+					return false
+				}
+				if _, ok := m[key]; !ok {
 					return false
 				}
 			}
 		}
 	case "array":
 		a, ok := v.([]any)
-		if !ok || len(a) < s["minItems"].(int) || len(a) > s["maxItems"].(int) {
+		if !ok || !proxyJSONWithinBounds(int64(len(a)), s, "minItems", "maxItems") {
+			return false
+		}
+		items, ok := s["items"].(map[string]any)
+		if !ok {
 			return false
 		}
 		for _, item := range a {
-			if !validateProxyJSON(item, s["items"].(map[string]any)) {
+			if !validateProxyJSON(item, items) {
 				return false
 			}
 		}
@@ -278,7 +293,7 @@ func validateProxyJSON(v any, s map[string]any) bool {
 			return false
 		}
 		val, err := strconv.ParseInt(string(n), 10, 64)
-		if err != nil || val < int64(s["minimum"].(int)) || val > int64(s["maximum"].(int)) {
+		if err != nil || !proxyJSONWithinBounds(val, s, "minimum", "maximum") {
 			return false
 		}
 	case "string":
@@ -291,6 +306,23 @@ func validateProxyJSON(v any, s map[string]any) bool {
 		}
 	default:
 		return false
+	}
+	return true
+}
+
+// 内置定义允许省略可选边界；错误类型必须拒绝，不能让参数校验触发崩溃。
+func proxyJSONWithinBounds(value int64, schema map[string]any, minKey, maxKey string) bool {
+	if raw, exists := schema[minKey]; exists {
+		bound, ok := raw.(int)
+		if !ok || value < int64(bound) {
+			return false
+		}
+	}
+	if raw, exists := schema[maxKey]; exists {
+		bound, ok := raw.(int)
+		if !ok || value > int64(bound) {
+			return false
+		}
 	}
 	return true
 }

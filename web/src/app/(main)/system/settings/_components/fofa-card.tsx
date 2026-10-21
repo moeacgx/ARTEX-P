@@ -14,12 +14,21 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import {
+  type FofaAccountCheck,
   type FofaConfig,
   fofaAPI,
   fofaConnectionTestInput,
   fofaSettingsPatch,
   fofaSettingsStatus,
 } from "@/lib/fofa-api";
+
+const quotaFields = [
+  { key: "fofa_point", label: "F 点余额" },
+  { key: "remain_free_point", label: "免费 F 点" },
+  { key: "remain_api_query", label: "API 剩余查询次数" },
+  { key: "remain_api_data", label: "API 剩余返回条数" },
+] as const;
+const quotaNumber = new Intl.NumberFormat("zh-CN", { maximumSignificantDigits: 21 });
 
 export function FofaCard() {
   const [config, setConfig] = React.useState<FofaConfig | null>(null);
@@ -28,24 +37,36 @@ export function FofaCard() {
   const [requestInterval, setRequestInterval] = React.useState("");
   const [rateLimitCooldown, setRateLimitCooldown] = React.useState("");
   const [loadError, setLoadError] = React.useState("");
+  const [accountCheck, setAccountCheck] = React.useState<FofaAccountCheck | null>(null);
+  const [accountError, setAccountError] = React.useState("");
   const [action, setAction] = React.useState<"load" | "save" | "save-enable" | "enable" | "clear" | "test" | null>(
     "load",
   );
   const locked = React.useRef(false);
 
-  const applyConfig = React.useCallback((value: FofaConfig) => {
-    setConfig(value);
-    setEnabled(value.enabled);
-    setApiKey("");
-    setRequestInterval(String(value.request_interval_seconds));
-    setRateLimitCooldown(String(value.rate_limit_cooldown_seconds));
+  const clearAccount = React.useCallback(() => {
+    setAccountCheck(null);
+    setAccountError("");
   }, []);
+
+  const applyConfig = React.useCallback(
+    (value: FofaConfig) => {
+      setConfig(value);
+      setEnabled(value.enabled);
+      setApiKey("");
+      setRequestInterval(String(value.request_interval_seconds));
+      setRateLimitCooldown(String(value.rate_limit_cooldown_seconds));
+      clearAccount();
+    },
+    [clearAccount],
+  );
 
   const load = React.useCallback(async () => {
     if (locked.current) return;
     locked.current = true;
     setAction("load");
     setLoadError("");
+    clearAccount();
     try {
       applyConfig(await fofaAPI.config());
     } catch (error) {
@@ -55,7 +76,7 @@ export function FofaCard() {
       locked.current = false;
       setAction(null);
     }
-  }, [applyConfig]);
+  }, [applyConfig, clearAccount]);
 
   React.useEffect(() => {
     void load();
@@ -64,6 +85,7 @@ export function FofaCard() {
   const save = async (activate = false) => {
     if (locked.current || !config) return;
     locked.current = true;
+    clearAccount();
     setAction(activate ? "save-enable" : "save");
     try {
       const patch = fofaSettingsPatch(config, activate || enabled, apiKey, {
@@ -84,6 +106,7 @@ export function FofaCard() {
   const enableSaved = async () => {
     if (locked.current || !config) return;
     locked.current = true;
+    clearAccount();
     setAction("enable");
     try {
       const value = await fofaAPI.enable(config);
@@ -103,6 +126,7 @@ export function FofaCard() {
   const clear = async () => {
     if (locked.current || !config?.api_key_set) return;
     locked.current = true;
+    clearAccount();
     setAction("clear");
     try {
       applyConfig(await fofaAPI.clear());
@@ -118,9 +142,11 @@ export function FofaCard() {
   const test = async () => {
     if (locked.current || !config) return;
     locked.current = true;
+    clearAccount();
     setAction("test");
     try {
       const result = await fofaAPI.test(fofaConnectionTestInput(config, apiKey));
+      setAccountCheck(result);
       const message = result.message || "FOFA 连接测试成功";
       if (!config.enabled) {
         toast.success(`${message}；FOFA 尚未启用，请保存并启用，或一键启用已保存的 Key`);
@@ -130,7 +156,8 @@ export function FofaCard() {
         toast.success(message);
       }
     } catch (error) {
-      toast.error(`连接测试失败：${(error as Error).message}`);
+      setAccountError((error as Error).message);
+      toast.error(`连接与额度查询失败：${(error as Error).message}`);
     } finally {
       locked.current = false;
       setAction(null);
@@ -200,7 +227,7 @@ export function FofaCard() {
               )}
               {status === "enabled" && (
                 <p className="text-muted-foreground text-xs leading-relaxed">
-                  总开关已开启。API Key 的有效性尚需通过「测试连接」确认，实际搜索还受账号权限与额度限制。
+                  总开关已开启。可通过「测试连接并查询额度」核对 Key 与账户信息，实际搜索仍受账号权限与额度限制。
                 </p>
               )}
             </div>
@@ -241,7 +268,10 @@ export function FofaCard() {
                 placeholder={config.api_key_set ? "留空保留原 Key；输入新 Key 后保存即可更换" : "输入 FOFA API Key"}
                 value={apiKey}
                 disabled={busy}
-                onChange={(event) => setApiKey(event.target.value)}
+                onChange={(event) => {
+                  setApiKey(event.target.value);
+                  clearAccount();
+                }}
                 aria-describedby="fofa-key-help"
               />
               <p id="fofa-key-help" className="text-muted-foreground text-xs leading-relaxed">
@@ -321,19 +351,63 @@ export function FofaCard() {
                 {action === "clear" ? "清除中…" : "清除 Key 并关闭"}
               </Button>
             </div>
-            <div className="flex items-center justify-between gap-4 border-t pt-4">
+            <div className="flex flex-col gap-3 border-t pt-4">
               <p className="text-muted-foreground text-xs leading-relaxed">
-                优先测试当前输入的 Key，留空则使用已保存的 Key。仅检查账号连接，不执行资产搜索，也不会保存输入。
+                优先使用当前输入的 Key，留空则使用已保存的 Key。仅访问账户接口，不执行资产搜索，也不会保存输入。
               </p>
               <Button
                 type="button"
                 variant="outline"
-                className="shrink-0"
+                className="self-start"
                 onClick={() => void test()}
                 disabled={busy || !hasKey}
               >
-                {action === "test" ? "测试中…" : "测试连接"}
+                {action === "test" ? "正在查询额度…" : "测试连接并查询额度"}
               </Button>
+              {action === "test" && (
+                <p role="status" className="text-muted-foreground text-xs">
+                  正在读取账户额度…
+                </p>
+              )}
+              {accountError && (
+                <p role="alert" className="text-destructive text-sm">
+                  额度读取失败：{accountError}
+                </p>
+              )}
+              {accountCheck && (
+                <section aria-label="FOFA 账户额度" className="flex flex-col gap-3 rounded-md border p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="font-medium text-sm">账户额度（本次读取）</h3>
+                    <Badge variant="outline">
+                      {accountCheck.key_source === "draft" ? "草稿 Key（未保存）" : "已保存 Key"}
+                    </Badge>
+                  </div>
+                  <dl className="grid grid-cols-2 gap-x-4 gap-y-3">
+                    {quotaFields.map(({ key, label }) => (
+                      <div key={key} className="flex flex-col gap-1">
+                        <dt className="text-muted-foreground text-xs">{label}</dt>
+                        <dd className="break-all font-medium text-base tabular-nums">
+                          {accountCheck.account[key] === null
+                            ? "未提供"
+                            : quotaNumber.format(accountCheck.account[key])}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                  <p className="text-muted-foreground text-xs">
+                    读取时间：
+                    <time dateTime={accountCheck.checked_at}>
+                      {new Date(accountCheck.checked_at).toLocaleString("zh-CN", {
+                        hour12: false,
+                        timeZoneName: "short",
+                      })}
+                    </time>
+                  </p>
+                  <p className="text-muted-foreground text-xs leading-relaxed">
+                    额度是读取时的账户快照，仅手动刷新。上游未提供的项目显示「未提供」，不会按零计算。
+                  </p>
+                </section>
+              )}
             </div>
           </>
         )}

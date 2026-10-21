@@ -6,6 +6,13 @@ import * as fofa from "./fofa-api.ts";
 const { fofaAPI, fofaConnectionTestInput, fofaSettingsPatch } = fofa;
 const throttleDefaults = { request_interval_seconds: 2, rate_limit_cooldown_seconds: 60 };
 const configResponse = (value) => Response.json({ ...throttleDefaults, ...value });
+const checkedAccount = (source = "saved") => ({
+  ok: true,
+  message: "连接成功",
+  account: { fofa_point: 12.5, remain_free_point: 0, remain_api_query: 42, remain_api_data: null },
+  checked_at: "2026-10-22T04:00:00Z",
+  key_source: source,
+});
 
 const originalFetch = globalThis.fetch;
 test.afterEach(() => {
@@ -106,7 +113,7 @@ test("连接测试可用草稿密钥或旧密钥，只调用测试端点且不�
   const calls = [];
   globalThis.fetch = async (url, init) => {
     calls.push({ url, method: init.method, body: JSON.parse(init.body) });
-    return Response.json({ ok: true, message: "连接成功" });
+    return Response.json(checkedAccount(JSON.parse(init.body).api_key ? "draft" : "saved"));
   };
   await fofaAPI.test(fofaConnectionTestInput({ enabled: false, api_key_set: false }, " synthetic-draft-key "));
   await fofaAPI.test(fofaConnectionTestInput({ enabled: false, api_key_set: true }, ""));
@@ -163,4 +170,66 @@ test("节流草稿只接受范围内整数，空值和非整数字符不能被�
   assert.deepEqual(fofaSettingsPatch(config, false, "", { request_interval_seconds: "60", rate_limit_cooldown_seconds: "3600" }), {
     request_interval_seconds: 60, rate_limit_cooldown_seconds: 3600,
   });
+});
+
+test("额度查询保留四项独立额度的0和null，只接收脱敏字段", async () => {
+  globalThis.fetch = async () => Response.json({
+    ...checkedAccount(),
+    account: { ...checkedAccount().account, email: "private@example.test", api_key: "secret-must-not-leave-parser" },
+    email: "private@example.test",
+  });
+  assert.deepEqual(await fofaAPI.test({}), {
+    ok: true, message: "连接成功",
+    account: { fofa_point: 12.5, remain_free_point: 0, remain_api_query: 42, remain_api_data: null },
+    checked_at: "2026-10-22T04:00:00Z", key_source: "saved",
+  });
+});
+
+test("额度数值必须非负有限，查询次数和条数还必须是安全整数", async () => {
+  for (const field of ["fofa_point", "remain_free_point", "remain_api_query", "remain_api_data"]) {
+    const invalid = [undefined, -1, "0", false, {}, []];
+    if (field.startsWith("remain_api_")) invalid.push(1.5, Number.MAX_SAFE_INTEGER + 1);
+    for (const value of invalid) {
+      globalThis.fetch = async () => Response.json({ ...checkedAccount(), account: { ...checkedAccount().account, [field]: value } });
+      await assert.rejects(fofaAPI.test({}), /额度.*无效/);
+    }
+    globalThis.fetch = async () => new Response(JSON.stringify(checkedAccount()).replace(`"${field}":${JSON.stringify(checkedAccount().account[field])}`, `"${field}":1e999`), { headers: { "Content-Type": "application/json" } });
+    await assert.rejects(fofaAPI.test({}), /额度.*无效/);
+  }
+  globalThis.fetch = async () => Response.json({ ...checkedAccount(), account: { fofa_point: 0.25, remain_free_point: null, remain_api_query: 0, remain_api_data: Number.MAX_SAFE_INTEGER } });
+  assert.deepEqual((await fofaAPI.test({})).account, { fofa_point: 0.25, remain_free_point: null, remain_api_query: 0, remain_api_data: Number.MAX_SAFE_INTEGER });
+});
+
+test("缺失账户或无效读取时间不能伪造额度快照", async () => {
+  for (const account of [undefined, null, [], {}]) {
+    globalThis.fetch = async () => Response.json({ ...checkedAccount(), account });
+    await assert.rejects(fofaAPI.test({}), /额度.*无效/);
+  }
+  for (const checked_at of [undefined, null, 1, "", "yesterday", "2026-10-22", "2026-10-22T04:00:00", "2026-02-30T04:00:00Z", "2026-13-22T04:00:00Z", "2026-10-22T24:00:00Z", "2026-10-22T04:60:00Z", "2026-10-22T04:00:00+24:00"]) {
+    globalThis.fetch = async () => Response.json({ ...checkedAccount(), checked_at });
+    await assert.rejects(fofaAPI.test({}), /读取时间.*无效/);
+  }
+  globalThis.fetch = async () => Response.json({ ...checkedAccount(), checked_at: "2026-10-22T12:00:00.123456789+08:00" });
+  assert.equal((await fofaAPI.test({})).checked_at, "2026-10-22T12:00:00.123456789+08:00");
+});
+
+test("额度Key来源必须明确且与本次请求一致", async () => {
+  for (const key_source of [undefined, null, "", "unknown", "draft", 1]) {
+    globalThis.fetch = async () => Response.json({ ...checkedAccount(), key_source });
+    await assert.rejects(fofaAPI.test({}), /Key 来源.*无效/);
+  }
+  globalThis.fetch = async () => Response.json(checkedAccount("saved"));
+  await assert.rejects(fofaAPI.test({ api_key: "synthetic-draft-key" }), /Key 来源.*无效/);
+  globalThis.fetch = async () => Response.json(checkedAccount("draft"));
+  assert.equal((await fofaAPI.test({ api_key: "synthetic-draft-key" })).key_source, "draft");
+});
+
+test("额度查询限流只返回错误，不重试或调用搜索端点", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, method: init.method });
+    return Response.json({ error: "FOFA 正在冷却，请稍后手动重试" }, { status: 429 });
+  };
+  await assert.rejects(fofaAPI.test({}), (error) => error.status === 429 && /冷却/.test(error.message));
+  assert.deepEqual(calls, [{ url: "/api/integrations/fofa/test", method: "POST" }]);
 });

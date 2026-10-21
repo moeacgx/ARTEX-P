@@ -14,6 +14,79 @@ export type FofaSettingsPatch = {
 };
 export type FofaThrottleDraft = { request_interval_seconds: string; rate_limit_cooldown_seconds: string };
 export type FofaConnectionTestInput = { api_key?: string };
+export type FofaAccountQuota = {
+  fofa_point: number | null;
+  remain_free_point: number | null;
+  remain_api_query: number | null;
+  remain_api_data: number | null;
+};
+export type FofaAccountCheck = {
+  ok: true;
+  message: string;
+  account: FofaAccountQuota;
+  checked_at: string;
+  key_source: "saved" | "draft";
+};
+
+function validQuotaNumber(value: unknown, integer: boolean): value is number | null {
+  return (
+    value === null ||
+    (typeof value === "number" && Number.isFinite(value) && value >= 0 && (!integer || Number.isSafeInteger(value)))
+  );
+}
+
+function validCheckedAt(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parts = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?([Zz]|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (!parts) return false;
+  const [year, month, day, hour, minute, second] = parts.slice(1, 7).map(Number);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return (
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= days[month - 1] &&
+    hour <= 23 &&
+    minute <= 59 &&
+    second <= 59 &&
+    (!parts[9] || (Number(parts[10]) <= 23 && Number(parts[11]) <= 59)) &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+function accountResponse(value: unknown, input: FofaConnectionTestInput): FofaAccountCheck {
+  const result = value as Partial<FofaAccountCheck> | null;
+  if (result?.ok !== true || typeof result.message !== "string") throw new Error("FOFA 连接测试未确认成功");
+  const account = result.account;
+  if (
+    !account ||
+    typeof account !== "object" ||
+    Array.isArray(account) ||
+    !validQuotaNumber(account.fofa_point, false) ||
+    !validQuotaNumber(account.remain_free_point, false) ||
+    !validQuotaNumber(account.remain_api_query, true) ||
+    !validQuotaNumber(account.remain_api_data, true)
+  ) {
+    throw new Error("FOFA 账户额度响应无效，请重新查询");
+  }
+  if (!validCheckedAt(result.checked_at)) throw new Error("FOFA 额度读取时间无效，请重新查询");
+  const source = input.api_key === undefined ? "saved" : "draft";
+  if (result.key_source !== source) throw new Error("FOFA 额度 Key 来源无效，请重新查询");
+  // 只保留四项额度与本次读取元数据，丢弃邮箱、密钥等非展示字段。
+  return {
+    ok: true,
+    message: result.message,
+    account: {
+      fofa_point: account.fofa_point,
+      remain_free_point: account.remain_free_point,
+      remain_api_query: account.remain_api_query,
+      remain_api_data: account.remain_api_data,
+    },
+    checked_at: result.checked_at,
+    key_source: source,
+  };
+}
 
 export function fofaSettingsStatus(config: FofaConfig): "unconfigured" | "disabled" | "enabled" {
   if (!config.api_key_set) return "unconfigured";
@@ -104,13 +177,10 @@ export const fofaAPI = {
       body: JSON.stringify({ enabled: false, api_key: "" }),
     }).then(configResponse),
   test: async (input: FofaConnectionTestInput) => {
-    const value = await http<{ ok?: unknown; message?: unknown } | null>("/integrations/fofa/test", {
+    const value = await http<unknown>("/integrations/fofa/test", {
       method: "POST",
       body: JSON.stringify(input),
     });
-    if (value?.ok !== true || typeof value.message !== "string") {
-      throw new Error("FOFA 连接测试未确认成功");
-    }
-    return { ok: true as const, message: value.message };
+    return accountResponse(value, input);
   },
 };

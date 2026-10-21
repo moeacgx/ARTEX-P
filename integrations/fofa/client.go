@@ -117,7 +117,7 @@ func (c *Client) Search(ctx context.Context, q Query) (*SearchResult, error) {
 
 // Test 只验证账户接口，不搜索资产、不返回账户隐私信息。
 func (c *Client) Test(ctx context.Context) error {
-	_, err := c.get(ctx, "/info/my", url.Values{})
+	_, err := c.Account(ctx)
 	return err
 }
 

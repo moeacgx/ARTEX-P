@@ -85,6 +85,7 @@ func (s *Server) setFOFASettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) testFOFASettings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if s.pg(w) == nil {
 		return
 	}
@@ -112,6 +113,7 @@ func (s *Server) testFOFASettings(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
+	var account *fofa.AccountInfo
 	// 账户检测同样遵守共享节流；真正发送前才占用出口维护锁。
 	err = s.runFOFARequest(ctx, key, c, func() error {
 		latest, err := s.m.pg.FOFAConfig()
@@ -125,7 +127,8 @@ func (s *Server) testFOFASettings(w http.ResponseWriter, r *http.Request) {
 			return errors.New("当前出口不可用，未回退直连")
 		}
 		defer finish()
-		return fofa.New(&http.Client{Transport: tr}, key).Test(ctx)
+		account, err = fofa.New(&http.Client{Transport: tr}, key).Account(ctx)
+		return err
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrFOFAThrottleUnsettled) {
@@ -141,7 +144,15 @@ func (s *Server) testFOFASettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 502, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "message": "FOFA 账户接口验证通过，未执行资产搜索"})
+	keySource := "saved"
+	if p.APIKey != nil {
+		keySource = "draft"
+	}
+	// 只返回经过客户端白名单验证的额度；不缓存账户原文或身份信息。
+	writeJSON(w, 200, map[string]any{
+		"ok": true, "message": "FOFA 账户接口验证通过，已读取可用额度信息，未执行资产搜索",
+		"account": account, "checked_at": time.Now().UTC().Format(time.RFC3339Nano), "key_source": keySource,
+	})
 }
 
 // 检测固定一次采样的全局出口。会话锁与 WARP 维护互斥，进程退出由数据库释放；

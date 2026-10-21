@@ -84,7 +84,7 @@ jobs:
       - name: FOFA 配置、工具和内置 Skill 回归
         run: |
           timeout 60s go test ./integrations/fofa ./skills -count=1 -timeout 60s
-          timeout 60s go test ./db -run '^TestFOFAConfig' -count=1 -timeout 60s
+          timeout 60s go test ./db -run '^TestFOFA' -count=1 -timeout 60s
           timeout 60s go test ./server -run '^(TestFOFA|TestBuiltinFOFASkill|TestProxyJSONOptionalConstraints|TestProxyToolsStrictArguments)' -count=1 -timeout 60s
           cd norma
           timeout 60s go test ./tool ./agentcore -run '^(TestSearchExtraTools|TestNativeToolDiscoveryKeepsDirectSchemaAndExecutionBoundary|TestExecuteExtraTool|TestDeferred)' -count=1 -timeout 60s

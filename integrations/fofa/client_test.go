@@ -96,6 +96,27 @@ func TestSearchValidationDoesNotSpendRequests(t *testing.T) {
 	}
 }
 
+func TestValidateQueryRejectsInvalidFieldsAndPageWithoutMutation(t *testing.T) {
+	for _, query := range []fofa.Query{
+		{Query: "test", Fields: []string{"body"}},
+		{Query: "test", Fields: []string{"host", "host"}},
+		{Query: "test", Page: -1},
+		{Query: "test", Page: 101},
+		{Query: "test", Size: 101},
+	} {
+		if err := fofa.ValidateQuery(query); err == nil {
+			t.Fatalf("无效查询未被拒绝: %+v", query)
+		}
+	}
+	query := fofa.Query{Query: " test ", Fields: []string{" host "}}
+	if err := fofa.ValidateQuery(query); err != nil {
+		t.Fatal(err)
+	}
+	if query.Query != " test " || query.Page != 0 || query.Size != 0 || query.Fields[0] != " host " {
+		t.Fatalf("验证修改了调用方参数: %+v", query)
+	}
+}
+
 func TestSearchRequestedFieldsPaginationAndSecretRedaction(t *testing.T) {
 	key := "secret-FOFA-api-key"
 	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"github.com/Autumn-27/artex/db"
 
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -44,12 +46,20 @@ func (s *Server) fofaStatusTool() actool.CoreTool {
 				return actool.Errorf("FOFA 工具目录读取失败，无法判断当前搜索权限"), nil
 			}
 			keySet := config.APIKey != ""
+			cooldown, err := s.m.pg.FOFARequestCooldown(ctx, config.APIKey)
+			pending := errors.Is(err, db.ErrFOFARequestPending)
+			if errors.Is(err, db.ErrFOFAThrottleUnsettled) {
+				return actool.Errorf(db.ErrFOFAThrottleUnsettled.Error()), nil
+			}
+			if err != nil && !pending {
+				return actool.Errorf("FOFA 冷却状态读取失败，无法判断当前可用性"), nil
+			}
 			searchEnabled, bound := false, false
 			if search != nil {
 				searchEnabled = search.Enabled
 				bound = contains(search.Agents, agentKey)
 			}
-			available := config.Enabled && keySet && search != nil && search.System && searchEnabled && bound
+			available := config.Enabled && keySet && search != nil && search.System && searchEnabled && bound && cooldown <= 0 && !pending
 			reason, message := "available", "当前 Agent 已满足 FOFA 搜索的本地配置与绑定条件，可直接调用 fofa_search"
 			switch {
 			case search == nil:
@@ -64,16 +74,23 @@ func (s *Server) fofaStatusTool() actool.CoreTool {
 				reason, message = "search_tool_disabled", "内置 FOFA 搜索工具当前已停用，请检查工具设置"
 			case !bound:
 				reason, message = "agent_not_bound", "当前 Agent 未绑定 FOFA 搜索工具，请检查 Agent 工具绑定"
+			case cooldown > 0:
+				reason, message = "rate_limited", "当前 Key 处于所有 Worker 共用的冷却期，请等待 retry_after_seconds 后再查询；更换代理不会解除冷却"
+			case pending:
+				reason, message = "request_in_progress", "当前 Key 正有请求执行中，请等待结束，不要重复查询"
 			}
 			// 只返回本地布尔状态，不能将密钥对象或上游认证结论混入输出。
 			return jsonResult(map[string]any{
-				"integration_enabled":   config.Enabled,
-				"api_key_set":           keySet,
-				"search_tool_enabled":   searchEnabled,
-				"agent_bound":           bound,
-				"search_tool_available": available,
-				"reason":                reason,
-				"message":               message + "。本次仅检查本地配置和绑定，未验证 FOFA 账户鉴权、可用额度或网络连通性。",
+				"integration_enabled":         config.Enabled,
+				"api_key_set":                 keySet,
+				"search_tool_enabled":         searchEnabled,
+				"agent_bound":                 bound,
+				"search_tool_available":       available,
+				"retry_after_seconds":         fofaRetrySeconds(cooldown),
+				"request_interval_seconds":    config.RequestIntervalSeconds,
+				"rate_limit_cooldown_seconds": config.RateLimitCooldownSeconds,
+				"reason":                      reason,
+				"message":                     message + "。本次仅检查本地配置和绑定，未验证 FOFA 账户鉴权、可用额度或网络连通性。",
 			})
 		},
 	})

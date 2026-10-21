@@ -4,6 +4,8 @@ import test from "node:test";
 import * as fofa from "./fofa-api.ts";
 
 const { fofaAPI, fofaConnectionTestInput, fofaSettingsPatch } = fofa;
+const throttleDefaults = { request_interval_seconds: 2, rate_limit_cooldown_seconds: 60 };
+const configResponse = (value) => Response.json({ ...throttleDefaults, ...value });
 
 const originalFetch = globalThis.fetch;
 test.afterEach(() => {
@@ -23,7 +25,7 @@ test("单纯保存首个 Key 不自动启用，只有明确保存并启用才开
   globalThis.fetch = async (url, init) => {
     const body = JSON.parse(init.body);
     calls.push({ url, method: init.method, body });
-    return Response.json({ enabled: body.enabled, api_key_set: true });
+    return configResponse({ enabled: body.enabled, api_key_set: true });
   };
   const saved = await fofaAPI.save(fofaSettingsPatch(config, false, "synthetic-first-key"));
   assert.equal(fofa.fofaSettingsStatus(saved), "disabled");
@@ -39,7 +41,7 @@ test("一键启用只提交开关，保留已保存 Key 且不测试或搜索", 
   const calls = [];
   globalThis.fetch = async (url, init) => {
     calls.push({ url, method: init.method, body: JSON.parse(init.body) });
-    return Response.json({ enabled: true, api_key_set: true });
+    return configResponse({ enabled: true, api_key_set: true });
   };
   await fofaAPI.enable({ enabled: false, api_key_set: true });
   assert.deepEqual(calls, [{ url: "/api/integrations/fofa", method: "PUT", body: { enabled: true } }]);
@@ -54,9 +56,9 @@ test("读取 FOFA 配置不缓存，只返回开关与密钥存在状态", async
   globalThis.fetch = async (url, init) => {
     assert.equal(url, "/api/integrations/fofa");
     assert.equal(init.cache, "no-store");
-    return Response.json({ enabled: false, api_key_set: true, api_key: "不得回填的旧密钥" });
+    return configResponse({ enabled: false, api_key_set: true, api_key: "不得回填的旧密钥" });
   };
-  assert.deepEqual(await fofaAPI.config(), { enabled: false, api_key_set: true });
+  assert.deepEqual(await fofaAPI.config(), { enabled: false, api_key_set: true, ...throttleDefaults });
 });
 
 test("缺失或错误类型的配置不能被当成未配置", async () => {
@@ -80,7 +82,7 @@ test("保存开关时留空保留旧密钥，输入新密钥才提交更换", as
   const calls = [];
   globalThis.fetch = async (url, init) => {
     calls.push({ url, method: init.method, body: JSON.parse(init.body) });
-    return Response.json({ enabled: true, api_key_set: true });
+    return configResponse({ enabled: true, api_key_set: true });
   };
   await fofaAPI.save(fofaSettingsPatch(config, true, "  "));
   await fofaAPI.save(fofaSettingsPatch(config, true, "  synthetic-new-key  "));
@@ -94,9 +96,9 @@ test("清除密钥明确提交空字符串，并同时关闭 FOFA 工具", async
   const calls = [];
   globalThis.fetch = async (url, init) => {
     calls.push({ url, method: init.method, body: JSON.parse(init.body) });
-    return Response.json({ enabled: false, api_key_set: false });
+    return configResponse({ enabled: false, api_key_set: false });
   };
-  assert.deepEqual(await fofaAPI.clear(), { enabled: false, api_key_set: false });
+  assert.deepEqual(await fofaAPI.clear(), { enabled: false, api_key_set: false, ...throttleDefaults });
   assert.deepEqual(calls, [{ url: "/api/integrations/fofa", method: "PUT", body: { enabled: false, api_key: "" } }]);
 });
 
@@ -129,4 +131,36 @@ test("保存失败保留服务端错误且不自动重试", async () => {
   };
   await assert.rejects(fofaAPI.save({ enabled: true }), (error) => error.status === 400 && /API Key 无效/.test(error.message));
   assert.equal(count, 1);
+});
+
+test("读取节流值严格校验，不将缺失或无效值猜成默认值", async () => {
+  for (const field of ["request_interval_seconds", "rate_limit_cooldown_seconds"]) {
+    for (const value of [undefined, null, 0, -1, 1.5, "2", field === "request_interval_seconds" ? 61 : 3601]) {
+      globalThis.fetch = async () => configResponse({ enabled: false, api_key_set: true, [field]: value });
+      await assert.rejects(fofaAPI.config(), /节流.*无效/);
+    }
+  }
+});
+
+test("只修改请求间隔不覆盖冷却值、Key和开关草稿", () => {
+  const config = { enabled: false, api_key_set: true, request_interval_seconds: 2, rate_limit_cooldown_seconds: 90 };
+  assert.deepEqual(fofaSettingsPatch(config, false, "", { request_interval_seconds: "7", rate_limit_cooldown_seconds: "90" }), {
+    request_interval_seconds: 7,
+  });
+  assert.deepEqual(fofaSettingsPatch(config, true, "new-key", { request_interval_seconds: "2", rate_limit_cooldown_seconds: "180" }), {
+    enabled: true, api_key: "new-key", rate_limit_cooldown_seconds: 180,
+  });
+});
+
+test("节流草稿只接受范围内整数，空值和非整数字符不能被自动转换", () => {
+  const config = { enabled: false, api_key_set: false, ...throttleDefaults };
+  for (const value of ["", " ", "0", "-1", "1.5", "2e1", "Infinity", "61"]) {
+    assert.throws(() => fofaSettingsPatch(config, false, "", { request_interval_seconds: value, rate_limit_cooldown_seconds: "60" }), /请求间隔.*1.*60/);
+  }
+  for (const value of ["", "0", "-1", "0.5", "3601"]) {
+    assert.throws(() => fofaSettingsPatch(config, false, "", { request_interval_seconds: "2", rate_limit_cooldown_seconds: value }), /限流冷却.*1.*3600/);
+  }
+  assert.deepEqual(fofaSettingsPatch(config, false, "", { request_interval_seconds: "60", rate_limit_cooldown_seconds: "3600" }), {
+    request_interval_seconds: 60, rate_limit_cooldown_seconds: 3600,
+  });
 });

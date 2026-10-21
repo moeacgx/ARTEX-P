@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,8 +37,8 @@ func fofaSettingsTestDB(t *testing.T) (*DB, string) {
 	cfg.RuntimeParams["search_path"] = schema
 	pool := stdlib.OpenDB(*cfg)
 	pool.SetMaxOpenConns(4)
-	t.Cleanup(func() { _ = pool.Close() })
 	d := &DB{DB: pool}
+	t.Cleanup(func() { _ = d.Close() })
 	if _, err := d.Exec(`CREATE TABLE settings (key text PRIMARY KEY, value text NOT NULL, updated_at timestamptz DEFAULT now())`); err != nil {
 		t.Fatal(err)
 	}
@@ -80,19 +81,178 @@ func TestFOFAConfigEncryptedStorageAndJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
 		t.Fatal(err)
 	}
-	if len(stored) != 2 || stored["enabled"] != true {
-		t.Fatal("持久配置应仅包含开关和密文")
+	if len(stored) != 4 || stored["enabled"] != true || stored["request_interval_seconds"] != float64(2) || stored["rate_limit_cooldown_seconds"] != float64(60) {
+		t.Fatal("持久配置应包含开关、密文和节流设置")
 	}
 	if cipher, ok := stored["api_key_cipher"].(string); !ok || !strings.HasPrefix(cipher, "v1:") {
 		t.Fatal("数据库未存储版本化密文")
 	}
 	encoded, err := json.Marshal(c)
-	if err != nil || string(encoded) != `{"enabled":true}` {
+	if err != nil || string(encoded) != `{"enabled":true,"request_interval_seconds":2,"rate_limit_cooldown_seconds":60}` {
 		t.Fatalf("通用序列化不得携带令牌字段: err=%v", err)
 	}
 	reloaded, err := d.FOFAConfig()
 	if err != nil || reloaded != c {
 		t.Fatalf("配置持久化恢复失败: matches=%v err=%v", reloaded == c, err)
+	}
+}
+
+func fofaConfigNumbers(t *testing.T, config FOFAConfig) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func TestFOFAThrottleDefaultsAndLegacyConfig(t *testing.T) {
+	d, _ := fofaSettingsTestDB(t)
+	for _, raw := range []string{"", `{}`, `{"enabled":false,"api_key_cipher":""}`} {
+		if raw != "" {
+			if err := d.SetSetting(settingFOFA, raw); err != nil {
+				t.Fatal(err)
+			}
+		}
+		config, err := d.FOFAConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := fofaConfigNumbers(t, config)
+		if got["request_interval_seconds"] != float64(2) || got["rate_limit_cooldown_seconds"] != float64(60) {
+			t.Fatalf("缺省/旧配置未补齐节流默认值: %+v", got)
+		}
+	}
+}
+
+func TestFOFAThrottlePatchPreservesOtherFields(t *testing.T) {
+	d, _ := fofaSettingsTestDB(t)
+	key, enabled := "synthetic-throttle-key", true
+	if _, err := d.SetFOFAConfig(t.Context(), FOFAConfigPatch{APIKey: &key, Enabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		patch              string
+		interval, cooldown int
+		enabled            bool
+	}{
+		{`{"request_interval_seconds":7}`, 7, 60, true},
+		{`{"rate_limit_cooldown_seconds":180}`, 7, 180, true},
+		{`{"enabled":false}`, 7, 180, false},
+		{`{"api_key":"replacement-throttle-key"}`, 7, 180, false},
+		{`{"enabled":true}`, 7, 180, true},
+		{`{"request_interval_seconds":1,"rate_limit_cooldown_seconds":1}`, 1, 1, true},
+		{`{"request_interval_seconds":60,"rate_limit_cooldown_seconds":3600}`, 60, 3600, true},
+	} {
+		var patch FOFAConfigPatch
+		if err := json.Unmarshal([]byte(step.patch), &patch); err != nil {
+			t.Fatal(err)
+		}
+		config, err := d.SetFOFAConfig(t.Context(), patch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := fofaConfigNumbers(t, config)
+		if config.APIKey == "" || config.Enabled != step.enabled || got["request_interval_seconds"] != float64(step.interval) || got["rate_limit_cooldown_seconds"] != float64(step.cooldown) {
+			t.Fatalf("局部保存覆盖了其它字段: patch=%s got=%+v hasKey=%v", step.patch, got, config.APIKey != "")
+		}
+	}
+}
+
+func TestFOFAThrottleRejectInvalidInputWithoutWriting(t *testing.T) {
+	d, _ := fofaSettingsTestDB(t)
+	key := "synthetic-unchanged-throttle-key"
+	if _, err := d.SetFOFAConfig(t.Context(), FOFAConfigPatch{APIKey: &key}); err != nil {
+		t.Fatal(err)
+	}
+	before := fofaStoredRaw(t, d)
+	for _, field := range []struct {
+		name, label string
+		max         int
+	}{
+		{"request_interval_seconds", "请求间隔", 60},
+		{"rate_limit_cooldown_seconds", "限流冷却", 3600},
+	} {
+		for _, raw := range []string{"null", "0", "-1", "1.5", `"2"`, "true", fmt.Sprint(field.max + 1)} {
+			var patch FOFAConfigPatch
+			err := json.Unmarshal([]byte(fmt.Sprintf(`{"%s":%s}`, field.name, raw)), &patch)
+			if err == nil {
+				_, err = d.SetFOFAConfig(t.Context(), patch)
+			}
+			if err == nil || !errors.Is(err, ErrFOFAConfig) || !strings.Contains(err.Error(), field.label) {
+				t.Fatalf("无效节流值未准确拒绝: field=%s input=%s err=%v", field.name, raw, err)
+			}
+			if fofaStoredRaw(t, d) != before {
+				t.Fatal("无效参数改变了已有配置")
+			}
+		}
+	}
+}
+
+func TestFOFAThrottleDirectPatchValidationAndConcurrentMerge(t *testing.T) {
+	d, _ := fofaSettingsTestDB(t)
+	key, enabled := "synthetic-concurrent-throttle-key", true
+	if _, err := d.SetFOFAConfig(t.Context(), FOFAConfigPatch{APIKey: &key, Enabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	before := fofaStoredRaw(t, d)
+	for _, value := range []int{0, -1, 61} {
+		if _, err := d.SetFOFAConfig(t.Context(), FOFAConfigPatch{RequestIntervalSeconds: &value}); !errors.Is(err, ErrFOFARequestInterval) {
+			t.Fatalf("直接写入未拒绝无效请求间隔: %v", err)
+		}
+	}
+	for _, value := range []int{0, -1, 3601} {
+		if _, err := d.SetFOFAConfig(t.Context(), FOFAConfigPatch{RateLimitCooldownSeconds: &value}); !errors.Is(err, ErrFOFARateLimitCooldown) {
+			t.Fatalf("直接写入未拒绝无效限流冷却: %v", err)
+		}
+	}
+	if fofaStoredRaw(t, d) != before {
+		t.Fatal("无效直接更新改变了原配置")
+	}
+	interval, cooldown := 9, 240
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, patch := range []FOFAConfigPatch{{RequestIntervalSeconds: &interval}, {RateLimitCooldownSeconds: &cooldown}} {
+		go func(p FOFAConfigPatch) { <-start; _, err := d.SetFOFAConfig(t.Context(), p); results <- err }(patch)
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := d.FOFAConfig()
+	if err != nil || got.RequestIntervalSeconds != interval || got.RateLimitCooldownSeconds != cooldown || !got.Enabled || got.APIKey != key {
+		t.Fatalf("并发局部更新丢失字段: err=%v", err)
+	}
+}
+
+func TestFOFAThrottleLegacyEncryptedKeyAndReplacementPreserveSettings(t *testing.T) {
+	d, _ := fofaSettingsTestDB(t)
+	key := "synthetic-legacy-fofa-key"
+	cipher, err := sealFOFAKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, _ := json.Marshal(map[string]any{"enabled": true, "api_key_cipher": cipher})
+	if err := d.SetSetting(settingFOFA, string(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.FOFAConfig()
+	if err != nil || got.APIKey != key || !got.Enabled || got.RequestIntervalSeconds != 2 || got.RateLimitCooldownSeconds != 60 {
+		t.Fatalf("旧密文配置未保留Key并补齐默认节流: %v", err)
+	}
+	if err := d.SetSetting(settingFOFA, `{"enabled":true,"api_key_cipher":"v1:broken-cipher","request_interval_seconds":11,"rate_limit_cooldown_seconds":300}`); err != nil {
+		t.Fatal(err)
+	}
+	replacement := "synthetic-replacement-fofa-key"
+	got, err = d.SetFOFAConfig(t.Context(), FOFAConfigPatch{APIKey: &replacement})
+	if err != nil || got.RequestIntervalSeconds != 11 || got.RateLimitCooldownSeconds != 300 {
+		t.Fatalf("替换损坏密文时重置了有效节流设置: %v", err)
 	}
 }
 

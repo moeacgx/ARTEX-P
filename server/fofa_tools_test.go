@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -93,10 +94,16 @@ func TestFOFAToolAvailableToBoundAgents(t *testing.T) {
 // 请求必须穿过任务选定代理，不能穿过明文流量录制器；结束凭证不能继续使用。
 func TestFOFAToolSearchUsesAdmittedProxyWithoutCapture(t *testing.T) {
 	s := newModelExecutionServer(t)
+	key := fmt.Sprintf("synthetic-proxy-key-%d", time.Now().UnixNano())
 	var calls, connects atomic.Int32
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		if r.URL.Query().Get("key") != "test-key-must-not-echo" || r.URL.Path != "/api/v1/search/all" {
+		call := calls.Add(1)
+		if call == 3 {
+			w.Header().Set("Retry-After", "120")
+			w.WriteHeader(429)
+			return
+		}
+		if r.URL.Query().Get("key") != key || r.URL.Path != "/api/v1/search/all" {
 			t.Error("查询未使用服务端配置")
 		}
 		fields := strings.Split(r.URL.Query().Get("fields"), ",")
@@ -154,7 +161,7 @@ func TestFOFAToolSearchUsesAdmittedProxyWithoutCapture(t *testing.T) {
 	}
 	s.m.traffic, s.m.trafficOn = capture, true
 	t.Cleanup(func() { s.m.traffic = nil; s.m.trafficOn = false; capture.Close() })
-	key, on := "test-key-must-not-echo", true
+	on := true
 	if _, err = s.m.pg.SetFOFAConfig(t.Context(), db.FOFAConfigPatch{Enabled: &on, APIKey: &key}); err != nil {
 		t.Fatal(err)
 	}
@@ -201,12 +208,27 @@ func TestFOFAToolSearchUsesAdmittedProxyWithoutCapture(t *testing.T) {
 	if calls.Load() != 2 || connects.Load() != 2 {
 		t.Fatal("显式字段查询未严格执行一次")
 	}
+	result, err = selected.Call(ctx, []byte(`{"query":"domain=\"example.test\""}`), nil)
+	if err != nil || !result.IsError || !strings.Contains(result.Flatten(), `"retry_after_seconds":120`) || calls.Load() != 3 {
+		t.Fatalf("上游429未形成结构化共享冷却: %v %s calls=%d", err, result.Flatten(), calls.Load())
+	}
+	// 同Key另一任务使用不同出口，仍必须由同一个持久冷却挡住。
+	otherTask := createRuntimeTask(t, s, db.TaskProxyModeDirect, nil)
+	otherCtx, otherFinish, ok := s.engine.beginTaskOperationContext(t.Context(), otherTask.ID)
+	if !ok {
+		t.Fatal("第二任务准入失败")
+	}
+	defer otherFinish()
+	result, err = selected.Call(otherCtx, []byte(`{"query":"domain=\"example.test\""}`), nil)
+	if err != nil || !result.IsError || !strings.Contains(result.Flatten(), `"code":"rate_limited"`) || calls.Load() != 3 {
+		t.Fatalf("跨任务/出口绕过共享冷却: %v %s calls=%d", err, result.Flatten(), calls.Load())
+	}
 	if n, err := capture.Count(); err != nil || n != 0 {
 		t.Fatal("凭据请求进入了流量库")
 	}
 	finish()
 	result, _ = selected.Call(ctx, []byte(`{"query":"domain=\"example.test\""}`), nil)
-	if !result.IsError || calls.Load() != 2 {
+	if !result.IsError || calls.Load() != 3 {
 		t.Fatal("已结束凭证仍能继续调用")
 	}
 }

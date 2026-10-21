@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,7 +25,7 @@ func (s *Server) registerFOFARoutes(mux *http.ServeMux) {
 }
 
 func fofaSettingsDTO(c db.FOFAConfig) map[string]any {
-	return map[string]any{"enabled": c.Enabled, "api_key_set": c.APIKey != ""}
+	return map[string]any{"enabled": c.Enabled, "api_key_set": c.APIKey != "", "request_interval_seconds": c.RequestIntervalSeconds, "rate_limit_cooldown_seconds": c.RateLimitCooldownSeconds}
 }
 
 func (s *Server) getFOFASettings(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +49,8 @@ func decodeFOFASettings(w http.ResponseWriter, r *http.Request, target any, test
 	properties := map[string]any{"api_key": map[string]any{"type": "string"}}
 	if !test {
 		properties["enabled"] = map[string]any{"type": "boolean"}
+		properties["request_interval_seconds"] = map[string]any{"type": "integer", "minimum": 1, "maximum": 60}
+		properties["rate_limit_cooldown_seconds"] = map[string]any{"type": "integer", "minimum": 1, "maximum": 3600}
 	}
 	if decodeProxyToolInput(data, objSchema(properties), nil) != nil {
 		return db.ErrFOFAConfig
@@ -92,15 +95,15 @@ func (s *Server) testFOFASettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "FOFA 测试参数无效")
 		return
 	}
+	c, err := s.m.pg.FOFAConfig()
+	if err != nil {
+		writeErr(w, 500, "FOFA 配置读取失败")
+		return
+	}
 	var key string
 	if p.APIKey != nil {
 		key = strings.TrimSpace(*p.APIKey)
 	} else {
-		c, err := s.m.pg.FOFAConfig()
-		if err != nil {
-			writeErr(w, 500, "FOFA 配置读取失败")
-			return
-		}
 		key = c.APIKey
 	}
 	if !db.ValidFOFAKey(key) {
@@ -109,14 +112,32 @@ func (s *Server) testFOFASettings(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	// 管理端检测采用当前全局出口，只访问账户接口，不进行资产搜索。
-	tr, finish, err := s.fofaTestTransport(ctx)
+	// 账户检测同样遵守共享节流；真正发送前才占用出口维护锁。
+	err = s.runFOFARequest(ctx, key, c, func() error {
+		latest, err := s.m.pg.FOFAConfig()
+		if err != nil || latest.RequestIntervalSeconds != c.RequestIntervalSeconds || latest.RateLimitCooldownSeconds != c.RateLimitCooldownSeconds || (p.APIKey == nil && latest.APIKey != key) {
+			return errors.New("FOFA 配置已变化，请重新测试")
+		}
+		return nil
+	}, func() error {
+		tr, finish, err := s.fofaTestTransport(ctx)
+		if err != nil {
+			return errors.New("当前出口不可用，未回退直连")
+		}
+		defer finish()
+		return fofa.New(&http.Client{Transport: tr}, key).Test(ctx)
+	})
 	if err != nil {
-		writeErr(w, 503, "当前出口不可用，未回退直连")
-		return
-	}
-	defer finish()
-	if err = fofa.New(&http.Client{Transport: tr}, key).Test(ctx); err != nil {
+		if errors.Is(err, db.ErrFOFAThrottleUnsettled) {
+			writeErr(w, 503, db.ErrFOFAThrottleUnsettled.Error())
+			return
+		}
+		var limited *fofa.RateLimitError
+		if errors.As(err, &limited) {
+			w.Header().Set("Retry-After", strconv.FormatInt(fofaRetrySeconds(limited.RetryAfter), 10))
+			writeErr(w, 429, limited.Error())
+			return
+		}
 		writeErr(w, 502, err.Error())
 		return
 	}

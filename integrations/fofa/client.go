@@ -121,6 +121,12 @@ func (c *Client) Test(ctx context.Context) error {
 	return err
 }
 
+// ValidateQuery 在申请请求配额前验证参数，不联网，也不修改调用方的查询。
+func ValidateQuery(q Query) error {
+	_, err := normalizeQuery(q)
+	return err
+}
+
 func normalizeQuery(q Query) (Query, error) {
 	q.Query = strings.TrimSpace(q.Query)
 	if q.Query == "" || len(q.Query) > 4096 {
@@ -181,7 +187,7 @@ func (c *Client) get(ctx context.Context, path string, values url.Values) ([]byt
 	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
 		return nil, errors.New("FOFA 鉴权失败，请检查 API Key 和账户权限")
 	case response.StatusCode == http.StatusTooManyRequests:
-		return nil, errors.New("FOFA 请求被限流，请稍后重试")
+		return nil, &RateLimitError{RetryAfter: parseRetryAfter(response.Header.Get("Retry-After"), time.Now())}
 	case response.StatusCode >= 300 && response.StatusCode < 400:
 		return nil, errors.New("FOFA 服务返回重定向，已拒绝跟随")
 	case response.StatusCode < 200 || response.StatusCode >= 300:
@@ -208,7 +214,7 @@ func (c *Client) get(ctx context.Context, path string, values url.Values) ([]byt
 		return nil, malformedResponse()
 	}
 	if *envelope.Error {
-		return nil, rejectedResponse(envelope.Message)
+		return nil, rejectedResponse(envelope.Message, parseRetryAfter(response.Header.Get("Retry-After"), time.Now()))
 	}
 	return data, nil
 }
@@ -217,7 +223,7 @@ func malformedResponse() error {
 	return errors.New("FOFA 返回了无效或不完整的结果")
 }
 
-func rejectedResponse(message string) error {
+func rejectedResponse(message string, retryAfter time.Duration) error {
 	message = strings.ToLower(message)
 	// 仅用于分类，绝不转发上游正文或原始错误消息。
 	for _, word := range []string{"quota", "insufficient", "credits", "余额", "额度", "积分", "f点"} {
@@ -225,9 +231,9 @@ func rejectedResponse(message string) error {
 			return errors.New("FOFA 账户额度不足，请检查可用查询额度")
 		}
 	}
-	for _, word := range []string{"rate limit", "too many", "限流", "频率"} {
+	for _, word := range []string{"rate limit", "too many requests", "限流", "频率"} {
 		if strings.Contains(message, word) {
-			return errors.New("FOFA 请求被限流，请稍后重试")
+			return &RateLimitError{RetryAfter: retryAfter}
 		}
 	}
 	for _, word := range []string{"api key", "api_key", "apikey", "unauthorized", "forbidden", "鉴权", "认证"} {

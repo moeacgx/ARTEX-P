@@ -64,8 +64,9 @@ func (d *DB) taskOperationLockConn(ctx context.Context) (*sql.Conn, error) {
 
 func (d *DB) Close() error {
 	var lockErr error
+	lockErr = d.closeFOFAThrottlePool()
 	if pool, ok := taskOperationLockPools.LoadAndDelete(d.DB); ok {
-		lockErr = pool.(*sql.DB).Close()
+		lockErr = errors.Join(lockErr, pool.(*sql.DB).Close())
 	}
 	return errors.Join(lockErr, d.DB.Close())
 }

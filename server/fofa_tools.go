@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 
@@ -46,14 +47,35 @@ func (s *Server) fofaTool() actool.CoreTool {
 			if !c.Enabled || c.APIKey == "" {
 				return actool.Errorf("FOFA 未启用或未配置，请在系统设置中保存 API Key 并启用"), nil
 			}
-			client, finish, err := s.admittedFOFAClient(ctx, c.APIKey)
-			if err != nil {
-				return actool.Errorf("FOFA 当前任务或出口不可用，未发起查询且未回退直连"), nil
-			}
-			defer finish()
-			result, err := client.Search(ctx, q)
-			if err != nil {
+			if err := fofa.ValidateQuery(q); err != nil {
 				return actool.Errorf(err.Error()), nil
+			}
+			var result *fofa.SearchResult
+			err = s.runFOFARequest(ctx, c.APIKey, c, func() error {
+				// 排队期间配置和授权可能变化；不能拿旧 Key 的许可发送新 Key。
+				latest, err := s.m.pg.FOFAConfig()
+				if err != nil || !latest.Enabled || latest.APIKey != c.APIKey || latest.RequestIntervalSeconds != c.RequestIntervalSeconds || latest.RateLimitCooldownSeconds != c.RateLimitCooldownSeconds {
+					return errors.New("FOFA 配置已变化，请重新确认后调用")
+				}
+				agentKey, _ := ctx.Value(fofaAgentContextKey{}).(string)
+				if agentKey != "" {
+					row, err := s.m.pg.GetTool("fofa_search")
+					if err != nil || row == nil || !row.System || !row.Enabled || !contains(row.Agents, agentKey) {
+						return errors.New("当前 Agent 的 FOFA 权限已变化，未发起查询")
+					}
+				}
+				return nil
+			}, func() error {
+				client, finish, err := s.admittedFOFAClient(ctx, c.APIKey)
+				if err != nil {
+					return errors.New("FOFA 当前任务或出口不可用，未发起查询且未回退直连")
+				}
+				defer finish()
+				result, err = client.Search(ctx, q)
+				return err
+			})
+			if err != nil {
+				return fofaToolError(err), nil
 			}
 			return jsonResult(result)
 		},

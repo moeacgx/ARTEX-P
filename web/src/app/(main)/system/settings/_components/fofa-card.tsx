@@ -25,6 +25,8 @@ export function FofaCard() {
   const [config, setConfig] = React.useState<FofaConfig | null>(null);
   const [enabled, setEnabled] = React.useState(false);
   const [apiKey, setApiKey] = React.useState("");
+  const [requestInterval, setRequestInterval] = React.useState("");
+  const [rateLimitCooldown, setRateLimitCooldown] = React.useState("");
   const [loadError, setLoadError] = React.useState("");
   const [action, setAction] = React.useState<"load" | "save" | "save-enable" | "enable" | "clear" | "test" | null>(
     "load",
@@ -35,6 +37,8 @@ export function FofaCard() {
     setConfig(value);
     setEnabled(value.enabled);
     setApiKey("");
+    setRequestInterval(String(value.request_interval_seconds));
+    setRateLimitCooldown(String(value.rate_limit_cooldown_seconds));
   }, []);
 
   const load = React.useCallback(async () => {
@@ -62,7 +66,10 @@ export function FofaCard() {
     locked.current = true;
     setAction(activate ? "save-enable" : "save");
     try {
-      const patch = fofaSettingsPatch(config, activate || enabled, apiKey);
+      const patch = fofaSettingsPatch(config, activate || enabled, apiKey, {
+        request_interval_seconds: requestInterval,
+        rate_limit_cooldown_seconds: rateLimitCooldown,
+      });
       const value = await fofaAPI.save(patch);
       applyConfig(value);
       toast.success(value.enabled ? "已保存 FOFA 配置并启用工具" : "已保存 FOFA 配置；工具尚未启用");
@@ -82,7 +89,7 @@ export function FofaCard() {
       const value = await fofaAPI.enable(config);
       setConfig(value);
       setEnabled(value.enabled);
-      // 启用已保存 Key 时保留尚未保存的新 Key 草稿。
+      // 只启用已保存配置，保留尚未保存的新 Key 和节流草稿。
       if (value.enabled) toast.success("已启用 FOFA；可通过测试连接确认 Key 是否有效");
       else toast.error("服务端尚未确认启用 FOFA，请重新读取配置");
     } catch (error) {
@@ -132,7 +139,12 @@ export function FofaCard() {
 
   const busy = action !== null;
   const hasKey = !!config?.api_key_set || apiKey.trim() !== "";
-  const changed = !!config && (enabled !== config.enabled || apiKey.trim() !== "");
+  const changed =
+    !!config &&
+    (enabled !== config.enabled ||
+      apiKey.trim() !== "" ||
+      requestInterval !== String(config.request_interval_seconds) ||
+      rateLimitCooldown !== String(config.rate_limit_cooldown_seconds));
   const status = config ? fofaSettingsStatus(config) : "unconfigured";
   const statusLabel = { unconfigured: "未配置", disabled: "Key 已保存，尚未启用", enabled: "已启用" }[status];
 
@@ -246,6 +258,44 @@ export function FofaCard() {
                   Skill 管理
                 </Link>{" "}
                 查看内置 FOFA 使用说明。
+              </p>
+            </div>
+            <div className="flex flex-col gap-3 border-t pt-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="fofa-request-interval">请求最小间隔（秒）</Label>
+                  <Input
+                    id="fofa-request-interval"
+                    type="number"
+                    min={1}
+                    max={60}
+                    step={1}
+                    value={requestInterval}
+                    disabled={busy}
+                    onChange={(event) => setRequestInterval(event.target.value)}
+                    aria-describedby="fofa-throttle-help"
+                  />
+                  <p className="text-muted-foreground text-xs">1–60 秒，默认 2 秒。</p>
+                </div>
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="fofa-rate-limit-cooldown">限流冷却时间（秒）</Label>
+                  <Input
+                    id="fofa-rate-limit-cooldown"
+                    type="number"
+                    min={1}
+                    max={3600}
+                    step={1}
+                    value={rateLimitCooldown}
+                    disabled={busy}
+                    onChange={(event) => setRateLimitCooldown(event.target.value)}
+                    aria-describedby="fofa-throttle-help"
+                  />
+                  <p className="text-muted-foreground text-xs">1–3600 秒，默认 60 秒。</p>
+                </div>
+              </div>
+              <p id="fofa-throttle-help" className="text-muted-foreground text-xs leading-relaxed">
+                本实例内所有 Worker 共用请求间隔和限流冷却，切换代理不会绕过冷却。发生限流后，按设置值与上游 Retry-After
+                中较长的时间等待。默认 60 秒是本程序的保守设置，不代表 FOFA 官方额度或限额。
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">

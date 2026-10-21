@@ -292,7 +292,7 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			log.Printf("[tools] 读取工具表失败，按代码默认放行: %v", err)
 			out := tools[:0:0]
 			for _, tool := range tools {
-				if !isProxyCenterTool(tool.Name()) {
+				if !isProxyCenterTool(tool.Name()) && tool.Name() != "fofa_search" {
 					out = append(out, tool)
 				}
 			}
@@ -309,6 +309,9 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 				_ = json.Unmarshal(row.Schema, &schema)
 			}
 			resolved := meterTool(agent.DecorateTool(t, row.Description, schema), pg, row.Key, agentKey, runInfo)
+			if t.Name() == "fofa_search" {
+				return authorizedFOFATool{CoreTool: resolved, pg: pg, agentKey: agentKey}
+			}
 			if isProxyCenterTool(t.Name()) {
 				return &authorizedProxyTool{CoreTool: resolved, pg: pg, agentKey: agentKey, schema: t.InputSchema()}
 			}
@@ -329,13 +332,13 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			}
 			row, known := byKey[t.Name()]
 			if !known { // MCP/skill/host tool: no row → untouched
-				if isProxyCenterTool(t.Name()) {
+				if isProxyCenterTool(t.Name()) || t.Name() == "fofa_search" {
 					continue
 				}
 				out = append(out, t)
 				continue
 			}
-			if !row.Enabled || !contains(row.Agents, agentKey) || (isProxyCenterTool(t.Name()) && !row.System) {
+			if !row.Enabled || !contains(row.Agents, agentKey) || ((isProxyCenterTool(t.Name()) || t.Name() == "fofa_search") && !row.System) {
 				continue // disabled globally or not bound to this agent → drop
 			}
 			out = append(out, resolve(t, row))

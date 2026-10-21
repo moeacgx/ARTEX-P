@@ -1,0 +1,103 @@
+// 通过 playwright-cli run-code --filename 执行；仅使用本地模拟接口，不调用 FOFA。
+async (page) => {
+  const check = (condition, message) => {
+    if (!condition) throw new Error(message);
+  };
+  const fixture = { config: { enabled: false, api_key_set: false }, failLoad: false, failWrite: false, calls: [] };
+  page.setDefaultTimeout(8000);
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  await page.addInitScript(() => {
+    localStorage.setItem("artex_token", "synthetic-fofa-ui-test");
+  });
+  await page.context().addCookies([{ name: "artex_token", value: "synthetic-fofa-ui-test", url: "http://127.0.0.1:3098" }]);
+  await page.unroute("**/api/**");
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const method = request.method();
+    if (path === "/api/integrations/fofa") {
+      fixture.calls.push({ path, method, body: request.postDataJSON() });
+      if (method === "GET" && fixture.failLoad) return route.fulfill({ status: 503, json: { error: "合成读取失败" } });
+      if (method === "PUT") {
+        if (fixture.failWrite) return route.fulfill({ status: 503, json: { error: "合成保存失败" } });
+        const body = request.postDataJSON();
+        fixture.config.enabled = body.enabled ?? fixture.config.enabled;
+        if (Object.hasOwn(body, "api_key")) fixture.config.api_key_set = body.api_key !== "";
+      }
+      return route.fulfill({ json: fixture.config });
+    }
+    if (path === "/api/integrations/fofa/test") {
+      fixture.calls.push({ path, method, body: request.postDataJSON() });
+      return route.fulfill({ json: { ok: true, message: "合成连接成功" } });
+    }
+    if (path === "/api/health") return route.fulfill({ json: { ok: true, service: "ARTEX", version: "dev-fofa-ui" } });
+    if (path === "/api/update/check") return route.fulfill({ json: { current: "dev-fofa-ui", has_update: false, supported: true, comparable: false } });
+    return route.fulfill({ json: {} });
+  });
+  await page.goto("http://127.0.0.1:3098/system/settings", { timeout: 60000 });
+  const card = page.locator('[data-slot="card"]').filter({ has: page.getByText("FOFA 资产搜索", { exact: true }) });
+  const key = card.getByLabel("API Key", { exact: true });
+  const toggle = card.getByRole("switch", { name: "启用 FOFA 工具" });
+  const save = card.getByRole("button", { name: "保存配置", exact: true });
+  const test = card.getByRole("button", { name: "测试连接", exact: true });
+  const clear = card.getByRole("button", { name: "清除 Key 并关闭", exact: true });
+  await key.waitFor();
+  check(await toggle.isDisabled(), "未配置密钥时不应允许开启");
+  check(await save.isDisabled(), "未修改时不应允许空白保存");
+  check(await key.getAttribute("type") === "text", "凭据输入不应触发登录密码识别");
+  check(await key.getAttribute("autocomplete") === "off", "凭据输入应禁用浏览器自动填充");
+  check(await key.evaluate((input) => getComputedStyle(input).webkitTextSecurity) === "disc", "凭据输入应保持遮罩");
+
+  await key.fill("synthetic-first-key");
+  await toggle.click();
+  await test.click();
+  await page.getByText("合成连接成功", { exact: true }).waitFor();
+  check(fixture.calls.filter((call) => call.method === "PUT").length === 0, "连接测试不能保存配置");
+  check(fixture.calls.some((call) => call.path.endsWith("/test") && call.body.api_key === "synthetic-first-key"), "应测试未保存的输入密钥");
+
+  await save.click();
+  await card.getByText("已配置", { exact: true }).waitFor();
+  check(await key.inputValue() === "", "保存成功后应移除内存中的输入密钥");
+  check(await toggle.isChecked(), "保存启用状态失败");
+  await test.click();
+  await test.waitFor({ state: "visible" });
+  check(fixture.calls.filter((call) => call.path.endsWith("/test")).at(-1).body.api_key === undefined, "空白测试应使用已有密钥");
+
+  await toggle.click();
+  await save.click();
+  await save.waitFor({ state: "visible" });
+  const disabled = fixture.calls.filter((call) => call.method === "PUT").at(-1);
+  check(disabled.body.enabled === false && !Object.hasOwn(disabled.body, "api_key"), "只保存开关不能清除旧密钥");
+  check(fixture.config.api_key_set, "只关闭开关应保留密钥");
+  await key.fill("synthetic-replacement-key");
+  await save.click();
+  await save.waitFor({ state: "visible" });
+  check(fixture.calls.filter((call) => call.method === "PUT").at(-1).body.api_key === "synthetic-replacement-key", "更换密钥未提交");
+  check(await key.inputValue() === "", "更换成功后应清空草稿");
+  await card.screenshot({ path: "output/playwright/fofa-settings/configured.png" });
+
+  await clear.click();
+  await card.getByText("未配置", { exact: true }).waitFor();
+  const cleared = fixture.calls.filter((call) => call.method === "PUT").at(-1).body;
+  check(cleared.api_key === "" && cleared.enabled === false, "清除必须明确提交空串并关闭工具");
+  check(!await toggle.isChecked() && await toggle.isDisabled(), "清除后应关闭并禁用开关");
+
+  fixture.failLoad = true;
+  await page.reload();
+  await card.getByRole("alert").waitFor();
+  check(await card.getByText("未配置", { exact: true }).count() === 0, "读取失败不能误显示未配置");
+  check(await key.count() === 0, "读取失败不能开放未知配置写入");
+  fixture.failLoad = false;
+  await card.getByRole("button", { name: "重新读取", exact: true }).click();
+  await key.waitFor();
+  await key.fill("synthetic-failed-write-key");
+  await toggle.click();
+  fixture.failWrite = true;
+  const before = fixture.calls.filter((call) => call.method === "PUT").length;
+  await save.evaluate((button) => { button.click(); button.click(); });
+  await page.getByText("保存失败：合成保存失败", { exact: true }).waitFor();
+  check(fixture.calls.filter((call) => call.method === "PUT").length === before + 1, "双击不能重复保存");
+  check(await key.inputValue() === "synthetic-failed-write-key", "保存失败应保留草稿供修正");
+  check(!fixture.config.enabled && !fixture.config.api_key_set, "保存失败不能伪装成功");
+  return { passed: true, synthetic: true, cases: 11, writes: fixture.calls.filter((call) => call.method === "PUT").length, searches: 0 };
+}

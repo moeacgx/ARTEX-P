@@ -81,6 +81,11 @@ jobs:
           timeout 60s go test ./server
           -run '^(TestChatDefault|TestLLMGlobalConversationUsesPoolSelectionAndFailover|TestResolveChatAgentHonoursConversationProfile|TestChatUnavailableReasonDistinguishesStates)'
           -count=1 -timeout 60s
+      - name: FOFA 配置、工具和内置 Skill 回归
+        run: |
+          timeout 60s go test ./integrations/fofa ./skills -count=1 -timeout 60s
+          timeout 60s go test ./db -run '^TestFOFAConfig' -count=1 -timeout 60s
+          timeout 60s go test ./server -run '^(TestFOFA|TestBuiltinFOFASkill)' -count=1 -timeout 60s
       - name: 重启恢复及出口引用回归
         run: |
           timeout 60s go test ./server -run '^(TestPlannerPGRestart|TestPlannerPGUnavailableResolver|TestPlannerPGProxyRecovers|TestPlannerPGLeaseRecovery|TestPlannerPGRetryHonors|TestPlannerPGGracefulRestart|TestServerShutdown)' -count=1 -timeout 60s
@@ -130,4 +135,4 @@ jobs:
         working-directory: web
         run: |
           npx tsc --noEmit
-          timeout 60s node --import ./scripts/test-api-loader.mjs --test src/lib/update-flow.test.mjs src/lib/update-api.test.mjs
+          timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/update-flow.test.mjs src/lib/update-api.test.mjs src/lib/fofa-settings.test.mjs

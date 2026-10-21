@@ -225,6 +225,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
+		if err := s.seedFOFATool(); err != nil {
+			log.Printf("[fofa] 工具初始化失败")
+		}
+		if err := s.seedFOFASkill(); err != nil {
+			log.Printf("[fofa] 内置 Skill 初始化失败: %v", err)
+		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools, m) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
@@ -773,6 +779,7 @@ func (s *Server) Handler() http.Handler {
 	s.registerSideRoutes(mux)
 	s.RegisterLLMModelRoutes(mux)
 	s.RegisterProxyActionRoutes(mux)
+	s.registerFOFARoutes(mux)
 
 	// Auth routes — exempt from JWT check (handled in requireAuth)
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)

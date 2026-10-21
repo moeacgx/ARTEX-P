@@ -1,4 +1,5 @@
 export const mentionKinds = [
+  { kind: "skill", label: "技能", alias: "skill" },
   { kind: "finding", label: "漏洞", alias: "finding" },
   { kind: "asset", label: "资产", alias: "asset" },
   { kind: "company", label: "企业", alias: "company" },
@@ -11,12 +12,10 @@ export const mentionKinds = [
 ] as const;
 
 export type MentionKind = (typeof mentionKinds)[number]["kind"];
-export interface ChatMention {
-  kind: MentionKind;
-  id: number;
+export type ChatMention = {
   label: string;
   description: string;
-}
+} & ({ kind: "skill"; id: string } | { kind: Exclude<MentionKind, "skill">; id: number });
 
 export function activeMention(value: string, caret: number) {
   const before = value.slice(0, caret);
@@ -43,6 +42,7 @@ export function mentionSearch(query: string) {
 }
 
 export function mentionToken(item: ChatMention) {
+  if (item.kind === "skill") return `@[技能#${item.id}]`;
   const kind = mentionKinds.find((entry) => entry.kind === item.kind)?.label ?? "资产";
   const label = item.label
     .replace(/[[\]]/g, (char) => (char === "[" ? "（" : "）"))
@@ -52,11 +52,13 @@ export function mentionToken(item: ChatMention) {
 }
 
 export function selectedMentions(value: string) {
-  return [...value.matchAll(/@\[(漏洞|资产|企业|接口|IP|应用|域名|子域名|服务)#([0-9]+)(?: ([^\]\r\n]*))?\]/g)].map(
-    (match) => ({
-      token: match[0],
-      label: `${match[1]} #${match[2]}${match[3] ? ` · ${match[3]}` : ""}`,
-      start: match.index,
-    }),
-  );
+  return [
+    ...value.matchAll(
+      /@\[(?:技能#([^\s[\]#]+)|(漏洞|资产|企业|接口|IP|应用|域名|子域名|服务)#([0-9]+)(?: ([^\]\r\n]*))?)\]/g,
+    ),
+  ].map((match) => ({
+    token: match[0],
+    label: match[1] ? `技能 · ${match[1]}` : `${match[2]} #${match[3]}${match[4] ? ` · ${match[4]}` : ""}`,
+    start: match.index,
+  }));
 }

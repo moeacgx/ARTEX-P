@@ -60,7 +60,7 @@ func TestParseRealYAML(t *testing.T) {
 		"  - nmap\n" +
 		"---\n" +
 		"Body here."
-	sk := parse(src)
+	sk := Parse(src)
 	if sk.Description != "ship it: fast and safe" {
 		t.Fatalf("quoted-colon description mishandled: %q", sk.Description)
 	}
@@ -77,7 +77,7 @@ func TestParseRealYAML(t *testing.T) {
 
 func TestParseMalformedYAMLDegrades(t *testing.T) {
 	// Broken YAML in the header must not drop the skill: fields empty, body loads.
-	sk := parse("---\n: : : not valid\n\t- bad indent\n---\nStill loads.")
+	sk := Parse("---\n: : : not valid\n\t- bad indent\n---\nStill loads.")
 	if sk.Instructions != "Still loads." {
 		t.Fatalf("body should still load on bad frontmatter, got %q", sk.Instructions)
 	}

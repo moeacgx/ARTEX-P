@@ -228,7 +228,7 @@ func LoadDir(dir string) (*Registry, error) {
 		if rerr != nil {
 			continue
 		}
-		s := parse(string(data))
+		s := Parse(string(data))
 		if s.Name == "" {
 			s.Name = strings.TrimSuffix(e.Name(), ".md")
 		}
@@ -256,11 +256,9 @@ type frontmatter struct {
 	MCP           stringOrList `yaml:"mcp"`
 }
 
-// parse extracts YAML frontmatter and body from a SKILL.md file using a real
-// YAML parser (multi-line values, quoted colons, block/flow lists all work).
-// Malformed frontmatter degrades gracefully: the fields stay empty and the body
-// still loads, so a bad header never drops the whole skill.
-func parse(s string) Skill {
+// Parse 使用 YAML 解析技能清单头部及正文，支持多行文本、引号与列表。
+// 头部格式错误时保留正文、元数据留空，与既有技能加载行为一致。
+func Parse(s string) Skill {
 	var sk Skill
 	body := s
 	if strings.HasPrefix(s, "---") {

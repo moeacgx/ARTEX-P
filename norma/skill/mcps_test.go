@@ -9,18 +9,18 @@ import (
 
 func TestParseMCPsFrontmatter(t *testing.T) {
 	cases := map[string][]string{
-		"---\nname: a\nmcps: browser\n---\nbody":            {"browser"},
+		"---\nname: a\nmcps: browser\n---\nbody":             {"browser"},
 		"---\nname: b\nmcps: browser, nmap\n---\nbody":       {"browser", "nmap"},
 		"---\nname: c\nmcps: [browser, \"nmap\"]\n---\nbody": {"browser", "nmap"},
 	}
 	for src, want := range cases {
-		sk := parse(src)
+		sk := Parse(src)
 		if strings.Join(sk.MCPs, ",") != strings.Join(want, ",") {
 			t.Fatalf("MCPs=%v want %v (src=%q)", sk.MCPs, want, src)
 		}
 	}
 	// no mcps → nil
-	if sk := parse("---\nname: d\n---\nbody"); sk.MCPs != nil {
+	if sk := Parse("---\nname: d\n---\nbody"); sk.MCPs != nil {
 		t.Fatalf("expected nil MCPs, got %v", sk.MCPs)
 	}
 }

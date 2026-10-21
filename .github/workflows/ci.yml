@@ -81,6 +81,8 @@ jobs:
           timeout 60s go test ./server
           -run '^(TestChatDefault|TestLLMGlobalConversationUsesPoolSelectionAndFailover|TestResolveChatAgentHonoursConversationProfile|TestChatUnavailableReasonDistinguishesStates)'
           -count=1 -timeout 60s
+      - name: 技能与记录引用和 Worker 发送回归
+        run: timeout 60s go test ./server -run '^(TestChatMention|TestChatSkillMention)' -count=1 -timeout 60s
       - name: FOFA 配置、工具和内置 Skill 回归
         run: |
           timeout 60s go test ./integrations/fofa ./skills -count=1 -timeout 60s
@@ -128,6 +130,9 @@ jobs:
           timeout 60s go test ./server -run '^(TestReleaseCache|TestUpdateOffer|TestUpdateStatus|TestWorkspaceProtects|TestPauseCancelsWithNamedCause|TestResumeYieldsFreshContext|TestResumeDoesNotClearDeleteBarrier)' -count=1 -timeout 60s
       - name: 技能打包下载与上传往返回归
         run: timeout 60s go test ./server -run '^(TestDownloadSkill|TestUploadSkill|TestSkillRelPath|TestValidSkillName)' -count=1 -timeout 60s
+      - name: 技能清单共享解析回归
+        working-directory: norma
+        run: timeout 60s go test ./skill -count=1 -timeout 60s
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -139,4 +144,4 @@ jobs:
         working-directory: web
         run: |
           npx tsc --noEmit
-          timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/update-flow.test.mjs src/lib/update-api.test.mjs src/lib/fofa-settings.test.mjs src/lib/skill-download-api.test.mjs
+          timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/update-flow.test.mjs src/lib/update-api.test.mjs src/lib/fofa-settings.test.mjs src/lib/skill-download-api.test.mjs src/lib/chat-mentions.test.mjs src/lib/chat-mentions-api.test.mjs

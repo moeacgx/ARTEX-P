@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -35,7 +36,7 @@ func TestChatMentionParsing(t *testing.T) {
 	if _, err := parseChatMentions(msg.String()); err == nil {
 		t.Fatal("accepted more than 10 references")
 	}
-	if actual, err := composeChatMentionMessage(nil, "普通消息 user@example.com @漏洞"); err != nil || actual != "普通消息 user@example.com @漏洞" {
+	if actual, err := composeChatMentionMessage(nil, "普通消息 user@example.com @漏洞", ""); err != nil || actual != "普通消息 user@example.com @漏洞" {
 		t.Fatalf("plain chat changed: %s %v", actual, err)
 	}
 }
@@ -123,7 +124,8 @@ func TestChatMentionWorkerReceivesServerDetails(t *testing.T) {
 	}
 	defer m.Close()
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{ctx: ctx, m: m, engine: NewEngine(m)}
+	s := &Server{ctx: ctx, m: m, engine: NewEngine(m), skillDir: t.TempDir()}
+	writeChatSkillFixture(t, s.skillDir, "worker-reference", "---\nname: actual-worker-skill\ndescription: Worker 应收到的技能描述\n---\n不能通过引用直接注入的正文\n")
 	task, err := m.CreateTask("Worker mention test", "Read referenced records", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -165,12 +167,15 @@ func TestChatMentionWorkerReceivesServerDetails(t *testing.T) {
 	if w := send("@[漏洞#9223372036854775807]"); w.Code != 400 {
 		t.Fatalf("invalid ref accepted: %d %s", w.Code, w.Body)
 	}
+	if w := send("@[技能#missing-skill]"); w.Code != 400 {
+		t.Fatalf("缺失的技能不能启动 Worker：%d %s", w.Code, w.Body)
+	}
 	node, _ := task.Store.GetNode(iid)
 	items, _, _ := task.Store.ActivityList(&iid, 0, 100)
 	if node.State != "paused" || len(items) != 0 {
 		t.Fatal("invalid reference started worker or persisted a turn")
 	}
-	message := fmt.Sprintf("请核对 @[漏洞#%d 测试]", fid)
+	message := fmt.Sprintf("请使用 @[技能#worker-reference] 核对 @[漏洞#%d 测试]", fid)
 	if w := send(message); w.Code != 200 {
 		t.Fatalf("send: %d %s", w.Code, w.Body)
 	}
@@ -179,6 +184,9 @@ func TestChatMentionWorkerReceivesServerDetails(t *testing.T) {
 		blob, _ := json.Marshal(req.Messages)
 		if !strings.Contains(string(blob), "worker-hidden-proof") || !strings.Contains(string(blob), "用户引用的记录快照") {
 			t.Fatalf("worker missing reference details: %s", blob)
+		}
+		if !strings.Contains(string(blob), "actual-worker-skill") || !strings.Contains(string(blob), "Worker 应收到的技能描述") || strings.Contains(string(blob), "不能通过引用直接注入的正文") {
+			t.Fatalf("Worker 没有收到正确技能元数据，或引用绕过加载工具：%s", blob)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("worker did not receive a model request")
@@ -255,10 +263,10 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 			t.Fatalf("search %s: %+v %v", kind, items, err)
 		}
 		if kind == "ip" {
-			if _, err := composeChatMentionMessage(pg, fmt.Sprintf("@[应用#%d]", id)); err == nil {
+			if _, err := composeChatMentionMessage(pg, fmt.Sprintf("@[应用#%d]", id), ""); err == nil {
 				t.Fatal("accepted mismatched type")
 			}
-			if data, err := loadChatMention(pg, chatMentionRef{"asset", id, "资产"}); err != nil || data == nil {
+			if data, err := loadChatMention(pg, chatMentionRef{Kind: "asset", ID: id, Name: "资产"}); err != nil || data == nil {
 				t.Fatalf("generic asset: %v", err)
 			}
 		}
@@ -266,7 +274,7 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 	if _, err := pg.Exec(`UPDATE findings SET report='完整报告内容',summary='最新摘要' WHERE id=$1`, fid); err != nil {
 		t.Fatal(err)
 	}
-	msg, err := composeChatMentionMessage(pg, refs.String())
+	msg, err := composeChatMentionMessage(pg, refs.String(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +283,7 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 			t.Errorf("context missing %s", want)
 		}
 	}
-	if _, err := composeChatMentionMessage(pg, "@[漏洞#9223372036854775807]"); err == nil {
+	if _, err := composeChatMentionMessage(pg, "@[漏洞#9223372036854775807]", ""); err == nil {
 		t.Fatal("accepted missing record")
 	}
 	for _, kind := range []string{"finding", "company", "asset", ""} {
@@ -301,26 +309,139 @@ func TestChatMentionCatalogAndContext(t *testing.T) {
 }
 
 func TestChatMentionConversationReceivesServerDetails(t *testing.T) {
-	s, fid := newRetestServer(t)
-	setRetestProvider(s, retestProvider{complete: func(_ context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
-		blob, _ := json.Marshal(req.Messages)
-		if !strings.Contains(string(blob), "original proof") || !strings.Contains(string(blob), "用户引用的记录快照") {
-			t.Errorf("model did not receive resolved evidence: %s", blob)
+	s := newModelExecutionServer(t)
+	s.skillDir = t.TempDir()
+	const skillDirName = "中文引用目录"
+	const invocationName = "chat-mention-actual"
+	const skillDescription = "服务端读取的技能目录描述"
+	const skillBody = "技能正文仅在Skill成功后可见"
+	const answer = "已读取记录并加载技能"
+	writeChatSkillFixture(t, s.skillDir, skillDirName, "---\nname: "+invocationName+"\ndescription: "+skillDescription+"\n---\n"+skillBody+"\n")
+
+	// 走真实 HTTP 渠道、对话调度与 Skill 装配，避免启动时 chatAgent 假实例掩盖动态解析。
+	type capturedRequest struct {
+		model       string
+		text        string
+		skillTool   bool
+		skillResult bool
+	}
+	requests := make(chan capturedRequest, 4)
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Role       string `json:"role"`
+				Content    any    `json:"content"`
+				ToolCallID string `json:"tool_call_id"`
+			} `json:"messages"`
+			Tools []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
 		}
-		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("已读取引用")}}, "end_turn", llm.Usage{}, nil
-	}})
-	c, err := s.m.pg.CreateConversation("auto", "引用测试", nil)
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("本地上游无法读取实际模型请求：%v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		captured := capturedRequest{model: request.Model}
+		for _, message := range request.Messages {
+			if text, ok := message.Content.(string); ok {
+				captured.text += text + "\n"
+			} else {
+				blob, _ := json.Marshal(message.Content)
+				captured.text += string(blob) + "\n"
+			}
+			if message.Role == "tool" && message.ToolCallID == "mention-skill-load" {
+				captured.skillResult = true
+			}
+		}
+		for _, tool := range request.Tools {
+			captured.skillTool = captured.skillTool || tool.Function.Name == "Skill"
+		}
+		requests <- captured
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{
+				"message": map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{
+					"id": "mention-skill-load", "type": "function", "function": map[string]any{"name": "Skill", "arguments": `{"name":"` + invocationName + `"}`},
+				}}}, "finish_reason": "tool_calls",
+			}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{
+			"message": map[string]any{"role": "assistant", "content": answer}, "finish_reason": "stop",
+		}}})
+	}))
+	t.Cleanup(upstream.Close)
+	profileID, models := executionModels(t, s, upstream.URL)
+	selection := &db.LLMModelSelection{ProfileID: profileID, ModelMode: db.LLMModelModeFixed, ModelID: &models.Models[0].ID}
+	key := fmt.Sprintf("mention_chat_%d", time.Now().UnixNano())
+	ag, err := s.m.pg.CreateAgent(key, "引用真实执行测试", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { waitRetestIdle(t, s); _, _ = s.m.pg.Exec(`DELETE FROM conversations WHERE id=$1`, c.ID) })
-	message := fmt.Sprintf("请查看 @[漏洞#%d 示例]", fid)
+	t.Cleanup(func() {
+		_, _ = s.m.pg.Exec(`DELETE FROM skill_usage WHERE agent_key=$1`, key)
+		_ = s.m.pg.DeleteAgent(key)
+	})
+	if err := s.m.pg.SetAgentLLMSelection(key, selection); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.pg.SetAgentMaxTurns(key, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.pg.SetAgentSkillVisibility(ag.ID, []string{skillDirName}); err != nil {
+		t.Fatal(err)
+	}
+	oldAugment, oldResolve, oldPrompt := agent.ToolAugment, agent.ToolResolve, agent.PromptOverride
+	agent.ToolResolve, agent.PromptOverride = nil, nil
+	wireAgentAugment(s.m.pg, s.skillDir, nil, s.m)
+	t.Cleanup(func() {
+		waitDefaultChatIdle(t, s)
+		agent.ToolAugment, agent.ToolResolve, agent.PromptOverride = oldAugment, oldResolve, oldPrompt
+	})
+	fid, err := s.m.pg.AddFinding(0, 0, "chat-mention", "引用执行测试", "low", "summary", "original proof", key, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.m.pg.DeleteFinding(fid) })
+	c, err := s.m.pg.CreateConversationSelection(key, "引用测试", selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { waitDefaultChatIdle(t, s); _ = s.m.pg.DeleteConversation(c.ID) })
+	if _, err := s.m.setProxyPolicy(t.Context(), db.ProxySubject{Kind: "conversation", ID: c.ID}, 0, db.ProxyPolicyPatch{Mode: db.TaskProxyModeDirect}); err != nil {
+		t.Fatal(err)
+	}
+	message := fmt.Sprintf("请查看 @[漏洞#%d 示例] 并参考 @[技能#%s]", fid, skillDirName)
 	body, _ := json.Marshal(map[string]any{"message": message})
 	w := retestRequest(s.pgSendConversationMessage, http.MethodPost, c.ID, string(body))
 	if w.Code != 202 {
 		t.Fatalf("send: %d %s", w.Code, w.Body)
 	}
-	waitRetestIdle(t, s)
+	waitDefaultChatResult(t, s, c.ID, answer)
+	if calls.Load() != 2 {
+		t.Fatalf("预期引用解析后再通过一次 Skill 加载，共两次真实模型请求，实际 %d", calls.Load())
+	}
+	first, second := <-requests, <-requests
+	for _, want := range []string{"original proof", "用户引用的记录快照", `"invocation_name":"` + invocationName + `"`, skillDescription} {
+		if !strings.Contains(first.text, want) {
+			t.Errorf("实际首轮模型请求缺少引用元数据 %q：%s", want, first.text)
+		}
+	}
+	if first.model != "real-a" || !first.skillTool || strings.Contains(first.text, skillBody) {
+		t.Fatalf("首轮应走绑定模型并提供 Skill 工具，不能提前注入正文：%+v", first)
+	}
+	if !second.skillResult || !strings.Contains(second.text, skillBody) {
+		t.Fatalf("真实 Skill 调用未向第二轮模型返回技能正文：%+v", second)
+	}
+	var skillCalls int
+	if err := s.m.pg.QueryRow(`SELECT count(*) FROM skill_usage WHERE agent_key=$1 AND skill=$2 AND found=true`, key, skillDirName).Scan(&skillCalls); err != nil || skillCalls != 1 {
+		t.Fatalf("技能调用未按目录归属记录成功：count=%d err=%v", skillCalls, err)
+	}
 	items, _, err := s.m.pg.ConvActivityList(c.ID, 0, 100)
 	if err != nil {
 		t.Fatal(err)

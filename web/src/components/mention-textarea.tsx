@@ -47,6 +47,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
   const search = mentionSearch(active?.query ?? "");
   const open = !!active && !dismissed && !disabled;
   const categories = search.categories;
+  const searchFields = search.kind === "skill" ? "名称或描述" : "名称、地址或 ID";
   const requestKey = open && !categories.length ? `${search.kind}:${search.query}` : "";
   const loading = !!requestKey && result?.key !== requestKey;
   const items = result?.key === requestKey ? result.items : [];
@@ -163,13 +164,14 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
     setActiveIndex(0);
   }
 
-  function keyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
+  // 文本区和弹层搜索框共享选择键位，搜索后可直接回车确认。
+  function mentionKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement | HTMLInputElement>) {
+    if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return true;
     if (open) {
       if (event.key === "Escape") {
         event.preventDefault();
         setDismissed(true);
-        return;
+        return true;
       }
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
@@ -177,22 +179,22 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
           pendingKeyboardIndex.current = count;
           setActiveIndex(count);
           loadMore();
-          return;
+          return true;
         }
         if (count) setActiveIndex((index) => (index + (event.key === "ArrowDown" ? 1 : count - 1)) % count);
-        return;
+        return true;
       }
       if ((event.key === "Enter" || event.key === "Tab") && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
         if (event.key === "Tab" && (loading || !count)) {
           setDismissed(true);
-          return;
+          return false;
         }
         event.preventDefault();
         if (!loading && count) choose(Math.min(activeIndex, count - 1));
-        return;
+        return true;
       }
     }
-    onKeyDown?.(event);
+    return false;
   }
 
   const Control = inputGroup ? InputGroupTextarea : Textarea;
@@ -212,7 +214,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
               value={value}
               disabled={disabled}
               className={className}
-              aria-label={props["aria-label"] ?? "消息，输入 @ 引用记录"}
+              aria-label={props["aria-label"] ?? "消息，输入 @ 引用记录或技能"}
               aria-autocomplete="list"
               aria-controls={open ? listId : undefined}
               aria-expanded={open}
@@ -231,7 +233,9 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
               onCompositionEnd={() => {
                 composing.current = false;
               }}
-              onKeyDown={keyDown}
+              onKeyDown={(event) => {
+                if (!mentionKeyDown(event)) onKeyDown?.(event);
+              }}
             />
           </div>
         </PopoverAnchor>
@@ -251,11 +255,15 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
               <Input
                 value={search.query}
                 onChange={(event) => updateSearchQuery(event.target.value)}
-                placeholder={`搜索${mentionKinds.find((kind) => kind.kind === search.kind)?.label ?? "记录"}名称、地址或 ID`}
+                placeholder={`搜索${mentionKinds.find((kind) => kind.kind === search.kind)?.label ?? "记录"}${searchFields}`}
                 aria-label={`搜索${mentionKinds.find((kind) => kind.kind === search.kind)?.label ?? "引用记录"}`}
+                aria-autocomplete="list"
+                aria-controls={listId}
+                aria-activedescendant={count ? `${listId}-${Math.min(activeIndex, count - 1)}` : undefined}
                 autoComplete="off"
                 autoCorrect="off"
                 spellCheck={false}
+                onKeyDown={mentionKeyDown}
               />
             </div>
           )}
@@ -309,7 +317,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
             )}
             {!categories.length && !loading && !error && !items.length && (
               <div role="status" className="p-3 text-muted-foreground text-sm">
-                没有匹配记录，请更换名称、地址或 ID
+                没有匹配{search.kind === "skill" ? "技能" : "记录"}，请更换{searchFields}
               </div>
             )}
             {items.map((item, index) => (
@@ -329,7 +337,9 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
                 <span className="flex w-full items-center gap-2">
                   <Badge variant="outline">{mentionKinds.find((kind) => kind.kind === item.kind)?.label}</Badge>
                   <span className="truncate text-sm">{item.label}</span>
-                  <span className="ml-auto shrink-0 text-muted-foreground text-xs">#{item.id}</span>
+                  {item.kind !== "skill" && (
+                    <span className="ml-auto shrink-0 text-muted-foreground text-xs">#{item.id}</span>
+                  )}
                 </span>
                 <span className="w-full truncate text-muted-foreground text-xs">{item.description}</span>
               </button>
@@ -347,7 +357,7 @@ export function MentionTextarea({ value, onValueChange, onKeyDown, className, in
               {!loadingMore &&
                 !nextCursor &&
                 (loading || !!error || items.length === 0) &&
-                "输入名称、地址或 ID 搜索记录"}
+                `输入${searchFields}搜索${search.kind === "skill" ? "技能" : "记录"}`}
             </p>
           )}
         </PopoverContent>

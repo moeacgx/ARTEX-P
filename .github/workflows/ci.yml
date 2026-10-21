@@ -76,6 +76,11 @@ jobs:
           timeout 60s go test ./server
           -run '^(TestTriggeredRunUsesAgentBoundProfileWithoutGlobalChatAgent|TestReporterSavesReportAfterStartupProxyRecovers|TestToolTriggerRetriesUnavailableAgentWithoutDuplicatingOtherTriggers)$'
           -count=1 -timeout 60s
+      - name: 默认对话配置恢复回归
+        run: >-
+          timeout 60s go test ./server
+          -run '^(TestChatDefault|TestLLMGlobalConversationUsesPoolSelectionAndFailover|TestResolveChatAgentHonoursConversationProfile|TestChatUnavailableReasonDistinguishesStates)'
+          -count=1 -timeout 60s
       - name: 重启恢复及出口引用回归
         run: |
           timeout 60s go test ./server -run '^(TestPlannerPGRestart|TestPlannerPGUnavailableResolver|TestPlannerPGProxyRecovers|TestPlannerPGLeaseRecovery|TestPlannerPGRetryHonors|TestPlannerPGGracefulRestart|TestServerShutdown)' -count=1 -timeout 60s

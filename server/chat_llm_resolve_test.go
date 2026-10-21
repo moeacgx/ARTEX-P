@@ -18,7 +18,7 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer m.Close()
+	t.Cleanup(func() { _ = m.Close() })
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 
@@ -68,9 +68,21 @@ func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer m.Close()
+	t.Cleanup(func() { _ = m.Close() })
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
+
+	// 此用例要求没有激活配置，不能仅清空内存实例来模拟缺少默认渠道。
+	active, err := m.pg.ActiveProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != nil {
+		if _, err := m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=$1`, active.ID); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = m.pg.SetActiveProfile(active.ID) })
+	}
 
 	// Force the global fallback to nil so a non-nil result can ONLY come from the
 	// conversation's own profile — this is exactly the situation the user hit

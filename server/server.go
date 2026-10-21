@@ -565,13 +565,9 @@ func (s *Server) resolveChatAgent(c *db.Conversation) *agent.ChatAgent {
 		if c.LLMProfileID != nil {
 			return s.chatAgentForSelection(db.LLMModelSelection{ProfileID: *c.LLMProfileID, ModelMode: c.LLMModelMode, ModelID: c.LLMModelID})
 		}
-		s.cfgMu.Lock()
-		configured := s.llmOn && s.chatAgent != nil
-		s.cfgMu.Unlock()
-		if configured {
-			if p, _ := s.m.pg.ActiveProfile(); p != nil {
-				return s.globalChatAgent()
-			}
+		// 启动时代理可能尚未恢复；按当前激活配置解析，避免旧就绪标志永久拦住默认对话。
+		if p, _ := s.m.pg.ActiveProfile(); p != nil {
+			return s.globalChatAgent()
 		}
 	}
 	return s.chatAgentRef()

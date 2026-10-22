@@ -1,9 +1,53 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 )
+
+// ClearStaleConversationActivities 仅供人工核实所有真实操作退出后的正式恢复入口。
+// 独占执行锁、版本和已消失的数据库会话缺一不可；不按超时推断外部操作已经退出。
+func (x *ProxyPolicyExecutor) ClearStaleConversationActivities(expected int64) (ProxyPolicy, error) {
+	var out ProxyPolicy
+	if x.Subject.Kind != "conversation" {
+		return out, ErrProxyInvalidMode
+	}
+	err := x.x.d.withProxySwitchLifecycle(x.x.conn, func(tx *sql.Tx) error {
+		p, err := proxyPolicyTx(tx, x.Subject)
+		if err != nil {
+			return err
+		}
+		out = p
+		if p.State.Revision != expected {
+			return ErrProxyRevisionConflict
+		}
+		var switching, liveOwner bool
+		if err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM proxy_switch_requests WHERE policy_id=$1 AND state IN ('pending','draining','applying','recovery_required'))`, p.ID).Scan(&switching); err != nil {
+			return err
+		}
+		if p.SwitchToken != "" || switching {
+			return ErrProxySwitchRecovery
+		}
+		// 丢失共享锁但数据库会话仍在时也保持阻塞，不能以锁丢失代替真实退出。
+		if err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM proxy_subject_activity a JOIN pg_stat_activity s ON s.pid=a.backend_pid WHERE a.policy_id=$1)`, p.ID).Scan(&liveOwner); err != nil {
+			return err
+		}
+		if liveOwner {
+			return ErrProxyInUse
+		}
+		if err = warpHealthLock(context.Background(), tx); err != nil {
+			return err
+		}
+		// 只释放本主体原 token 对应的 WARP 引用；独立探测和其他主体的引用原样保留。
+		if _, err = tx.Exec(`DELETE FROM warp_proxy_health_activity w USING proxy_subject_activity a WHERE w.activity_token::text=a.token AND a.policy_id=$1`, p.ID); err != nil {
+			return err
+		}
+		_, err = tx.Exec(`DELETE FROM proxy_subject_activity WHERE policy_id=$1`, p.ID)
+		return err
+	})
+	return out, err
+}
 
 // 人工恢复仍必须取得主体独占锁并核验真实活动为空，不以时间或状态夺权。
 type ProxyPolicyRecovery struct {

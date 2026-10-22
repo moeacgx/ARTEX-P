@@ -10,7 +10,8 @@ import (
 func (s *Server) recoverSubjectProxyPolicy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		proxyPolicyHTTPInput
-		Action string `json:"action"`
+		Action                  string `json:"action"`
+		ConfirmOperationsExited *bool  `json:"confirm_operations_exited"`
 	}
 	if !decodeProxyHTTP(w, r, &req) {
 		return
@@ -26,6 +27,10 @@ func (s *Server) recoverSubjectProxyPolicy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var patch *db.ProxyPolicyPatch
+	if req.Action != "clear_stale_activity" && req.ConfirmOperationsExited != nil {
+		s.writeProxyPolicyError(w, db.ErrProxyInvalidMode)
+		return
+	}
 	switch req.Action {
 	case "replace_policy", "confirm_released_replace_policy":
 		_, v, err := req.proxyPolicyHTTPInput.patch()
@@ -34,6 +39,12 @@ func (s *Server) recoverSubjectProxyPolicy(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		patch = &v
+	case "clear_stale_activity":
+		// 操作者必须先完成浏览器、工具和模型出口的真实退出核验，不能仅凭 owner 消失清理。
+		if subject.Kind != "conversation" || req.ConfirmOperationsExited == nil || !*req.ConfirmOperationsExited || req.Mode != "" || len(req.ID)+len(req.Groups)+len(req.Enabled)+len(req.Cooldown)+len(req.Budget) > 0 {
+			s.writeProxyPolicyError(w, db.ErrProxyInvalidMode)
+			return
+		}
 	case "retry", "confirm_released":
 		if req.Mode != "" || len(req.ID)+len(req.Groups)+len(req.Enabled)+len(req.Cooldown)+len(req.Budget) > 0 {
 			s.writeProxyPolicyError(w, db.ErrProxyInvalidMode)
@@ -62,6 +73,9 @@ func (m *Manager) recoverSubjectProxyPolicy(ctx context.Context, subject db.Prox
 		return db.ProxyPolicy{}, e
 	}
 	defer x.Close()
+	if action == "clear_stale_activity" {
+		return x.ClearStaleConversationActivities(expected)
+	}
 	recovery, e := x.PendingRecovery(expected)
 	if e != nil {
 		return recovery.Policy, e

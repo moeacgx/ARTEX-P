@@ -267,3 +267,105 @@ func TestCatalogDownloadOnlyContainsVerifiedRepositoryFiles(t *testing.T) {
 		t.Fatal("下载未携带精确提交")
 	}
 }
+
+func TestCatalogPayloadUsesExistingSkillNameRules(t *testing.T) {
+	for _, name := range []string{"proof_v1", "proof--v1", "proof-", "Proof", strings.Repeat("a", 65)} {
+		t.Run(name, func(t *testing.T) {
+			files := map[string][]byte{"SKILL.md": []byte("---\nname: " + name + "\n---\n说明")}
+			if _, err := validateCatalogPayload(catalog.Item{Kind: "skill", ID: name}, files); err == nil {
+				t.Fatal("目录允许安装现有技能接口无法管理的名称")
+			}
+			agent := catalog.Item{Kind: "agent", ID: "proof_agent", Skills: []string{name}}
+			if _, err := validateCatalogPayload(agent, map[string][]byte{"agent.json": []byte(`{"key":"proof_agent","name":"证据助手","prompt":"整理证据"}`)}); err == nil {
+				t.Fatal("Agent允许绑定不符合现有名称规范的技能依赖")
+			}
+		})
+	}
+	files := map[string][]byte{"SKILL.md": []byte("---\nname: proof-v1\n---\n说明")}
+	if _, err := validateCatalogPayload(catalog.Item{Kind: "skill", ID: "proof-v1", Skills: []string{"other-proof"}}, files); err != nil {
+		t.Fatalf("合法技能名称被拒绝：%v", err)
+	}
+}
+
+func TestCatalogPlatformSkillMutationsShareInstallationLock(t *testing.T) {
+	for _, create := range []bool{true, false} {
+		t.Run(map[bool]string{true: "create_skill", false: "update_skill_file"}[create], func(t *testing.T) {
+			s := &Server{skillDir: t.TempDir()}
+			root := filepath.Join(s.skillDir, "proof")
+			if !create {
+				if err := os.Mkdir(root, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			skillMutationMu.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					skillMutationMu.Unlock()
+				}
+			}()
+			started := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				tool := s.toolUpdateSkillFile()
+				in := json.RawMessage(`{"name":"proof","content":"Agent修改"}`)
+				if create {
+					tool = s.toolCreateSkill()
+					in = json.RawMessage(`{"name":"proof","description":"Agent创建"}`)
+				}
+				close(started)
+				result, err := tool.Call(context.Background(), in, nil)
+				if err == nil && !result.IsError {
+					err = fmt.Errorf("Agent写入未在锁内重新判断技能存在性")
+				}
+				done <- err
+			}()
+			<-started
+			select {
+			case <-done:
+				t.Fatal("Agent技能写入绕过了目录安装锁")
+			case <-time.After(30 * time.Millisecond):
+			}
+			// 模拟安装在持锁期间改变目录，工具必须在获得锁后复核存在性。
+			if create {
+				if err := os.Mkdir(root, 0755); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Rename(root, root+"-old"); err != nil {
+				t.Fatal(err)
+			}
+			skillMutationMu.Unlock()
+			locked = false
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("安装锁释放后Agent工具未恢复")
+			}
+			if _, err := os.Stat(filepath.Join(root, "SKILL.md")); !os.IsNotExist(err) {
+				t.Fatalf("存在性变化后仍写入了技能：%v", err)
+			}
+		})
+	}
+}
+
+func TestCatalogHTTPAgentSkillWriteInvalidatesPreview(t *testing.T) {
+	s := catalogTestServer(t)
+	catalogSkillFixture(t)
+	if w := installCatalogPreview(t, s, previewCatalogSkill(t, s, "1")); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	p := previewCatalogSkill(t, s, "2")
+	result, err := s.toolUpdateSkillFile().Call(context.Background(), json.RawMessage(`{"name":"proof","content":"Agent最新修改"}`), nil)
+	if err != nil || result.IsError {
+		t.Fatalf("Agent写入失败：%v %+v", err, result)
+	}
+	if w := installCatalogPreview(t, s, p); w.Code != 409 {
+		t.Fatalf("Agent写入后过期安装应409：%d %s", w.Code, w.Body)
+	}
+	if b, err := os.ReadFile(filepath.Join(s.skillDir, "proof", "SKILL.md")); err != nil || string(b) != "Agent最新修改" {
+		t.Fatalf("Agent最新写入被覆盖：%v %q", err, b)
+	}
+}

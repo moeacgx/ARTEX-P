@@ -268,7 +268,15 @@ func strictCatalogJSON(b []byte, v any) error {
 }
 
 func validateCatalogPayload(i catalog.Item, files map[string][]byte) ([]byte, error) {
+	for _, name := range i.Skills {
+		if !validSkillName(name) {
+			return nil, fmt.Errorf("技能依赖名称无效：%s", name)
+		}
+	}
 	if i.Kind == "skill" {
+		if !validSkillName(i.ID) {
+			return nil, fmt.Errorf("技能目录ID不符合技能名称规范")
+		}
 		if skillNameFromFrontmatter(files["SKILL.md"]) != i.ID {
 			return nil, fmt.Errorf("SKILL.md name 必须与目录ID一致")
 		}

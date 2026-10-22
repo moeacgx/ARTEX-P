@@ -978,7 +978,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			log.Printf("[planner] task %s 规划完成", t.ID)
 		}
 		e.touch(t.ID)
-		return
+		// 单轮已返回而清理仍在继续时，保留独占 lease 并安排恢复唤醒。
+		// 真正退出前准入会拒绝新轮次，退出后无需再等十分钟普通心跳。
+		return agent.HasPendingPlannerExit(plannerErr) && e.plannerRetryAllowed(t)
 	}
 
 	for {

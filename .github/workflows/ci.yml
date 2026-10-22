@@ -86,6 +86,8 @@ jobs:
       - name: 在线目录安装、绑定与回滚回归
         run: |
           timeout 60s go test ./db ./server -run '^TestCatalog' -count=1 -timeout 60s
+      - name: Agent 绑定计数与工具空绑定回归
+        run: timeout 60s go test ./db ./server -run '^(TestAgentBindingCounts|TestToolWrites|TestAgentListBindingCount)' -count=1 -timeout 60s
       - name: FOFA 配置、工具和内置 Skill 回归
         run: |
           timeout 60s go test ./integrations/fofa ./skills -count=1 -timeout 60s

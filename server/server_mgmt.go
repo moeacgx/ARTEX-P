@@ -237,13 +237,17 @@ func (s *Server) pgListAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dtos := agentDTOs(ags)
-	// overlay per-agent binding counts (mcp/skill by id, tools by key) — best-effort.
-	if mcp, skill, tools, err := pg.AgentBindingCounts(); err == nil {
-		for i := range dtos {
-			dtos[i].McpCount = mcp[ags[i].ID]
-			dtos[i].SkillCount = skill[ags[i].ID]
-			dtos[i].ToolCount = tools[ags[i].Key]
-		}
+	// 统计失败必须可见，避免把读取错误伪装成所有 Agent 都没有绑定。
+	mcp, skill, tools, err := pg.AgentBindingCounts()
+	if err != nil {
+		log.Printf("[agents] 读取绑定统计失败: %v", err)
+		writeErr(w, http.StatusInternalServerError, "读取 Agent 绑定统计失败")
+		return
+	}
+	for i := range dtos {
+		dtos[i].McpCount = mcp[ags[i].ID]
+		dtos[i].SkillCount = skill[ags[i].ID]
+		dtos[i].ToolCount = tools[ags[i].Key]
 	}
 	writeJSON(w, 200, map[string]any{"agents": dtos})
 }

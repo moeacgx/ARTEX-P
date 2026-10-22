@@ -612,7 +612,10 @@ func (d *DB) AgentBindingCounts() (mcp map[int64]int, skill map[int64]int, tools
 	if err = byID(`SELECT agent_id, count(*) FROM agent_skill_visibility WHERE enabled GROUP BY agent_id`, skill); err != nil {
 		return
 	}
-	rows, e := d.Query(`SELECT elem, count(*) FROM tools, jsonb_array_elements_text(agents) AS elem GROUP BY elem`)
+	// 旧版本可能把空绑定写成 JSON null；异常非数组只影响该工具，不能拖垮全部 Agent 的统计。
+	rows, e := d.Query(`SELECT elem, count(*) FROM tools,
+jsonb_array_elements_text(CASE WHEN jsonb_typeof(agents)='array' THEN agents ELSE '[]'::jsonb END) AS elem
+GROUP BY elem`)
 	if e != nil {
 		err = e
 		return

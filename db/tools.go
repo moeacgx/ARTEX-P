@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 )
 
 // Tool is one row of the built-in tool catalog. key + handler live in code; this
@@ -24,6 +25,20 @@ type Tool struct {
 
 const toolCols = `key, system, description, schema, agents, enabled, kind, exec, deferred`
 
+// 空绑定统一写成数组，避免 JSON null 污染依赖数组语义的查询。
+func normalizeToolAgents(raw json.RawMessage) (json.RawMessage, error) {
+	var keys []string
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &keys); err != nil {
+			return nil, errors.New("工具 Agent 绑定必须为字符串数组")
+		}
+	}
+	if keys == nil {
+		keys = []string{}
+	}
+	return json.Marshal(keys)
+}
+
 // SeedTool inserts a built-in tool's code-defined defaults ONCE. ON CONFLICT DO
 // NOTHING: an existing row (possibly edited in the UI) is never overwritten on
 // startup — that's what keeps page edits from being wiped every restart. Use
@@ -32,10 +47,11 @@ func (d *DB) SeedTool(key, desc string, schema, agents json.RawMessage) error {
 	if len(schema) == 0 {
 		schema = json.RawMessage("{}")
 	}
-	if len(agents) == 0 {
-		agents = json.RawMessage("[]")
+	agents, err := normalizeToolAgents(agents)
+	if err != nil {
+		return err
 	}
-	_, err := d.Exec(`
+	_, err = d.Exec(`
 INSERT INTO tools(key, system, description, schema, agents, enabled)
 VALUES ($1, true, $2, $3, $4, true)
 ON CONFLICT (key) DO NOTHING`, key, desc, schema, agents)
@@ -47,7 +63,7 @@ ON CONFLICT (key) DO NOTHING`, key, desc, schema, agents)
 // default toolset on existing DBs.
 func (d *DB) AddAgentToToolBinding(agentKey string, keys []string) error {
 	for _, k := range keys {
-		if _, err := d.Exec(`UPDATE tools SET agents = agents || to_jsonb($1::text) WHERE key=$2 AND NOT (agents ? $1)`, agentKey, k); err != nil {
+		if _, err := d.Exec(`UPDATE tools SET agents = (CASE WHEN jsonb_typeof(agents)='array' THEN agents ELSE '[]'::jsonb END) || to_jsonb($1::text) WHERE key=$2 AND NOT ((CASE WHEN jsonb_typeof(agents)='array' THEN agents ELSE '[]'::jsonb END) ? $1)`, agentKey, k); err != nil {
 			return err
 		}
 	}
@@ -77,10 +93,11 @@ func (d *DB) UpsertToolForce(key, desc string, schema, agents json.RawMessage) e
 	if len(schema) == 0 {
 		schema = json.RawMessage("{}")
 	}
-	if len(agents) == 0 {
-		agents = json.RawMessage("[]")
+	agents, err := normalizeToolAgents(agents)
+	if err != nil {
+		return err
 	}
-	_, err := d.Exec(`
+	_, err = d.Exec(`
 INSERT INTO tools(key, system, description, schema, agents, enabled)
 VALUES ($1, true, $2, $3, $4, true)
 ON CONFLICT (key) DO UPDATE
@@ -159,10 +176,11 @@ func (d *DB) CreateCustomTool(t *Tool) error {
 		exec = json.RawMessage("{}")
 	}
 	agents, _ := json.Marshal(t.Agents)
-	if len(agents) == 0 {
-		agents = json.RawMessage("[]")
+	agents, err := normalizeToolAgents(agents)
+	if err != nil {
+		return err
 	}
-	_, err := d.Exec(`
+	_, err = d.Exec(`
 INSERT INTO tools(key, system, description, schema, agents, enabled, kind, exec, deferred)
 VALUES ($1, false, $2, $3, $4, $5, $6, $7, $8)`,
 		t.Key, t.Description, schema, agents, t.Enabled, t.Kind, exec, t.Deferred)
@@ -181,10 +199,11 @@ func (d *DB) UpdateCustomTool(t *Tool) error {
 		exec = json.RawMessage("{}")
 	}
 	agents, _ := json.Marshal(t.Agents)
-	if len(agents) == 0 {
-		agents = json.RawMessage("[]")
+	agents, err := normalizeToolAgents(agents)
+	if err != nil {
+		return err
 	}
-	_, err := d.Exec(`
+	_, err = d.Exec(`
 UPDATE tools SET description=$2, schema=$3, agents=$4, enabled=$5, kind=$6, exec=$7, deferred=$8
 WHERE key=$1 AND system=false`,
 		t.Key, t.Description, schema, agents, t.Enabled, t.Kind, exec, t.Deferred)
@@ -222,10 +241,11 @@ func (d *DB) UpdateTool(key, desc string, schema, agents json.RawMessage, enable
 	if len(schema) == 0 {
 		schema = json.RawMessage("{}")
 	}
-	if len(agents) == 0 {
-		agents = json.RawMessage("[]")
+	agents, err := normalizeToolAgents(agents)
+	if err != nil {
+		return err
 	}
-	_, err := d.Exec(`
+	_, err = d.Exec(`
 UPDATE tools SET description=$2, schema=$3, agents=$4, enabled=$5 WHERE key=$1`,
 		key, desc, schema, agents, enabled)
 	return err

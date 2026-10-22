@@ -157,7 +157,7 @@ func (d *DB) CatalogApply(ctx context.Context, kind, key, expectedHash string, p
 			return err
 		}
 		for _, toolKey := range tools {
-			res, e := tx.ExecContext(ctx, `UPDATE tools SET agents=agents || to_jsonb($1::text) WHERE key=$2 AND NOT (agents ? $1)`, key, toolKey)
+			res, e := tx.ExecContext(ctx, `UPDATE tools SET agents=(CASE WHEN jsonb_typeof(agents)='array' THEN agents ELSE '[]'::jsonb END) || to_jsonb($1::text) WHERE key=$2 AND NOT ((CASE WHEN jsonb_typeof(agents)='array' THEN agents ELSE '[]'::jsonb END) ? $1)`, key, toolKey)
 			if e != nil {
 				return e
 			}

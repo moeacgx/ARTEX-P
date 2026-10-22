@@ -39,6 +39,7 @@ import {
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { AgentEditor } from "@/components/agent-editor";
 import { api } from "@/lib/api";
+import { CatalogPanel } from "@/components/catalog-panel";
 import type { Agent } from "@/lib/types";
 
 // AgentGridCard is one clickable tile opening the agent's editor drawer. Custom
@@ -228,12 +229,15 @@ export default function AgentsPage() {
             内置 Agent 的提示词/配置，以及自定义会话 Agent 的创建与管理
           </p>
         </div>
-        <CreateAgentDialog
-          onCreated={(key) => {
-            reload();
-            setEditKey(key);
-          }}
-        />
+        <div className="flex flex-wrap gap-2">
+          <CatalogPanel kind="agent" onInstalled={reload} />
+          <CreateAgentDialog
+            onCreated={(key) => {
+              reload();
+              setEditKey(key);
+            }}
+          />
+        </div>
       </div>
 
       <Card>

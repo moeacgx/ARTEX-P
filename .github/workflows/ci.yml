@@ -83,6 +83,9 @@ jobs:
           -count=1 -timeout 60s
       - name: 技能与记录引用和 Worker 发送回归
         run: timeout 60s go test ./server -run '^(TestChatMention|TestChatSkillMention)' -count=1 -timeout 60s
+      - name: 在线目录安装、绑定与回滚回归
+        run: |
+          timeout 60s go test ./db ./server -run '^TestCatalog' -count=1 -timeout 60s
       - name: FOFA 配置、工具和内置 Skill 回归
         run: |
           timeout 60s go test ./integrations/fofa ./skills -count=1 -timeout 60s
@@ -137,15 +140,20 @@ jobs:
       - name: 技能清单共享解析回归
         working-directory: norma
         run: timeout 60s go test ./skill -count=1 -timeout 60s
+      - name: 仓库目录源与文件校验回归
+        run: timeout 60s go test ./catalog -count=1 -timeout 60s
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - name: 在线目录文件摘要校验
+        run: node scripts/check-catalog.mjs
       - run: npm ci --ignore-scripts
         working-directory: web
       - name: 前端类型和更新流程
         working-directory: web
         run: |
           npx tsc --noEmit
+          timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/catalog-api.test.mjs
           timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/update-flow.test.mjs src/lib/update-api.test.mjs src/lib/fofa-settings.test.mjs src/lib/skill-download-api.test.mjs src/lib/chat-mentions.test.mjs src/lib/chat-mentions-api.test.mjs

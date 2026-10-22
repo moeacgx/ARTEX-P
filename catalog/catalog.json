@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "items": [
+    {
+      "kind": "skill",
+      "id": "evidence-summary",
+      "name": "证据整理",
+      "description": "将已有工具输出整理为可追溯的中文报告，说明失败和待验证项。",
+      "version": "1.0.0",
+      "license": "AGPL-3.0",
+      "files": {
+        "SKILL.md": "550f2496642c3ca13fba724ca32da034c375ca3c1da8609c78bc32bd0c4f7a9a"
+      }
+    },
+    {
+      "kind": "tool",
+      "id": "catalog_utc_clock",
+      "name": "UTC 时间",
+      "description": "Python 只读示例：返回当前 UTC 时间，不访问网络或读取文件。",
+      "version": "1.0.0",
+      "license": "AGPL-3.0",
+      "files": {
+        "tool.json": "60daa7f0e2d48b5bbf87bc52bc1ab061c358b4de6f200c2778ac0c0aa8ae6153"
+      }
+    },
+    {
+      "kind": "agent",
+      "id": "evidence_assistant",
+      "name": "证据报告助手",
+      "description": "依照证据整理技能编写可复核的中文报告。",
+      "version": "1.0.0",
+      "license": "AGPL-3.0",
+      "tools": [
+        "catalog_utc_clock"
+      ],
+      "skills": [
+        "evidence-summary"
+      ],
+      "files": {
+        "agent.json": "f9c6c829efc28a8e16af4653b1bc1b8fd3f9e90ed4187a0a92ae27741be84e0e"
+      }
+    }
+  ]
+}

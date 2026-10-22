@@ -43,6 +43,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { CatalogPanel } from "@/components/catalog-panel";
 import type { Agent, SkillItem, MCPServer, SkillCall, MissingSkill } from "@/lib/types";
 
 import { SkillDownloadButton, useSkillDownload } from "./skill-download-button";
@@ -710,6 +711,11 @@ export default function SkillsPage() {
           <h1 className="text-sm font-semibold leading-tight">Skill</h1>
           <p className="text-muted-foreground text-xs">技能库 · agentskills.io 规范 · 按 Agent 授权可见</p>
         </div>
+        <CatalogPanel
+          kind="skill"
+          onInstalled={() => { setSelected(null); load(); }}
+          disabled={dirty || fileLoading}
+        />
         {/* 缺口清单：agent 点名调用、但库里没有的 skill —— 直接是该补什么的依据。 */}
         {missing.length > 0 && (
           <Popover>

@@ -1,0 +1,15 @@
+{
+  "key": "catalog_utc_clock",
+  "description": "返回当前 UTC 时间，用于报告中的观察时间标记。仅查询本机时间，不读取文件或访问网络。",
+  "kind": "script",
+  "schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "exec": {
+    "code": "import json\nfrom datetime import datetime, timezone\nprint(json.dumps({'utc': datetime.now(timezone.utc).isoformat()}))\n",
+    "timeout_ms": 5000
+  },
+  "deferred": true
+}

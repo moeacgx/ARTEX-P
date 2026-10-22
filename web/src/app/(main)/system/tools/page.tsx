@@ -35,6 +35,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { api } from "@/lib/api";
+import { CatalogPanel } from "@/components/catalog-panel";
 import type { Agent, Tool } from "@/lib/types";
 
 // Traffic tools are host tools gated by the global 流量捕获 switch: bindable, but
@@ -405,6 +406,7 @@ export default function ToolsPage() {
           <h1 className="text-xl font-semibold tracking-tight">工具</h1>
           <p className="text-muted-foreground text-sm">系统工具的描述/绑定，以及自定义工具(command/script/http)</p>
         </div>
+        <CatalogPanel kind="tool" onInstalled={reload} />
         <div className="relative w-64">
           <SearchIcon className="text-muted-foreground absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2" />
           <Input

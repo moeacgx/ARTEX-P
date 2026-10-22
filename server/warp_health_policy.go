@@ -32,28 +32,13 @@ func (s *Server) warpHealthPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxy, err := s.m.pg.GetProxy(id)
-	if err != nil || proxy.Kind != db.ProxyKindWarp {
+	if err != nil || proxy == nil || proxy.Kind != db.ProxyKindWarp {
 		writeErr(w, 404, "WARP 档案不存在")
 		return
 	}
 	if r.Method == http.MethodPut {
-		var input struct {
-			Revision json.RawMessage `json:"expected_revision"`
-			Enabled  *bool           `json:"auto_recover_enabled"`
-		}
-		if !decodeProxyHTTP(w, r, &input) {
-			return
-		}
-		revision, err := parseProxyRevision(input.Revision)
-		if err != nil || revision == 0 || input.Enabled == nil {
-			writeErr(w, 400, "健康策略参数无效")
-			return
-		}
-		err = s.m.pg.SetWarpAutoRecovery(r.Context(), id, revision, *input.Enabled)
-		if err != nil {
-			s.writeWarpHealthPolicyError(w, id, err)
-			return
-		}
+		writeJSON(w, http.StatusGone, map[string]any{"error": "自动恢复已改为全局设置，请使用全局 WARP 健康策略", "code": "warp_health_policy_global"})
+		return
 	}
 	state, err := s.m.pg.WarpHealth(r.Context(), id)
 	if err != nil {
@@ -111,4 +96,53 @@ func (s *Server) writeWarpHealthPolicyError(w http.ResponseWriter, id int64, err
 	default:
 		writeJSON(w, 500, map[string]any{"error": "WARP 健康操作失败", "code": "warp_health_operation_failed"})
 	}
+}
+
+type globalWarpHealthPolicyDTO struct {
+	Scope                 string `json:"scope"`
+	Revision              int64  `json:"revision"`
+	AutoRecoverEnabled    bool   `json:"auto_recover_enabled"`
+	ProbeIntervalSeconds  int    `json:"probe_interval_seconds"`
+	FailureThreshold      int    `json:"failure_threshold"`
+	RecoveryMinSeconds    int    `json:"recovery_min_seconds"`
+	RecoveryMaxSeconds    int    `json:"recovery_max_seconds"`
+	MigratedDisabledNodes int    `json:"migrated_disabled_nodes"`
+}
+
+func globalWarpPolicyDTO(p db.GlobalWarpHealthPolicy) globalWarpHealthPolicyDTO {
+	return globalWarpHealthPolicyDTO{Scope: "global", Revision: p.Revision, AutoRecoverEnabled: p.AutoRecoverEnabled, ProbeIntervalSeconds: 60, FailureThreshold: 3, RecoveryMinSeconds: 300, RecoveryMaxSeconds: 3600, MigratedDisabledNodes: p.MigratedDisabledNodes}
+}
+func (s *Server) globalWarpHealthPolicy(w http.ResponseWriter, r *http.Request) {
+	var policy db.GlobalWarpHealthPolicy
+	var err error
+	if r.Method == http.MethodPut {
+		var input struct {
+			Revision json.RawMessage `json:"expected_revision"`
+			Enabled  *bool           `json:"auto_recover_enabled"`
+		}
+		if !decodeProxyHTTP(w, r, &input) {
+			return
+		}
+		revision, parseErr := parseProxyRevision(input.Revision)
+		if parseErr != nil || revision == 0 || input.Enabled == nil {
+			writeErr(w, 400, "全局健康策略参数无效")
+			return
+		}
+		policy, err = s.m.pg.SetGlobalWarpHealthPolicy(r.Context(), revision, *input.Enabled)
+	} else {
+		policy, err = s.m.pg.GlobalWarpHealthPolicy(r.Context())
+	}
+	if err != nil {
+		if errors.Is(err, db.ErrWarpHealthStale) {
+			response := map[string]any{"error": "全局健康策略版本已变化，请核对当前设置", "code": "warp_health_revision_conflict"}
+			if current, readErr := s.m.pg.GlobalWarpHealthPolicy(r.Context()); readErr == nil {
+				response["current_revision"] = current.Revision
+			}
+			writeJSON(w, 409, response)
+		} else {
+			writeJSON(w, 500, map[string]any{"error": "全局健康策略操作失败", "code": "warp_health_operation_failed"})
+		}
+		return
+	}
+	writeJSON(w, 200, globalWarpPolicyDTO(policy))
 }

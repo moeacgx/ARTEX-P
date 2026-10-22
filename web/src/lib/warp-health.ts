@@ -17,8 +17,9 @@ export function warpEffectiveIP(proxy: ProxyRecord): string | null {
   return health.egress_ip?.trim() || null;
 }
 
-export type WarpHealthPolicy = {
-  proxy_id: string;
+export type GlobalWarpHealthPolicy = {
+  scope: "global";
+  migrated_disabled_nodes: number;
   revision: number;
   auto_recover_enabled: boolean;
   probe_interval_seconds: 60;

@@ -365,68 +365,41 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, s.runtimeProxyDTO(checked))
 		return
 	}
-	if p.Kind == db.ProxyKindWarp {
-		pending, err := s.m.pg.WarpCreatePending(id)
-		if err != nil {
-			writeErr(w, 500, "无法读取 WARP 创建状态")
-			return
-		}
-		if pending {
-			writeErr(w, 409, "WARP 创建尚未完成，请使用原 Idempotency-Key 查询结果")
-			return
-		}
-	}
-	var probeErr error
-	if p.Kind == db.ProxyKindWarp {
-		rt, runtimeErr := s.m.proxyRuntime()
-		probeErr = runtimeErr
-		if runtimeErr == nil && rt.health != nil {
-			if probeErr = s.m.pg.PrepareWarpHealthManualProbe(r.Context(), id); probeErr == nil {
-				probeErr = rt.health.RunOnce(r.Context(), id)
-			}
-		} else if runtimeErr == nil {
-			probeErr = errors.New("WARP 健康控制器不可用")
-		}
-	} else if p.Kind == db.ProxyKindResin {
-		probeErr = newResinAdapter().probe(r.Context(), p)
-	} else {
-		probeErr = egress.ProbeProxy(r.Context(), p.URL, "", p.Kind == db.ProxyKindWarp)
-	}
-	status := db.ProxyStatusHealthy
-	message := ""
-	if probeErr != nil {
-		status = db.ProxyStatusFailed
-		message = probeErr.Error()
-	}
-	if p.Kind == db.ProxyKindWarp {
-		fresh, readErr := s.m.pg.GetProxyContext(r.Context(), id)
-		if readErr == nil {
-			p = fresh
-		}
-		if probeErr == nil {
-			health, healthErr := s.m.pg.WarpHealth(r.Context(), id)
-			if healthErr != nil || health.State != "ready" || !health.Desired {
-				probeErr = db.ErrWarpHealthBlocked
-				message = "WARP 尚未通过健康验证"
-			}
-		}
-	} else {
-		now := time.Now()
-		p.Status, p.LastError, p.LastCheckedAt = status, message, &now
-		if err := s.m.pg.SetProxyStatus(id, status, message, now); err != nil {
-			if errors.Is(err, db.ErrProxyInUse) {
-				writeErr(w, 409, "代理状态已改变，请刷新后重试")
-			} else {
-				writeErr(w, 500, err.Error())
-			}
-			return
-		}
-	}
-	if probeErr != nil {
-		writeErr(w, 502, message)
+	pending, err := s.m.pg.WarpCreatePending(id)
+	if err != nil {
+		writeErr(w, 500, "无法读取 WARP 创建状态")
 		return
 	}
-	writeJSON(w, 200, s.runtimeProxyDTO(p))
+	if pending {
+		writeErr(w, 409, "WARP 创建尚未完成，请使用原 Idempotency-Key 查询结果")
+		return
+	}
+	rt, err := s.m.proxyRuntime()
+	if err != nil || rt.health == nil {
+		writeErr(w, 502, "WARP 健康控制器不可用")
+		return
+	}
+	if err = rt.health.ProbeNow(r.Context(), id); err != nil {
+		if errors.Is(err, db.ErrWarpHealthBlocked) || errors.Is(err, db.ErrProxyInUse) {
+			writeErr(w, 409, "WARP 当前无法检测，请等待现有操作完成并确认节点已启用运行")
+		} else {
+			writeErr(w, 502, "WARP 本次检测未完成")
+		}
+		return
+	}
+	fresh, err := s.m.pg.GetProxyContext(r.Context(), id)
+	if err != nil {
+		writeErr(w, 500, "无法读取 WARP 本次检测结果")
+		return
+	}
+	dto := s.runtimeProxyDTO(fresh)
+	// 数据库的旧 ready 不代表运行器仍在线；成功响应必须与列表的实时状态一致。
+	if dto == nil || !dto.Enabled || dto.Status != db.ProxyStatusHealthy || dto.WarpPhase != "ready" ||
+		dto.WarpHealth == nil || dto.WarpHealth.State != "ready" || !dto.WarpHealth.DesiredRunning || !egress.ValidWarpPublicIP(dto.EgressIP) {
+		writeErr(w, 502, "WARP 尚未通过本次健康验证")
+		return
+	}
+	writeJSON(w, 200, dto)
 }
 
 func (s *Server) setGlobalProxy(w http.ResponseWriter, r *http.Request) {
@@ -473,6 +446,8 @@ func proxyFromRequest(req proxyRequest) *db.Proxy {
 // RegisterProxyActionRoutes 供共享路由装配调用；响应统一使用前端代理 DTO。
 func (s *Server) RegisterProxyActionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/proxies/batch", s.batchCreateProxies)
+	mux.HandleFunc("GET /api/proxies/warp-health-policy", s.globalWarpHealthPolicy)
+	mux.HandleFunc("PUT /api/proxies/warp-health-policy", s.globalWarpHealthPolicy)
 	mux.HandleFunc("GET /api/proxies/{id}", s.getProxy)
 	mux.HandleFunc("POST /api/proxies/{id}/warp/{action}", s.warpAction)
 	mux.HandleFunc("GET /api/proxies/{id}/health-policy", s.warpHealthPolicy)

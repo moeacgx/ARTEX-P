@@ -122,13 +122,7 @@ func (d *DB) BeginWarpHealthDelete(ctx context.Context, execution *WarpHealthExe
 	return claim, err
 }
 
-func (d *DB) SetWarpAutoRecovery(ctx context.Context, id, expectedRevision int64, enabled bool) error {
-	return d.WithWarpHealthLifecycle(ctx, func(tx *sql.Tx) error {
-		return SetWarpAutoRecoveryTx(ctx, tx, id, expectedRevision, enabled)
-	})
-}
-
-// PrepareWarpHealthManualProbe 只为明确的管理端“立即检测”清除周期门槛。
+// PrepareWarpHealthManualProbe 只为管理端“立即检测”清除周期门槛。
 // 不抢占 pending、repair、unknown 或正在执行的 probe，也不改变 Desired/策略。
 func (d *DB) PrepareWarpHealthManualProbe(ctx context.Context, id int64) error {
 	return d.WithWarpHealthLifecycle(ctx, func(tx *sql.Tx) error {

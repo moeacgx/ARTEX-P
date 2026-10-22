@@ -121,6 +121,13 @@ jobs:
         run: |
           timeout 60s go test ./server -run '^TestWarpContainerExit' -count=1 -timeout 60s
           timeout 60s go test ./maintenance ./egress ./cmd/artex-warp-recovery -count=1 -timeout 60s
+      - name: 全局 WARP 策略与后台安全恢复回归
+        env:
+          ARTEX_WARP_HEALTH_TEST_DSN: postgres://artex_test:artex_test@127.0.0.1:5432/artex_warp_health_test?sslmode=disable
+        run: |
+          psql "$ARTEX_PG_DSN" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE artex_warp_health_test'
+          timeout 60s go test ./db -run '^(TestGlobalWarp|TestWarpHealth)' -count=1 -timeout 60s
+          timeout 60s go test ./server -run '^(TestGlobalWarpHealthPolicyHTTP|TestWarpHealthController|TestWarpHealthDTO)' -count=1 -timeout 60s
 
   checks:
     needs: branch-policy
@@ -158,4 +165,5 @@ jobs:
         run: |
           npx tsc --noEmit
           timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/catalog-api.test.mjs
+          timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/warp-health-api.test.mjs src/lib/proxy-center.test.mjs src/lib/warp-create-intent.test.mjs src/lib/warp-create-api.test.mjs src/lib/proxy-warp-register.test.mjs
           timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/update-flow.test.mjs src/lib/update-api.test.mjs src/lib/fofa-settings.test.mjs src/lib/skill-download-api.test.mjs src/lib/chat-mentions.test.mjs src/lib/chat-mentions-api.test.mjs

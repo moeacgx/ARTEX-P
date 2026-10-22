@@ -1,30 +1,35 @@
-import { http } from "./api";
+﻿import { http } from "./api";
 import { validRevision } from "./proxy-policy";
-import type { ProxyRecord } from "./types";
-import type { WarpHealthPolicy } from "./warp-health";
+import type { GlobalWarpHealthPolicy } from "./warp-health";
 
-export const warpHealthAPI = {
-  policy: async (id: string) => {
-    const value = await http<WarpHealthPolicy>(`/proxies/${encodeURIComponent(id)}/health-policy`, { cache: "no-store" });
-    if (value.proxy_id !== id || !validRevision(value.revision) || typeof value.auto_recover_enabled !== "boolean")
-      throw new Error("健康策略回读编号或版本无效");
-    return value;
-  },
-  save: (id: string, revision: number, enabled: boolean) => {
-    if (!validRevision(revision) || typeof enabled !== "boolean") throw new Error("缺少有效健康策略版本或开关状态");
-    return http<WarpHealthPolicy>(
-      `/proxies/${encodeURIComponent(id)}/health-policy`,
+function checkedPolicy(value: GlobalWarpHealthPolicy): GlobalWarpHealthPolicy {
+  if (
+    value.scope !== "global" ||
+    !validRevision(value.revision) ||
+    value.revision === 0 ||
+    typeof value.auto_recover_enabled !== "boolean" ||
+    !Number.isSafeInteger(value.migrated_disabled_nodes) ||
+    value.migrated_disabled_nodes < 0 ||
+    value.probe_interval_seconds !== 60 ||
+    value.failure_threshold !== 3 ||
+    value.recovery_min_seconds !== 300 ||
+    value.recovery_max_seconds !== 3600
+  )
+    throw new Error("全局健康策略回读范围、版本或内容无效");
+  return value;
+}
+
+export const globalWarpHealthAPI = {
+  get: async () =>
+    checkedPolicy(await http<GlobalWarpHealthPolicy>("/proxies/warp-health-policy", { cache: "no-store" })),
+  save: (revision: number, enabled: boolean) => {
+    if (!validRevision(revision) || revision === 0 || typeof enabled !== "boolean")
+      throw new Error("缺少有效全局健康策略版本或开关状态");
+    return http<GlobalWarpHealthPolicy>(
+      "/proxies/warp-health-policy",
       { method: "PUT", body: JSON.stringify({ expected_revision: revision, auto_recover_enabled: enabled }) },
       true,
-    );
-  },
-  // 退出证明只来自服务端。请求只提交恢复意图，绝不发送自证布尔、token 或 revision。
-  recover: (id: string) =>
-    http<ProxyRecord>(`/proxies/${encodeURIComponent(id)}/health/recovery`, { method: "POST", body: JSON.stringify({}) }, true),
-  proxy: async (id: string) => {
-    const value = await http<ProxyRecord>(`/proxies/${encodeURIComponent(id)}`, { cache: "no-store" });
-    if (value.id !== id) throw new Error("WARP 回读编号不一致");
-    return value;
+    ).then(checkedPolicy);
   },
 };
-export type WarpHealthAdapter = typeof warpHealthAPI;
+export type GlobalWarpHealthAdapter = typeof globalWarpHealthAPI;

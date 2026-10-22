@@ -235,23 +235,31 @@ func TestWarpHealthPolicyCASMissingStaleAndDesired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	set := func(id, revision int64, enabled bool) error {
-		return d.WithWarpHealthLifecycle(t.Context(), func(tx *sql.Tx) error { return SetWarpAutoRecoveryTx(t.Context(), tx, id, revision, enabled) })
+	p, err := d.GlobalWarpHealthPolicy(t.Context())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err = set(id+1000000, 1, false); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("不存在的策略应返回 sql.ErrNoRows: %v", err)
-	}
-	if err = set(id, s.Revision+1, false); !errors.Is(err, ErrWarpHealthStale) {
+	t.Cleanup(func() { setHealthPolicyForTest(t, d, true) })
+	if _, err = d.SetGlobalWarpHealthPolicy(t.Context(), p.Revision+1, false); !errors.Is(err, ErrWarpHealthStale) {
 		t.Fatalf("旧 revision 未拒绝: %v", err)
 	}
-	if err = set(id, s.Revision, false); err != nil {
+	if _, err = d.SetGlobalWarpHealthPolicy(t.Context(), p.Revision, false); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := d.WarpHealth(t.Context(), id)
-	if !got.Desired || got.AutoRecoverEnabled || got.Revision != s.Revision+1 {
+	if !got.Desired || got.AutoRecoverEnabled || got.Revision != s.Revision {
 		t.Fatalf("开关误改 Desired: %+v", got)
 	}
-	if err = set(id, got.Revision, true); err != nil {
+	setHealthPolicyForTest(t, d, true)
+}
+
+func setHealthPolicyForTest(t *testing.T, d *DB, enabled bool) {
+	t.Helper()
+	p, err := d.GlobalWarpHealthPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = d.SetGlobalWarpHealthPolicy(context.Background(), p.Revision, enabled); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -260,6 +268,8 @@ func TestWarpHealthPolicyAndRepairSerialize(t *testing.T) {
 	for _, repairFirst := range []bool{false, true} {
 		t.Run(fmt.Sprint(repairFirst), func(t *testing.T) {
 			d := warpHealthDB(t)
+			setHealthPolicyForTest(t, d, true)
+			t.Cleanup(func() { setHealthPolicyForTest(t, d, true) })
 			id := healthProxy(t, d)
 			healthIntent(t, d, id)
 			now := time.Now()
@@ -280,21 +290,21 @@ func TestWarpHealthPolicyAndRepairSerialize(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				err = d.WithWarpHealthLifecycle(t.Context(), func(tx *sql.Tx) error { return SetWarpAutoRecoveryTx(t.Context(), tx, id, claim.Revision, false) })
-				if !errors.Is(err, ErrWarpHealthBlocked) {
-					t.Fatalf("repair 被策略抢占: %v", err)
+				setHealthPolicyForTest(t, d, false)
+				active, _ := d.WarpHealth(t.Context(), id)
+				if active.Claim.Token != repair.Token {
+					t.Fatal("全局关闭清除了执行中的 claim")
 				}
 				if err = d.MarkWarpHealthUnknown(t.Context(), repair); err != nil {
 					t.Fatal(err)
 				}
-				err = d.WithWarpHealthLifecycle(t.Context(), func(tx *sql.Tx) error { return SetWarpAutoRecoveryTx(t.Context(), tx, id, claim.Revision, true) })
-				if !errors.Is(err, ErrWarpHealthBlocked) {
-					t.Fatalf("unknown 被策略解封: %v", err)
+				setHealthPolicyForTest(t, d, true)
+				unknown, _ := d.WarpHealth(t.Context(), id)
+				if unknown.Claim.Token != repair.Token || unknown.ClaimState != "unknown" {
+					t.Fatal("全局开启解除了未知执行屏障")
 				}
 			} else {
-				if err := d.WithWarpHealthLifecycle(t.Context(), func(tx *sql.Tx) error { return SetWarpAutoRecoveryTx(t.Context(), tx, id, claim.Revision, false) }); err != nil {
-					t.Fatal(err)
-				}
+				setHealthPolicyForTest(t, d, false)
 				if _, err := d.BeginWarpHealthRepair(t.Context(), claim, now, DefaultWarpHealthPolicy()); !errors.Is(err, ErrWarpHealthBlocked) {
 					t.Fatalf("策略先关闭仍获 repair: %v", err)
 				}
@@ -450,10 +460,8 @@ func TestWarpHealthManualClaimStartsStoppedAndCommitsAtomically(t *testing.T) {
 	if err := d.MigrateWarpHealth(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	s, _ := d.WarpHealth(t.Context(), id)
-	if err := d.WithWarpHealthLifecycle(t.Context(), func(tx *sql.Tx) error { return SetWarpAutoRecoveryTx(t.Context(), tx, id, s.Revision, false) }); err != nil {
-		t.Fatal(err)
-	}
+	setHealthPolicyForTest(t, d, false)
+	t.Cleanup(func() { setHealthPolicyForTest(t, d, true) })
 	execution, err := d.TryWarpHealthExecution(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
@@ -474,7 +482,7 @@ func TestWarpHealthManualClaimStartsStoppedAndCommitsAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, _ = d.WarpHealth(t.Context(), id)
+	s, _ := d.WarpHealth(t.Context(), id)
 	if !s.Desired || s.AutoRecoverEnabled || s.Material != "same-material" || s.Claim.Token != "" || s.Revision != claim.Revision+1 {
 		t.Fatalf("manual 完成不原子/误改策略: %+v", s)
 	}
@@ -545,6 +553,12 @@ func TestWarpHealthManualCompletionRollbackKeepsClaim(t *testing.T) {
 func TestWarpHealthPolicyCASWaitsForConcurrentRepairGuard(t *testing.T) {
 	d := warpHealthDB(t)
 	other := warpHealthDB(t)
+	setHealthPolicyForTest(t, d, true)
+	t.Cleanup(func() { setHealthPolicyForTest(t, d, true) })
+	policy, err := d.GlobalWarpHealthPolicy(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	id := healthProxy(t, d)
 	healthIntent(t, d, id)
 	now := time.Now()
@@ -575,7 +589,8 @@ func TestWarpHealthPolicyCASWaitsForConcurrentRepairGuard(t *testing.T) {
 	started := make(chan struct{})
 	go func() {
 		close(started)
-		casDone <- other.WithWarpHealthLifecycle(t.Context(), func(tx *sql.Tx) error { return SetWarpAutoRecoveryTx(t.Context(), tx, id, previous.Revision, false) })
+		_, err := other.SetGlobalWarpHealthPolicy(t.Context(), policy.Revision, false)
+		casDone <- err
 	}()
 	<-started
 	select {
@@ -589,7 +604,11 @@ func TestWarpHealthPolicyCASWaitsForConcurrentRepairGuard(t *testing.T) {
 	if err := <-repairDone; err != nil {
 		t.Fatal(err)
 	}
-	if err := <-casDone; !errors.Is(err, ErrWarpHealthBlocked) {
-		t.Fatalf("并发 CAS 覆盖 repair: %v", err)
+	if err := <-casDone; err != nil {
+		t.Fatalf("并发全局 CAS 失败: %v", err)
+	}
+	state, _ := d.WarpHealth(t.Context(), id)
+	if state.Claim.Kind != "repair" || state.Claim.Token == "" || state.AutoRecoverEnabled {
+		t.Fatal("全局关闭不应抢占已准入的 repair")
 	}
 }

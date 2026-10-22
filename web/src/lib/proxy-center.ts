@@ -1,4 +1,25 @@
 import type { ProxyKind, ProxyRecord, ProxyWriteInput, Task, TaskProxyMode } from "./types";
+import { warpEffectiveIP } from "./warp-health";
+
+export function proxyHealthStatus(item: ProxyRecord): string {
+  // WARP 必须有当前健康验证的出口，不能只认历史 healthy 字段。
+  if (item.kind === "warp" && item.status === "healthy" && !warpEffectiveIP(item)) return "unknown";
+  return item.status;
+}
+
+export function proxyProbeResult(expected: ProxyRecord, result: ProxyRecord): { available: boolean; message: string } {
+  if (result.id !== expected.id || result.kind !== expected.kind)
+    throw new Error("检测返回的代理编号或类型不一致，无法确认结果");
+  if (!result.enabled) return { available: false, message: "代理已停用" };
+  if (result.kind === "warp") {
+    const ip = warpEffectiveIP(result);
+    if (ip) return { available: true, message: `检测可用 · 出口 ${ip}` };
+    return { available: false, message: "尚未验证有效出口 IP，未确认可用" };
+  }
+  return result.status === "healthy"
+    ? { available: true, message: "检测可用" }
+    : { available: false, message: "检测未通过，未确认可用" };
+}
 
 export type ProxyForm = {
   name: string;
@@ -59,7 +80,8 @@ export function taskProxyError(input: {
   let id: string | null | undefined = null;
   if (input.mode === "fixed") id = input.id;
   if (input.mode === "inherit") id = input.globalID;
-  if (input.mode === "fixed" && (!id || !Number.isSafeInteger(Number(id)))) return "请选择可由历史任务接口精确表示的代理编号";
+  if (input.mode === "fixed" && (!id || !Number.isSafeInteger(Number(id))))
+    return "请选择可由历史任务接口精确表示的代理编号";
   if (id !== null && id !== undefined) {
     const proxy = input.items.find((item) => item.id === id);
     if (!proxy || !proxySelectable(proxy)) return `代理 #${id} 已不可用，请修复或重新选择`;

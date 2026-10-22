@@ -9,6 +9,7 @@ export type TaskProxyMode = "inherit" | "direct" | "fixed";
 export interface WarpHealth {
   proxy_id: string;
   desired_running: boolean;
+  auto_recover_enabled?: boolean;
   state: "unknown" | "stopped" | "disabled" | "pending" | "checking" | "ready" | "failed" | "deferred" | "repairing";
   consecutive_failures: number;
   recovery_attempts: number;

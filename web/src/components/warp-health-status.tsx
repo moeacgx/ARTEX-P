@@ -6,7 +6,7 @@ import type { ProxyRecord, WarpHealth } from "@/lib/types";
 import { warpEffectiveIP } from "@/lib/warp-health";
 
 const labels: Record<WarpHealth["state"], string> = {
-  unknown: "状态未知，需人工核对",
+  unknown: "等待确认上次执行",
   stopped: "已停止",
   disabled: "已停用",
   pending: "创建或注册待确认",
@@ -21,10 +21,12 @@ const time = (value?: string) =>
 export function WarpHealthStatus({ proxy }: { proxy: ProxyRecord }) {
   const health = proxy.warp_health,
     ip = warpEffectiveIP(proxy);
+  let desiredLabel = "未确认";
+  if (health) desiredLabel = health.desired_running ? "保持运行" : "不自动启动";
   return (
     <div className="w-full space-y-3 rounded-lg border bg-muted/20 p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="font-medium text-sm">WARP 持续健康检测</p>
+        <p className="font-medium text-sm">运行详情</p>
         <Badge variant={health?.state === "failed" || health?.state === "unknown" ? "destructive" : "secondary"}>
           {health ? labels[health.state] : "健康信息尚未返回"}
         </Badge>
@@ -35,8 +37,8 @@ export function WarpHealthStatus({ proxy }: { proxy: ProxyRecord }) {
           <dd className="break-all font-mono">{ip ?? "未验证"}</dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">明确运行意图</dt>
-          <dd>{health ? (health.desired_running ? "保持运行" : "不自动启动") : "未确认"}</dd>
+          <dt className="text-muted-foreground">运行设置</dt>
+          <dd>{desiredLabel}</dd>
         </div>
         <div>
           <dt className="text-muted-foreground">最近探测</dt>
@@ -52,25 +54,22 @@ export function WarpHealthStatus({ proxy }: { proxy: ProxyRecord }) {
         </div>
         <div>
           <dt className="text-muted-foreground">下次恢复</dt>
-          <dd>{time(health?.next_recovery_at)}</dd>
+          <dd>{health?.auto_recover_enabled === false ? "自动恢复已关闭" : time(health?.next_recovery_at)}</dd>
         </div>
       </dl>
       {health?.last_error && <p className="text-destructive text-xs">{proxyErrorText(health.last_error)}</p>}
       {(health?.state === "unknown" || health?.state === "pending") && (
-        <p className="text-xs">
-          注册或恢复结果尚未确认。请核对原条目与原执行；不会再次注册、创建新出口或自行解除恢复屏障。
+        <p className="text-muted-foreground text-xs">
+          上次操作尚未确认；确认执行已退出后，系统将按全局策略继续恢复。无法确认时会保留阻塞原因。
         </p>
       )}
       {health?.state === "deferred" && (
-        <p className="text-xs">有实际活动或资源尚未退出，恢复推迟；暂停或终态不代表已空闲。</p>
+        <p className="text-muted-foreground text-xs">
+          {health.auto_recover_enabled === false
+            ? "自动恢复已关闭；系统仍会检测连接状态。"
+            : "恢复条件尚未满足，系统将在满足全局策略和安全空闲条件后重试。"}
+        </p>
       )}
-      <p className="text-muted-foreground text-xs">
-        默认每 60 秒探测；连续 3 次失败后复探，仅安全空闲时复用原注册材料重连。失败恢复按 300 → 3600
-        秒有界退避；恢复可能保留相同 IP。
-      </p>
-      <p className="text-muted-foreground text-xs">
-        有效 IP 仅表示当前验证结果。服务端尚未提供历史 IP 字段，此处不缓存历史 IP。
-      </p>
     </div>
   );
 }

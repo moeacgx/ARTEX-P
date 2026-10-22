@@ -1,7 +1,10 @@
+import { mockHandle } from "./mock/handler.ts";
 import {
   buildProxyPayload,
   proxyEndpoint,
   proxyErrorText,
+  proxyHealthStatus,
+  proxyProbeResult,
   proxySelectable,
   taskProxyError,
   taskProxyLabel,
@@ -138,4 +141,92 @@ test("URL、诊断和无效地址均不泄露示例凭据", () => {
     ),
   );
   assert.equal(error.includes("fake-"), false);
+});
+
+const verifiedWarp = (extra = {}) =>
+  proxy({
+    id: "3",
+    kind: "warp",
+    warp_phase: "ready",
+    warp_health: {
+      proxy_id: "3",
+      desired_running: true,
+      state: "ready",
+      egress_ip: "203.0.113.42",
+      last_checked_at: "2026-10-22T06:00:00Z",
+    },
+    ...extra,
+  });
+
+test("WARP 检测提示和列表必须同时有当前有效出口，历史 healthy 不能误报成功", () => {
+  const valid = verifiedWarp();
+  assert.equal(proxyProbeResult(valid, valid).available, true);
+  assert.match(proxyProbeResult(valid, valid).message, /203\.0\.113\.42/);
+  assert.equal(proxyHealthStatus(valid), "healthy");
+  for (const result of [
+    verifiedWarp({ warp_health: undefined, egress_ip: "203.0.113.42" }),
+    ...[
+      { egress_ip: "" },
+      { egress_ip: "   " },
+      { desired_running: false },
+      { state: "stopped" },
+      { state: "checking" },
+      { state: "failed" },
+      { proxy_id: "4" },
+      { last_checked_at: "invalid" },
+      { last_checked_at: undefined },
+    ].map((patch) => verifiedWarp({ warp_health: { ...valid.warp_health, ...patch } })),
+  ]) {
+    assert.equal(proxyProbeResult(valid, result).available, false);
+    assert.equal(proxyHealthStatus(result), "unknown");
+  }
+  for (const patch of [{ enabled: false }, { status: "stopped" }, { status: "failed" }])
+    assert.equal(proxyProbeResult(valid, verifiedWarp(patch)).available, false);
+});
+
+test("检测不能把别的类型或编号冒充当前 WARP，普通失败和停用也不提示可用", () => {
+  const valid = verifiedWarp();
+  assert.throws(() => proxyProbeResult(valid, { ...valid, kind: "http" }), /不一致/);
+  assert.throws(() => proxyProbeResult(valid, { ...valid, id: "4" }), /不一致/);
+  assert.equal(proxyProbeResult(proxy(), proxy()).available, true);
+  assert.equal(proxyProbeResult(proxy(), proxy({ enabled: false })).available, false);
+  assert.equal(proxyProbeResult(proxy(), proxy({ status: "failed" })).available, false);
+});
+
+test("演示检测明确拒绝真实验证，不伪造 HTTP healthy，不改变 WARP 列表", async () => {
+  const before = structuredClone(await mockHandle("GET", "/proxies"));
+  await assert.rejects(mockHandle("POST", "/proxies/1/test"), /演示模式未执行真实代理检测/);
+  assert.deepEqual(await mockHandle("GET", "/proxies"), before);
+});
+
+test("演示编辑返回完整代理且列表回读一致，不把保存当成连接成功", async () => {
+  const before = structuredClone(await mockHandle("GET", "/proxies"));
+  const original = before.proxies[0];
+  try {
+    const saved = await mockHandle(
+      "PUT",
+      `/proxies/${original.id}`,
+      JSON.stringify({ name: "修改名称", enabled: true }),
+    );
+    assert.equal(saved.id, original.id);
+    assert.equal(saved.kind, "warp");
+    assert.equal(saved.status, "stopped");
+    assert.equal(saved.name, "修改名称");
+    assert.deepEqual((await mockHandle("GET", "/proxies")).proxies[0], saved);
+    assert.equal(proxyProbeResult(saved, saved).available, false);
+  } finally {
+    await mockHandle("PUT", `/proxies/${original.id}`, JSON.stringify(original));
+  }
+});
+
+test("演示全局代理路由优先于编号编辑，改为直连与回读一致", async () => {
+  const before = await mockHandle("GET", "/proxies");
+  try {
+    assert.deepEqual(await mockHandle("PUT", "/proxies/global", JSON.stringify({ proxy_id: null })), {
+      global_proxy_id: null,
+    });
+    assert.equal((await mockHandle("GET", "/proxies")).global_proxy_id, null);
+  } finally {
+    await mockHandle("PUT", "/proxies/global", JSON.stringify({ proxy_id: before.global_proxy_id }));
+  }
 });

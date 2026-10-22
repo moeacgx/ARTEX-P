@@ -2,8 +2,10 @@
 
 import * as React from "react";
 
+import { ChevronDown, Plus, RefreshCw, Search } from "lucide-react";
 import { toast } from "sonner";
 
+import { GlobalWarpHealthControl } from "@/components/global-warp-health-control";
 import { ProxyGroups } from "@/components/proxy-groups";
 import {
   AlertDialog,
@@ -17,7 +19,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
@@ -27,18 +29,28 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { WarpHealthControl } from "@/components/warp-health-control";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { WarpHealthStatus } from "@/components/warp-health-status";
 import { APIError, api } from "@/lib/api";
+import { MOCK } from "@/lib/mock/enabled";
 import {
   buildProxyPayload,
   proxyEndpoint as endpoint,
   proxyErrorText as errorText,
   type ProxyForm as Form,
+  proxyHealthStatus as listStatus,
   proxyFromFailure,
+  proxyProbeResult,
   proxySelectable as selectable,
   WARP_PHASE_LABEL,
   WARP_REGISTER_TERMS,
@@ -91,6 +103,12 @@ export function ProxyCenter() {
   const [items, setItems] = React.useState<ProxyRecord[]>([]);
   const [globalID, setGlobalID] = React.useState<string | null>(null);
   const [form, setForm] = React.useState<Form>(freshForm);
+  const [formOpen, setFormOpen] = React.useState(false);
+  const [groupsOpen, setGroupsOpen] = React.useState(false);
+  const [detailID, setDetailID] = React.useState<string | null>(null);
+  const [query, setQuery] = React.useState("");
+  const [kindFilter, setKindFilter] = React.useState("all");
+  const [statusFilter, setStatusFilter] = React.useState("all");
   const [editing, setEditing] = React.useState<ProxyRecord | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [loadError, setLoadError] = React.useState("");
@@ -157,6 +175,7 @@ export function ProxyCenter() {
     setItems(result.proxies ?? []);
     setGlobalID(result.global_proxy_id ?? null);
     setLoadError("");
+    return result;
   }, []);
   React.useEffect(() => {
     let active = true;
@@ -260,7 +279,7 @@ export function ProxyCenter() {
       clearPassword: false,
       clearAdminToken: false,
     });
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    setFormOpen(true);
   };
 
   async function refreshAfterMutation() {
@@ -311,7 +330,10 @@ export function ProxyCenter() {
           finishCreation("complete");
           setPendingID(result.id);
           setForm({ ...freshForm(), kind: "warp", name: data.name });
-        } else setForm(freshForm());
+        } else {
+          setForm(freshForm());
+          setFormOpen(false);
+        }
         setEditing(null);
       }
       await refreshAfterMutation();
@@ -366,10 +388,16 @@ export function ProxyCenter() {
   async function test(id: string) {
     setBusy(`test:${id}`);
     try {
+      const current = items.find((item) => item.id === id);
+      if (!current) throw new Error("代理记录不存在，请刷新列表");
       const result = await api.testProxy(id);
-      await refreshAfterMutation();
-      if (result.status === "healthy") toast.success(`代理 #${id} 检测可用`);
-      else toast.info(`代理 #${id} 检测完成：${STATUS[result.status] ?? result.status}`);
+      const outcome = proxyProbeResult(current, result);
+      const latest = await reload();
+      const fresh = latest.proxies.find((item) => item.id === id);
+      if (!fresh) throw new Error("检测后代理记录已改变，无法确认结果");
+      const confirmed = proxyProbeResult(current, fresh);
+      if (outcome.available && confirmed.available) toast.success(`代理 #${id} ${confirmed.message}`);
+      else toast.info(`代理 #${id} ${outcome.available ? confirmed.message : outcome.message}`);
     } catch (error) {
       try {
         await reload();
@@ -469,6 +497,10 @@ export function ProxyCenter() {
 
   const global = items.find((item) => item.id === globalID);
   const creatingWarp = !editing && form.kind === "warp";
+  let formDescription = "配置代理名称、类型和连接信息。";
+  if (editing) formDescription = "修改连接配置；秘密字段留空表示保留。";
+  if (editing && form.kind === "warp") formDescription = "修改代理名称和启用状态。";
+  if (creatingWarp) formDescription = "输入名称并确认添加，系统自动注册、启动和验证出口。";
   const creationBlocked = creatingWarp && (!!intentStorageError || createStage !== "draft");
   let saveLabel = "添加代理";
   if (!editing && form.kind === "warp") saveLabel = "确认添加（同意条款）";
@@ -485,171 +517,134 @@ export function ProxyCenter() {
   if (globalID) globalLabel = `#${globalID}（记录未返回）`;
   if (global) globalLabel = `#${global.id} ${global.name}`;
   if (loading || loadError) globalLabel = "正在核对或状态未知";
+  const detail = items.find((item) => item.id === detailID);
+  let emptyLabel = items.length ? "没有符合条件的代理" : "暂无代理，点击“新增代理”添加";
+  if (loading) emptyLabel = "正在加载代理…";
+  const counts = {
+    all: items.length,
+    healthy: items.filter((item) => item.enabled && listStatus(item) === "healthy").length,
+    failed: items.filter((item) => listStatus(item) === "failed").length,
+  };
+  const visibleItems = items.filter((item) => {
+    if (kindFilter !== "all" && item.kind !== kindFilter) return false;
+    if (statusFilter === "healthy" && (!item.enabled || listStatus(item) !== "healthy")) return false;
+    if (statusFilter === "failed" && listStatus(item) !== "failed") return false;
+    const text =
+      `${item.id} ${item.name} ${endpoint(item)} ${item.kind === "warp" ? (warpEffectiveIP(item) ?? "") : (item.egress_ip ?? "")}`.toLowerCase();
+    return text.includes(query.trim().toLowerCase());
+  });
   return (
-    <div className="flex flex-1 flex-col gap-5">
+    <div className="flex flex-1 flex-col gap-4">
       <div>
-        <h1 className="font-semibold text-xl tracking-tight">代理中心</h1>
-        <p className="text-muted-foreground text-sm">
-          普通代理、轻量 WARP 与 Resin 共享编号。任务与对话可明确授权使用分组，候选耗尽不会回落直连。
-        </p>
+        <div className="flex items-center gap-2">
+          <h1 className="font-semibold text-xl tracking-tight">代理中心</h1>
+          {MOCK && <Badge variant="secondary">演示模式 · 不执行真实检测</Badge>}
+        </div>
+        <p className="text-muted-foreground text-sm">管理代理出口、分组与全局恢复策略。</p>
       </div>
-      <ProxyGroups proxies={items} />
-      <Card>
-        <CardHeader>
-          <CardTitle>{editing ? `编辑代理 #${editing.id}` : "新增代理"}</CardTitle>
-          <CardDescription>
-            {form.kind === "warp"
-              ? "输入名称并确认添加，系统自动注册、启动和验证出口。"
-              : "凭据不回显；编辑时秘密字段留空表示保留，勾选清除才会删除。"}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-2">
-          <div className="grid gap-2">
-            <Label htmlFor="proxy-name">名称</Label>
-            <Input
-              id="proxy-name"
-              disabled={!!busy || (creatingWarp && !!createIntent)}
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-            />
-          </div>
-          <div className="grid gap-2">
-            <Label htmlFor="proxy-kind">类型</Label>
-            <select
-              id="proxy-kind"
-              className="h-10 rounded-md border border-input bg-background px-3 text-sm"
-              value={form.kind}
-              disabled={!!editing || !!busy || (creatingWarp && !!createIntent)}
-              onChange={(e) => setForm({ ...form, kind: e.target.value as ProxyKind })}
-            >
-              {KINDS.map((kind) => (
-                <option key={kind.value} value={kind.value}>
-                  {kind.label}
-                </option>
-              ))}
-            </select>
-          </div>
-          {form.kind !== "warp" && form.kind !== "resin" && (
-            <div className="grid gap-2 md:col-span-2">
-              <Label htmlFor="proxy-url">代理 URL {editing ? "（留空保留原地址）" : ""}</Label>
-              {editing && <p className="break-all text-muted-foreground text-xs">当前：{endpoint(editing)}</p>}
+      <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-card p-3">
+        <Button
+          size="sm"
+          disabled={!!busy}
+          onClick={() => {
+            reset();
+            setFormOpen(true);
+          }}
+        >
+          <Plus className="size-4" />
+          新增代理
+        </Button>
+        <GlobalWarpHealthControl
+          onUpdated={() => {
+            void refreshAfterMutation();
+          }}
+        />
+        <Button size="sm" variant="outline" onClick={() => setGroupsOpen(true)}>
+          管理分组
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={!!busy || loading}
+          onClick={() => {
+            setLoading(true);
+            void reload()
+              .catch((error) => setLoadError(errorText(error)))
+              .finally(() => setLoading(false));
+          }}
+        >
+          <RefreshCw className={loading ? "size-4 animate-spin" : "size-4"} />
+          刷新
+        </Button>
+        <span className="ml-auto text-muted-foreground text-xs" title="更改仅影响之后创建的任务快照">
+          全局默认：{globalLabel}
+        </span>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={!!busy || loading || !!loadError || globalID === null}
+          onClick={() => void choose(null)}
+        >
+          改为直连
+        </Button>
+      </div>
+      <Dialog
+        open={formOpen}
+        onOpenChange={(open) => {
+          if (!mutationLock.current) setFormOpen(open);
+        }}
+      >
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{editing ? `编辑代理 #${editing.id}` : "新增代理"}</DialogTitle>
+            <DialogDescription>{formDescription}</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="grid gap-2">
+              <Label htmlFor="proxy-name">名称</Label>
               <Input
-                id="proxy-url"
-                autoComplete="off"
-                value={form.url}
-                onChange={(e) => setForm({ ...form, url: e.target.value })}
-                placeholder={`${form.kind}://user@host:port`}
+                id="proxy-name"
+                disabled={!!busy || (creatingWarp && !!createIntent)}
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
               />
-              <Label htmlFor="ordinary-password">认证密码 {editing?.has_password ? "（已保存）" : ""}</Label>
-              <Input
-                id="ordinary-password"
-                type="password"
-                autoComplete="new-password"
-                value={form.password}
-                disabled={form.clearPassword}
-                onChange={(e) => setForm({ ...form, password: e.target.value })}
-                placeholder={editing ? "留空保留原密码" : "可选，也可包含在 URL 中"}
-              />
-              {editing && (
-                <label className="flex gap-2 text-xs">
-                  <input
-                    type="checkbox"
-                    checked={form.clearPassword}
-                    onChange={(e) => setForm({ ...form, clearPassword: e.target.checked, password: "" })}
-                  />
-                  明确清除认证密码
-                </label>
-              )}
             </div>
-          )}
-          {form.kind === "warp" && (
-            <div className="space-y-2 text-muted-foreground text-sm md:col-span-2">
-              {!editing && (
-                <p>
-                  点击“确认添加”表示同意{" "}
-                  <a href={WARP_TERMS_URL} target="_blank" rel="noreferrer" className="underline">
-                    Cloudflare WARP 服务条款
-                  </a>
-                  ，并申请注册。轻量 WARP 提供本机 SOCKS5 出口。
-                </p>
-              )}
-              {creatingWarp && createStage === "uncertain" && (
-                <p>已保留「{createIntent?.name}」的原 UUID 添加意图。结果未知时仅可核对列表，不再次创建或注册。</p>
-              )}
-              {creatingWarp && createStage === "complete" && (
-                <p role="status">WARP #{pendingID} 已完成添加。需要另一个出口时，请点击“新增另一个”。</p>
-              )}
-              {intentStorageError && (
-                <div role="alert" className="space-y-2 text-destructive">
-                  <p>{intentStorageError}</p>
-                  <Button variant="outline" disabled={!!busy} onClick={restoreIntent}>
-                    重试读取本地意图
-                  </Button>
-                </div>
-              )}
-              {editing && (
-                <p>
-                  代理 #{editing.id} · {WARP_PHASE_LABEL[editing.warp_phase ?? ""] ?? "状态待核对"} · 出口 IP：
-                  {warpEffectiveIP(editing) ?? "未验证"}
-                </p>
-              )}
+            <div className="grid gap-2">
+              <Label htmlFor="proxy-kind">类型</Label>
+              <select
+                id="proxy-kind"
+                className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+                value={form.kind}
+                disabled={!!editing || !!busy || (creatingWarp && !!createIntent)}
+                onChange={(e) => setForm({ ...form, kind: e.target.value as ProxyKind })}
+              >
+                {KINDS.map((kind) => (
+                  <option key={kind.value} value={kind.value}>
+                    {kind.label}
+                  </option>
+                ))}
+              </select>
             </div>
-          )}
-          {form.kind === "resin" && (
-            <>
-              <div className="grid gap-2">
-                <Label htmlFor="proxy-host">数据面 Host</Label>
-                <Input id="proxy-host" value={form.host} onChange={(e) => setForm({ ...form, host: e.target.value })} />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="proxy-port">数据面 Port</Label>
-                <Input
-                  id="proxy-port"
-                  inputMode="numeric"
-                  value={form.port}
-                  onChange={(e) => setForm({ ...form, port: e.target.value })}
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="proxy-protocol">数据面协议</Label>
-                <select
-                  id="proxy-protocol"
-                  className="h-10 rounded-md border border-input bg-background px-3 text-sm"
-                  value={form.protocol}
-                  onChange={(e) => setForm({ ...form, protocol: e.target.value as Form["protocol"] })}
-                >
-                  <option value="socks5">SOCKS5</option>
-                  <option value="http">HTTP</option>
-                </select>
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="resin-platform">Platform</Label>
-                <Input
-                  id="resin-platform"
-                  value={form.platform}
-                  onChange={(e) => setForm({ ...form, platform: e.target.value })}
-                />
-                <p className="text-muted-foreground text-xs">任务 Account 按任务编号生成，不在此设置。</p>
-              </div>
+            {form.kind !== "warp" && form.kind !== "resin" && (
               <div className="grid gap-2 md:col-span-2">
-                <Label htmlFor="resin-admin-url">Admin URL（可选）</Label>
+                <Label htmlFor="proxy-url">代理 URL {editing ? "（留空保留原地址）" : ""}</Label>
+                {editing && <p className="break-all text-muted-foreground text-xs">当前：{endpoint(editing)}</p>}
                 <Input
-                  id="resin-admin-url"
-                  value={form.adminURL}
-                  onChange={(e) => setForm({ ...form, adminURL: e.target.value })}
-                  placeholder="https://resin.example.com"
+                  id="proxy-url"
+                  autoComplete="off"
+                  value={form.url}
+                  onChange={(e) => setForm({ ...form, url: e.target.value })}
+                  placeholder={`${form.kind}://user@host:port`}
                 />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="proxy-password">Proxy Token {editing?.has_password ? "（已保存）" : ""}</Label>
+                <Label htmlFor="ordinary-password">认证密码 {editing?.has_password ? "（已保存）" : ""}</Label>
                 <Input
-                  id="proxy-password"
+                  id="ordinary-password"
                   type="password"
                   autoComplete="new-password"
                   value={form.password}
                   disabled={form.clearPassword}
                   onChange={(e) => setForm({ ...form, password: e.target.value })}
-                  placeholder={editing ? "留空保留" : "输入 Token"}
+                  placeholder={editing ? "留空保留原密码" : "可选，也可包含在 URL 中"}
                 />
                 {editing && (
                   <label className="flex gap-2 text-xs">
@@ -658,233 +653,431 @@ export function ProxyCenter() {
                       checked={form.clearPassword}
                       onChange={(e) => setForm({ ...form, clearPassword: e.target.checked, password: "" })}
                     />
-                    明确清除 Proxy Token
+                    明确清除认证密码
                   </label>
                 )}
               </div>
-              <div className="grid gap-2">
-                <Label htmlFor="resin-admin-token">
-                  Admin Token {editing?.has_resin_admin_token ? "（已保存）" : ""}
-                </Label>
-                <Input
-                  id="resin-admin-token"
-                  type="password"
-                  autoComplete="new-password"
-                  value={form.adminToken}
-                  disabled={form.clearAdminToken}
-                  onChange={(e) => setForm({ ...form, adminToken: e.target.value })}
-                  placeholder="留空保留（新建可选）"
-                />
+            )}
+            {form.kind === "warp" && (
+              <div className="space-y-2 text-muted-foreground text-sm md:col-span-2">
+                {!editing && (
+                  <p>
+                    点击“确认添加”表示同意{" "}
+                    <a href={WARP_TERMS_URL} target="_blank" rel="noreferrer" className="underline">
+                      Cloudflare WARP 服务条款
+                    </a>
+                    ，并申请注册。轻量 WARP 提供本机 SOCKS5 出口。
+                  </p>
+                )}
+                {creatingWarp && createStage === "uncertain" && (
+                  <p>已保留「{createIntent?.name}」的原 UUID 添加意图。结果未知时仅可核对列表，不再次创建或注册。</p>
+                )}
+                {creatingWarp && createStage === "complete" && (
+                  <p role="status">WARP #{pendingID} 已完成添加。需要另一个出口时，请点击“新增另一个”。</p>
+                )}
+                {intentStorageError && (
+                  <div role="alert" className="space-y-2 text-destructive">
+                    <p>{intentStorageError}</p>
+                    <Button variant="outline" disabled={!!busy} onClick={restoreIntent}>
+                      重试读取本地意图
+                    </Button>
+                  </div>
+                )}
                 {editing && (
-                  <label className="flex gap-2 text-xs">
-                    <input
-                      type="checkbox"
-                      checked={form.clearAdminToken}
-                      onChange={(e) => setForm({ ...form, clearAdminToken: e.target.checked, adminToken: "" })}
-                    />
-                    明确清除 Admin Token
-                  </label>
+                  <p>
+                    代理 #{editing.id} · {WARP_PHASE_LABEL[editing.warp_phase ?? ""] ?? "状态待核对"} · 出口 IP：
+                    {warpEffectiveIP(editing) ?? "未验证"}
+                  </p>
                 )}
               </div>
-            </>
-          )}
-          {(form.kind !== "warp" || editing) && (
-            <div className="flex items-center gap-3 md:col-span-2">
-              <Switch
-                id="proxy-enabled"
-                checked={form.enabled}
-                onCheckedChange={(enabled) => setForm({ ...form, enabled })}
-              />
-              <Label htmlFor="proxy-enabled">启用此代理</Label>
-            </div>
-          )}
-          {saveError && (
-            <p role="alert" className="text-destructive text-sm md:col-span-2">
-              {saveError}
-            </p>
-          )}
-          <div className="flex gap-2 md:col-span-2">
-            <Button disabled={!!busy || creationBlocked} onClick={() => void save()}>
-              {saveLabel}
-            </Button>
-            {form.kind === "warp" && createIntent && (
-              <Button
-                variant="outline"
-                disabled={!!busy || createStage === "pending" || createStage === "uncertain" || !!intentStorageError}
-                onClick={newWarpIntent}
-              >
-                新增另一个
-              </Button>
             )}
-            {creatingWarp && createStage === "pending" && (
-              <Button variant="outline" disabled={!!busy} onClick={() => setPollAttempt((value) => value + 1)}>
-                核对进度 {pendingID ? `#${pendingID}` : ""}
-              </Button>
-            )}
-            {editing && (
-              <Button variant="outline" disabled={!!busy} onClick={reset}>
-                取消编辑
-              </Button>
-            )}
-          </div>
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>代理列表</CardTitle>
-          <CardDescription>
-            全局默认：{globalLabel}
-            。更改仅影响之后创建的任务快照。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="flex gap-2">
-            <Button
-              variant={globalID === null ? "default" : "outline"}
-              disabled={!!busy || loading || !!loadError || globalID === null}
-              onClick={() => void choose(null)}
-            >
-              全局默认直连
-            </Button>
-            <Button
-              variant="outline"
-              disabled={!!busy || loading}
-              onClick={() => {
-                setLoading(true);
-                void reload()
-                  .catch((error) => setLoadError(errorText(error)))
-                  .finally(() => setLoading(false));
-              }}
-            >
-              刷新状态
-            </Button>
-          </div>
-          {loading && <p className="text-muted-foreground text-sm">正在加载代理…</p>}
-          {!loading && loadError && (
-            <p role="alert" className="text-destructive text-sm">
-              代理列表加载失败：{loadError}
-            </p>
-          )}
-          {!loading && !loadError && items.length === 0 && <p className="text-muted-foreground text-sm">暂无代理。</p>}
-          {!loading &&
-            !loadError &&
-            items.map((item) => (
-              <div key={item.id} className="space-y-2 rounded-lg border p-3">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <strong>
-                        #{item.id} {item.name}
-                      </strong>
-                      <Badge variant={badgeVariant(item.status)}>{STATUS[item.status] ?? item.status}</Badge>
-                      {!item.enabled && <Badge variant="outline">已停用</Badge>}
-                      {globalID === item.id && <Badge variant="outline">全局默认</Badge>}
-                    </div>
-                    <p className="text-muted-foreground text-xs">
-                      {KINDS.find((kind) => kind.value === item.kind)?.label ?? item.kind} ·{" "}
-                      <span className="break-all font-mono">{endpoint(item)}</span>
-                    </p>
-                    {item.kind === "resin" && (
-                      <p className="text-muted-foreground text-xs">
-                        Platform：{item.resin_platform || "Default"} · Proxy Token：
-                        {item.has_password ? "已保存" : "未确认"} · Admin Token：
-                        {item.has_resin_admin_token ? "已保存" : "未确认"}
-                      </p>
-                    )}
-                    {item.last_checked_at && (
-                      <p className="text-muted-foreground text-xs">
-                        最近检测：{new Date(item.last_checked_at).toLocaleString()}
-                      </p>
-                    )}
-                    {item.last_error && (
-                      <p className="break-all text-destructive text-xs">诊断：{errorText(item.last_error)}</p>
-                    )}
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      size="sm"
-                      variant={globalID === item.id ? "default" : "outline"}
-                      disabled={!!busy || !selectable(item) || globalID === item.id}
-                      onClick={() => void choose(item.id)}
-                    >
-                      {globalID === item.id ? "全局默认" : "设为默认"}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={!!busy || (createStage === "pending" && pendingID === item.id)}
-                      onClick={() => edit(item)}
-                    >
-                      编辑
-                    </Button>
-                    <Button size="sm" variant="outline" disabled={!!busy} onClick={() => void test(item.id)}>
-                      {busy === `test:${item.id}` ? "检测中…" : "检测"}
-                    </Button>
-                    <Button size="sm" variant="destructive" disabled={!!busy} onClick={() => setDeleting(item)}>
-                      删除
-                    </Button>
-                  </div>
+            {form.kind === "resin" && (
+              <>
+                <div className="grid gap-2">
+                  <Label htmlFor="proxy-host">数据面 Host</Label>
+                  <Input
+                    id="proxy-host"
+                    value={form.host}
+                    onChange={(e) => setForm({ ...form, host: e.target.value })}
+                  />
                 </div>
-                {item.kind === "warp" && (
-                  <div className="flex flex-wrap gap-2 border-t pt-2">
-                    <WarpHealthStatus proxy={item} />
-                    <WarpHealthControl
-                      key={item.id}
-                      proxy={item}
-                      onUpdated={(value) =>
-                        setItems((previous) => previous.map((entry) => (entry.id === value.id ? value : entry)))
-                      }
-                    />
-                    <p className="w-full text-muted-foreground text-xs">
-                      {WARP_PHASE_LABEL[item.warp_phase ?? ""] ?? "状态待核对"} · 出口 IP：
-                      {warpEffectiveIP(item) ?? "未验证"}
-                    </p>
-                    {warpAllowedActions(item)
-                      .filter((action) => action !== "recover")
-                      .map((action) => (
-                        <Button
-                          key={action}
-                          size="sm"
-                          variant="outline"
-                          disabled={
-                            !!busy ||
-                            (createStage === "pending" && pendingID === item.id) ||
-                            (action === "register" && registrationUncertain.includes(item.id)) ||
-                            (action === "start" && item.status === "healthy") ||
-                            (action === "stop" && item.status === "stopped")
-                          }
-                          onClick={() => {
-                            if (warpActionNeedsTerms(action)) {
-                              // 注册：先弹确认框，用户明确同意后才发请求。
-                              setAcceptTerms(false);
-                              setRegistering(item.id);
-                              return;
-                            }
-                            void warp(item.id, action);
-                          }}
-                        >
-                          {{ register: "注册", start: "启动", stop: "停止", recover: "恢复" }[action]}
-                        </Button>
-                      ))}
-                    {(item.warp_phase === "registering" || registrationUncertain.includes(item.id)) && (
-                      <p className="text-muted-foreground text-xs">
-                        注册结果可能不确定，请核对原条目；不会自动重复注册。
-                      </p>
-                    )}
-                  </div>
-                )}
-                {item.kind === "resin" && (
-                  <div className="border-t pt-2">
-                    <Button size="sm" variant="outline" disabled={!!busy} onClick={() => setReleasing(item.id)}>
-                      {releaseReadback.includes(item.id) ? "核对租约状态" : "释放租约"}
-                    </Button>
-                  </div>
-                )}
+                <div className="grid gap-2">
+                  <Label htmlFor="proxy-port">数据面 Port</Label>
+                  <Input
+                    id="proxy-port"
+                    inputMode="numeric"
+                    value={form.port}
+                    onChange={(e) => setForm({ ...form, port: e.target.value })}
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="proxy-protocol">数据面协议</Label>
+                  <select
+                    id="proxy-protocol"
+                    className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+                    value={form.protocol}
+                    onChange={(e) => setForm({ ...form, protocol: e.target.value as Form["protocol"] })}
+                  >
+                    <option value="socks5">SOCKS5</option>
+                    <option value="http">HTTP</option>
+                  </select>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="resin-platform">Platform</Label>
+                  <Input
+                    id="resin-platform"
+                    value={form.platform}
+                    onChange={(e) => setForm({ ...form, platform: e.target.value })}
+                  />
+                  <p className="text-muted-foreground text-xs">任务 Account 按任务编号生成，不在此设置。</p>
+                </div>
+                <div className="grid gap-2 md:col-span-2">
+                  <Label htmlFor="resin-admin-url">Admin URL（可选）</Label>
+                  <Input
+                    id="resin-admin-url"
+                    value={form.adminURL}
+                    onChange={(e) => setForm({ ...form, adminURL: e.target.value })}
+                    placeholder="https://resin.example.com"
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="proxy-password">Proxy Token {editing?.has_password ? "（已保存）" : ""}</Label>
+                  <Input
+                    id="proxy-password"
+                    type="password"
+                    autoComplete="new-password"
+                    value={form.password}
+                    disabled={form.clearPassword}
+                    onChange={(e) => setForm({ ...form, password: e.target.value })}
+                    placeholder={editing ? "留空保留" : "输入 Token"}
+                  />
+                  {editing && (
+                    <label className="flex gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={form.clearPassword}
+                        onChange={(e) => setForm({ ...form, clearPassword: e.target.checked, password: "" })}
+                      />
+                      明确清除 Proxy Token
+                    </label>
+                  )}
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="resin-admin-token">
+                    Admin Token {editing?.has_resin_admin_token ? "（已保存）" : ""}
+                  </Label>
+                  <Input
+                    id="resin-admin-token"
+                    type="password"
+                    autoComplete="new-password"
+                    value={form.adminToken}
+                    disabled={form.clearAdminToken}
+                    onChange={(e) => setForm({ ...form, adminToken: e.target.value })}
+                    placeholder="留空保留（新建可选）"
+                  />
+                  {editing && (
+                    <label className="flex gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={form.clearAdminToken}
+                        onChange={(e) => setForm({ ...form, clearAdminToken: e.target.checked, adminToken: "" })}
+                      />
+                      明确清除 Admin Token
+                    </label>
+                  )}
+                </div>
+              </>
+            )}
+            {(form.kind !== "warp" || editing) && (
+              <div className="flex items-center gap-3 md:col-span-2">
+                <Switch
+                  id="proxy-enabled"
+                  checked={form.enabled}
+                  onCheckedChange={(enabled) => setForm({ ...form, enabled })}
+                />
+                <Label htmlFor="proxy-enabled">启用此代理</Label>
               </div>
-            ))}
+            )}
+            {saveError && (
+              <p role="alert" className="text-destructive text-sm md:col-span-2">
+                {saveError}
+              </p>
+            )}
+            <div className="flex gap-2 md:col-span-2">
+              <Button disabled={!!busy || creationBlocked} onClick={() => void save()}>
+                {saveLabel}
+              </Button>
+              {form.kind === "warp" && createIntent && (
+                <Button
+                  variant="outline"
+                  disabled={!!busy || createStage === "pending" || createStage === "uncertain" || !!intentStorageError}
+                  onClick={newWarpIntent}
+                >
+                  新增另一个
+                </Button>
+              )}
+              {creatingWarp && createStage === "pending" && (
+                <Button variant="outline" disabled={!!busy} onClick={() => setPollAttempt((value) => value + 1)}>
+                  核对进度 {pendingID ? `#${pendingID}` : ""}
+                </Button>
+              )}
+              {editing && (
+                <Button variant="outline" disabled={!!busy} onClick={() => setFormOpen(false)}>
+                  取消编辑
+                </Button>
+              )}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <Card className="gap-0 py-0">
+        <CardContent className="p-0">
+          <div className="flex flex-wrap items-center justify-between gap-3 px-4 pt-3 pb-2">
+            <fieldset className="flex gap-4" aria-label="代理状态筛选">
+              {(
+                [
+                  ["all", "全部"],
+                  ["healthy", "可用"],
+                  ["failed", "异常"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  type="button"
+                  key={value}
+                  aria-pressed={statusFilter === value}
+                  onClick={() => setStatusFilter(value)}
+                  className={`border-b-2 py-2 text-sm ${statusFilter === value ? "border-primary font-medium text-primary" : "border-transparent text-muted-foreground"}`}
+                >
+                  {label}
+                  <span className="ml-1.5 text-xs tabular-nums">{loading || loadError ? "—" : counts[value]}</span>
+                </button>
+              ))}
+            </fieldset>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative">
+                <Search className="absolute top-2.5 left-2.5 size-3.5 text-muted-foreground" />
+                <Input
+                  aria-label="搜索代理"
+                  placeholder="搜索名称、地址或 IP"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  className="h-8 w-52 pl-8 text-xs"
+                />
+              </div>
+              <select
+                aria-label="代理类型筛选"
+                value={kindFilter}
+                onChange={(event) => setKindFilter(event.target.value)}
+                className="h-8 rounded-md border bg-background px-2 text-xs"
+              >
+                <option value="all">全部类型</option>
+                {KINDS.map((kind) => (
+                  <option key={kind.value} value={kind.value}>
+                    {kind.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <Table className="min-w-[900px] text-xs">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead className="pl-4">名称</TableHead>
+                <TableHead>类型 / 协议</TableHead>
+                <TableHead>代理地址</TableHead>
+                <TableHead>公网出口 IP</TableHead>
+                <TableHead>状态</TableHead>
+                <TableHead>最近检测</TableHead>
+                <TableHead className="pr-4 text-right">操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {(loading || loadError || visibleItems.length === 0) && (
+                <TableRow>
+                  <TableCell colSpan={7} className="h-28 text-center text-muted-foreground">
+                    {loadError && !loading ? (
+                      <span role="alert" className="text-destructive">
+                        加载失败：{loadError}
+                      </span>
+                    ) : (
+                      emptyLabel
+                    )}
+                  </TableCell>
+                </TableRow>
+              )}
+              {!loading &&
+                !loadError &&
+                visibleItems.map((item) => (
+                  <TableRow key={item.id} className="even:bg-muted/15">
+                    <TableCell className="max-w-52 py-3 pl-4">
+                      <button
+                        type="button"
+                        onClick={() => setDetailID(item.id)}
+                        className="max-w-full truncate text-left font-medium hover:underline"
+                        title={item.name}
+                      >
+                        {item.name}
+                      </button>
+                      <div className="mt-1 flex items-center gap-2 text-muted-foreground">
+                        <span>#{item.id}</span>
+                        {globalID === item.id && (
+                          <Badge variant="outline" className="px-1 py-0 text-[10px]">
+                            全局默认
+                          </Badge>
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="secondary" className="text-[10px]">
+                        {item.kind === "resin" ? "Resin" : item.kind.toUpperCase()}
+                      </Badge>
+                      <div className="mt-1 text-muted-foreground">
+                        {item.kind === "warp" ? "SOCKS5" : (item.protocol || item.kind).toUpperCase()}
+                      </div>
+                    </TableCell>
+                    <TableCell className="max-w-64">
+                      <span className="block truncate font-mono" title={endpoint(item)}>
+                        {endpoint(item)}
+                      </span>
+                      {item.kind === "resin" && (
+                        <div className="mt-1 text-muted-foreground">{item.resin_platform || "Default"}</div>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <span className="font-mono">
+                        {item.kind === "warp" ? (warpEffectiveIP(item) ?? "未验证") : item.egress_ip || "—"}
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <Badge
+                        variant={!item.enabled ? "outline" : badgeVariant(listStatus(item))}
+                        className="text-[10px]"
+                      >
+                        {!item.enabled ? "已停用" : (STATUS[listStatus(item)] ?? listStatus(item))}
+                      </Badge>
+                      {item.kind === "warp" && (
+                        <div className="mt-1 text-muted-foreground">
+                          {WARP_PHASE_LABEL[item.warp_phase ?? ""] ?? "状态待确认"}
+                        </div>
+                      )}
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap text-muted-foreground">
+                      {item.last_checked_at ? new Date(item.last_checked_at).toLocaleString() : "尚未检测"}
+                    </TableCell>
+                    <TableCell className="pr-4 text-right">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 gap-1 px-2 text-xs"
+                            aria-label={`操作：${item.name}`}
+                          >
+                            操作
+                            <ChevronDown className="size-3" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onSelect={() => setDetailID(item.id)}>查看详情</DropdownMenuItem>
+                          <DropdownMenuItem disabled={!!busy} onSelect={() => void test(item.id)}>
+                            检测连接
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            disabled={!!busy || (createStage === "pending" && pendingID === item.id)}
+                            onSelect={() => edit(item)}
+                          >
+                            编辑代理
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            disabled={!!busy || !selectable(item) || globalID === item.id}
+                            onSelect={() => void choose(item.id)}
+                          >
+                            设为全局默认
+                          </DropdownMenuItem>
+                          {item.kind === "warp" &&
+                            warpAllowedActions(item)
+                              .filter((action) => action !== "recover")
+                              .map((action) => (
+                                <DropdownMenuItem
+                                  key={action}
+                                  disabled={
+                                    !!busy ||
+                                    (createStage === "pending" && pendingID === item.id) ||
+                                    (action === "register" && registrationUncertain.includes(item.id))
+                                  }
+                                  onSelect={() => {
+                                    if (warpActionNeedsTerms(action)) {
+                                      setAcceptTerms(false);
+                                      setRegistering(item.id);
+                                    } else void warp(item.id, action);
+                                  }}
+                                >
+                                  {
+                                    { register: "注册 WARP", start: "启动 WARP", stop: "停止 WARP", recover: "恢复" }[
+                                      action
+                                    ]
+                                  }
+                                </DropdownMenuItem>
+                              ))}
+                          {item.kind === "resin" && (
+                            <DropdownMenuItem disabled={!!busy} onSelect={() => setReleasing(item.id)}>
+                              {releaseReadback.includes(item.id) ? "核对租约状态" : "释放租约"}
+                            </DropdownMenuItem>
+                          )}
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem variant="destructive" disabled={!!busy} onSelect={() => setDeleting(item)}>
+                            删除代理
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </TableCell>
+                  </TableRow>
+                ))}
+            </TableBody>
+          </Table>
+          <div className="border-t px-4 py-2 text-muted-foreground text-xs">
+            {loading || loadError
+              ? "正在核对代理状态"
+              : `共 ${items.length} 个代理${visibleItems.length !== items.length ? `，当前显示 ${visibleItems.length} 个` : ""}`}
+          </div>
         </CardContent>
       </Card>
-
+      <Dialog open={groupsOpen} onOpenChange={setGroupsOpen}>
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>代理分组</DialogTitle>
+            <DialogDescription>管理分组成员、轮询与定时刷新。</DialogDescription>
+          </DialogHeader>
+          <ProxyGroups proxies={items} />
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={detailID !== null}
+        onOpenChange={(open) => {
+          if (!open) setDetailID(null);
+        }}
+      >
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>{detail ? detail.name : "代理详情"}</DialogTitle>
+            <DialogDescription>
+              #{detailID} · {detail ? endpoint(detail) : "代理记录已不可用，请刷新列表"}
+            </DialogDescription>
+          </DialogHeader>
+          {detail?.kind === "warp" && <WarpHealthStatus proxy={detail} />}
+          {detail?.last_error && <p className="break-words text-destructive text-xs">{errorText(detail.last_error)}</p>}
+          {detail?.kind === "resin" && (
+            <p className="text-sm">
+              Platform：{detail.resin_platform || "Default"} · Proxy Token：{detail.has_password ? "已保存" : "未配置"}{" "}
+              · Admin Token：{detail.has_resin_admin_token ? "已保存" : "未配置"}
+            </p>
+          )}
+          {detail?.kind === "warp" &&
+            (detail.warp_phase === "registering" || registrationUncertain.includes(detail.id)) && (
+              <p className="text-muted-foreground text-xs">注册结果尚未确认，系统会保留原条目，避免重复注册。</p>
+            )}
+        </DialogContent>
+      </Dialog>
       <AlertDialog
         open={deleting !== null}
         onOpenChange={(open) => {

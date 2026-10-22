@@ -198,6 +198,16 @@ func (c *WarpHealthController) execute(ctx context.Context, execution *db.WarpHe
 	return p, err, bounded.Err() != nil || !stopped
 }
 func (c *WarpHealthController) RunOnce(ctx context.Context, id int64) error {
+	return c.runOnce(ctx, id, false)
+}
+
+// ProbeNow 供管理端立即检测使用；未准入不能被解释为本次检测成功。
+// 只清除周期门槛，不接管遗留 claim，也不改变节点意图或全局恢复策略。
+func (c *WarpHealthController) ProbeNow(ctx context.Context, id int64) error {
+	return c.runOnce(ctx, id, true)
+}
+
+func (c *WarpHealthController) runOnce(ctx context.Context, id int64, immediate bool) error {
 	c.mu.Lock()
 	closed := c.closed
 	if !closed {
@@ -214,6 +224,9 @@ func (c *WarpHealthController) RunOnce(ctx context.Context, id int64) error {
 	// 独立 session 锁覆盖网络真实退出；不同档案的慢操作不持全局生命周期锁。
 	execution, err := c.store.TryWarpHealthExecution(ctx, id)
 	if errors.Is(err, db.ErrWarpHealthBlocked) {
+		if immediate {
+			return err
+		}
 		return nil
 	}
 	if err != nil {
@@ -224,8 +237,33 @@ func (c *WarpHealthController) RunOnce(ctx context.Context, id int64) error {
 			_ = execution.Close()
 		}
 	}()
+	if immediate {
+		// 先持有实际执行锁，再清除周期门槛，避免后台抢先执行后前台静默跳过。
+		if err = c.store.PrepareWarpHealthManualProbe(ctx, id); err != nil {
+			return err
+		}
+	}
+	// 遗留 claim 不能只凭超时清除。持有旧执行的独占锁并核对真实退出后，
+	// 才能解除屏障并重新走正常探测；未知注册或仍在使用的节点继续阻塞。
+	previous, err := execution.WarpHealth(ctx, id)
+	if err != nil {
+		return err
+	}
+	if previous.Claim.Token != "" {
+		if immediate {
+			return db.ErrWarpHealthBlocked
+		}
+		if err = c.autoResolveUnknown(ctx, execution, previous); errors.Is(err, db.ErrWarpHealthBlocked) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+	}
 	claim, err := execution.BeginWarpHealthProbe(ctx, id, time.Now())
 	if errors.Is(err, db.ErrWarpHealthBlocked) {
+		if immediate {
+			return err
+		}
 		return nil
 	}
 	if err != nil {
@@ -342,35 +380,87 @@ func (c *WarpHealthController) ResolveUnknown(ctx context.Context, id int64) err
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
+	guard := c.guard
+	c.mu.Unlock()
+	return c.resolveUnknownWithExecution(ctx, execution, s, guard, false)
+}
+
+func (c *WarpHealthController) autoResolveUnknown(ctx context.Context, execution *db.WarpHealthExecution, s db.WarpHealthState) error {
+	c.mu.Lock()
+	allowed, guard := c.allowed, c.guard
+	c.mu.Unlock()
+	if allowed != nil {
+		ok, err := allowed(ctx, s.ProxyID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return db.ErrWarpHealthBlocked
+		}
+	}
+	// 全局策略、节点意图及业务占用在停止前与清屏障前各作同事务复核。
+	// 策略关闭不强杀已准入的 Stop/Wait，但关闭后不能再清屏障或发起重连。
+	autoGuard := func(ctx context.Context, tx *sql.Tx, id int64) error {
+		if err := db.CheckWarpHealthAutoRecoveryEligibleTx(ctx, tx, id); err != nil {
+			return err
+		}
+		if guard != nil {
+			return guard(ctx, tx, id)
+		}
+		return nil
+	}
+	return c.resolveUnknownWithExecution(ctx, execution, s, autoGuard, true)
+}
+
+func (c *WarpHealthController) resolveUnknownWithExecution(ctx context.Context, execution *db.WarpHealthExecution, s db.WarpHealthState, guard db.WarpHealthRepairGuard, automatic bool) error {
 	if s.Claim.Token == "" {
 		return db.ErrWarpHealthBlocked
 	}
-	if _, running := warpHealthExecutions.Load(s.Claim.Token); running {
+	// 独占连接意外中断时仍要等当前宿主中的真实停止函数返回。
+	if _, running := warpHealthExecutions.LoadOrStore(s.Claim.Token, true); running {
 		return db.ErrWarpHealthBlocked
 	}
+	defer warpHealthExecutions.Delete(s.Claim.Token)
 	localHost, hostErr := os.Hostname()
 	if hostErr != nil {
 		return egress.ErrWarpExitUnknown
 	}
 	if s.OwnerPID != os.Getpid() || s.OwnerHost != localHost {
-		if err = egress.ConfirmWarpOwnerExited(s.OwnerHost, s.OwnerPID); err != nil {
+		if err := egress.ConfirmWarpOwnerExited(s.OwnerHost, s.OwnerPID); err != nil {
 			return err
 		}
 	}
-	// 崩溃可能来不及写 unknown；拿到旧执行 session 独占锁后才允许提升为人工核对状态。
+	if err := execution.CheckIdle(ctx, s.ProxyID, guard); err != nil {
+		return err
+	}
+	if automatic {
+		p, err := c.runtime.Get(warpProfileID(s.ProxyID))
+		if err != nil || !p.Desired || !p.RegistrationAttempted || !p.Registered || !p.Generated || p.Phase == "registering" || p.Phase == "generating" {
+			return db.ErrWarpHealthBlocked
+		}
+		// unknown 仅在注册和生成均已完成时允许核对旧进程；核对后仍必须校验全部材料。
+		if p.Phase != "unknown" {
+			p, material, err := c.runtime.HealthMaterial(warpProfileID(s.ProxyID))
+			if err != nil || material != s.Material || !p.Desired {
+				return db.ErrWarpHealthBlocked
+			}
+		}
+	}
+	// 崩溃可能来不及写 unknown；取得旧执行独占锁并核对 owner 后才提升为核对状态。
 	if s.ClaimState != "unknown" {
-		if err = execution.MarkWarpHealthUnknown(ctx, s.Claim); err != nil {
+		if err := execution.MarkWarpHealthUnknown(ctx, s.Claim); err != nil {
 			return err
 		}
 	}
-	c.mu.Lock()
-	guard := c.guard
-	c.mu.Unlock()
-	if err = execution.CheckIdle(ctx, id, guard); err != nil {
+	if err := c.runtime.ConfirmStopped(ctx, warpProfileID(s.ProxyID)); err != nil {
 		return err
 	}
-	if err = c.runtime.ConfirmStopped(ctx, warpProfileID(id)); err != nil {
-		return err
+	if automatic {
+		p, material, err := c.runtime.HealthMaterial(warpProfileID(s.ProxyID))
+		if err != nil || material != s.Material || !p.Desired {
+			return db.ErrWarpHealthBlocked
+		}
 	}
 	return execution.ResolveWarpHealthUnknownWithGuard(ctx, s.Claim, guard)
 }

@@ -101,6 +101,19 @@ proxy_id bigint NOT NULL REFERENCES outbound_proxies(id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS warp_health_activity_proxy_idx ON warp_proxy_health_activity(proxy_id);
 INSERT INTO warp_proxy_health(proxy_id,state) SELECT id,CASE WHEN status='stopped' THEN 'stopped' ELSE 'unknown' END FROM outbound_proxies WHERE kind='warp' ON CONFLICT DO NOTHING;`)
+		if err != nil {
+			return err
+		}
+		// 只迁移一次。旧节点曾明确关闭时保守关闭全局；后续以单行策略为唯一权威。
+		_, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS warp_health_policy (
+singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+auto_recover_enabled boolean NOT NULL,
+revision bigint NOT NULL DEFAULT 1 CHECK(revision>0),
+migrated_disabled_nodes integer NOT NULL DEFAULT 0,
+updated_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO warp_health_policy(singleton,auto_recover_enabled,migrated_disabled_nodes)
+SELECT true, count(*)=0, count(*) FROM warp_proxy_health WHERE NOT auto_recover_enabled
+ON CONFLICT DO NOTHING`)
 		return err
 	})
 }
@@ -155,7 +168,7 @@ func warpHealthOwner() (string, int) {
 	return host, os.Getpid()
 }
 
-const healthColumns = `proxy_id,desired,imported,auto_recover_enabled,material,profile_revision,revision,state,egress_ip,last_error,failures,recovery_attempts,last_checked_at,next_probe_at,next_recovery_at,COALESCE(claim_token::text,''),claim_kind,claim_state,owner_host,owner_pid`
+const healthColumns = `proxy_id,desired,imported,(SELECT auto_recover_enabled FROM warp_health_policy WHERE singleton),material,profile_revision,revision,state,egress_ip,last_error,failures,recovery_attempts,last_checked_at,next_probe_at,next_recovery_at,COALESCE(claim_token::text,''),claim_kind,claim_state,owner_host,owner_pid`
 
 func scanWarpHealth(row interface{ Scan(...any) error }) (WarpHealthState, error) {
 	var s WarpHealthState
@@ -405,34 +418,7 @@ func (e *WarpHealthExecution) CompleteWarpHealthManual(ctx context.Context, clai
 	return e.withLifecycle(ctx, func(tx *sql.Tx) error { return CompleteWarpHealthManualTx(ctx, tx, claim, intent, finish) })
 }
 
-// 开关 CAS 不改变 Desired；关闭/重新开启均不得抢占 repair 或 unknown。
-func SetWarpAutoRecoveryTx(ctx context.Context, tx *sql.Tx, id, expectedRevision int64, enabled bool) error {
-	if err := CheckWarpHealthMutationTx(ctx, tx, id); err != nil {
-		return err
-	}
-	s, err := healthTx(ctx, tx, id)
-	if err != nil {
-		return err
-	}
-	// JSON 数字必须在 JavaScript 可精确表示的安全整数范围内。
-	if expectedRevision <= 0 || expectedRevision > 9007199254740991 || s.Revision != expectedRevision {
-		return ErrWarpHealthStale
-	}
-	if s.Revision >= 9007199254740991 {
-		return ErrWarpHealthBlocked
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE warp_proxy_health SET auto_recover_enabled=$3,revision=revision+1,claim_token=NULL,claim_kind='',claim_state='',last_probe_token=NULL,owner_host='',owner_pid=0,
-state=CASE WHEN state='checking' THEN 'unknown' ELSE state END WHERE proxy_id=$1 AND revision=$2`, id, expectedRevision, enabled)
-	if err != nil {
-		return err
-	}
-	n, err := result.RowsAffected()
-	if err == nil && n != 1 {
-		return ErrWarpHealthStale
-	}
-	return err
-}
-
+// healthEligibleTx 校验节点自身的运行意图、原注册材料与待处理创建请求。
 func healthEligibleTx(ctx context.Context, tx *sql.Tx, id int64) (WarpHealthState, error) {
 	p, err := getProxyTx(tx, id)
 	if err != nil {
@@ -633,7 +619,7 @@ func (d *DB) MarkWarpHealthUnknown(ctx context.Context, c WarpHealthClaim) error
 	})
 }
 func markWarpHealthUnknownTx(ctx context.Context, tx *sql.Tx, c WarpHealthClaim) error {
-	r, err := tx.ExecContext(ctx, `UPDATE warp_proxy_health SET claim_state='unknown',state='unknown',egress_ip='',last_error='旧执行退出未确认，需正式人工恢复' WHERE proxy_id=$1 AND revision=$2 AND claim_token=$3 AND claim_kind=$4`, c.ProxyID, c.Revision, c.Token, c.Kind)
+	r, err := tx.ExecContext(ctx, `UPDATE warp_proxy_health SET claim_state='unknown',state='unknown',egress_ip='',last_error='旧执行退出未确认，等待安全核对' WHERE proxy_id=$1 AND revision=$2 AND claim_token=$3 AND claim_kind=$4`, c.ProxyID, c.Revision, c.Token, c.Kind)
 	if err != nil {
 		return err
 	}
@@ -806,7 +792,7 @@ func resolveWarpHealthUnknownTx(ctx context.Context, tx *sql.Tx, c WarpHealthCla
 	if err = WarpHealthIdleTx(ctx, tx, c.ProxyID); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE warp_proxy_health SET claim_token=NULL,claim_kind='',claim_state='',revision=revision+1,state='failed',egress_ip='',last_error='人工确认旧执行退出',last_probe_token=NULL,owner_host='',owner_pid=0 WHERE proxy_id=$1`, c.ProxyID)
+	_, err = tx.ExecContext(ctx, `UPDATE warp_proxy_health SET claim_token=NULL,claim_kind='',claim_state='',revision=revision+1,state='failed',egress_ip='',last_error='旧执行已确认退出，等待重新探测',last_probe_token=NULL,owner_host='',owner_pid=0 WHERE proxy_id=$1`, c.ProxyID)
 	return err
 }
 
@@ -819,7 +805,7 @@ func (e *WarpHealthExecution) ResolveWarpHealthUnknown(ctx context.Context, c Wa
 	})
 }
 
-// 人工恢复在停止运行器前后都需复核真实活动；回调只能复用传入短事务。
+// 安全恢复在停止运行器前后都需复核真实活动；回调只能复用传入短事务。
 func (e *WarpHealthExecution) CheckIdle(ctx context.Context, id int64, guard WarpHealthRepairGuard) error {
 	if e == nil || e.key != warpExecutionKey(id) {
 		return ErrWarpHealthBlocked

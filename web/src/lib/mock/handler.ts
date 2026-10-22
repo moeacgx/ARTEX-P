@@ -52,6 +52,17 @@ const mockConversations = structuredClone(D.conversations);
 const mockLLMPool = structuredClone(D.llmPool);
 const mockLLMModels = structuredClone(D.llmModelsByProfile);
 const mockProxies = structuredClone(D.proxies);
+let mockGlobalProxyID: string | null = "1";
+let mockGlobalWarpHealthPolicy = {
+  scope: "global" as const,
+  revision: 1,
+  auto_recover_enabled: true,
+  migrated_disabled_nodes: 0,
+  probe_interval_seconds: 60,
+  failure_threshold: 3,
+  recovery_min_seconds: 300,
+  recovery_max_seconds: 3600,
+};
 // Agent 的渠道+模型绑定覆盖（demo 内存态）：PUT /agents/{key}/config 落这里，
 // GET /agents/{key} 再合并回去，保证"保存 → 重新打开"能看到真实往返，而不是假装成功。
 const mockAgentLLMBindings = new Map<
@@ -2410,10 +2421,30 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   // ── proxies（代理中心）──
   // demo 目录里保留一条未注册的 WARP，让"注册需先确认条款"这条交互可被实际操作/截图；
   // register 缺少 accept_terms:true 直接拒绝，与真实后端规则一致。
-  if (path === "/proxies" && m === "GET") return { proxies: mockProxies, global_proxy_id: "1" };
+  if (path === "/proxies/warp-health-policy" && m === "GET") return { ...mockGlobalWarpHealthPolicy };
+  if (path === "/proxies/warp-health-policy" && m === "PUT") {
+    if (b.expected_revision !== mockGlobalWarpHealthPolicy.revision || typeof b.auto_recover_enabled !== "boolean")
+      throw new Error("全局健康策略版本已变化，请重新核对");
+    mockGlobalWarpHealthPolicy = {
+      ...mockGlobalWarpHealthPolicy,
+      revision: mockGlobalWarpHealthPolicy.revision + 1,
+      auto_recover_enabled: b.auto_recover_enabled,
+    };
+    return { ...mockGlobalWarpHealthPolicy };
+  }
+  if (path === "/proxies" && m === "GET") return { proxies: mockProxies, global_proxy_id: mockGlobalProxyID };
+  if (path === "/proxies/global" && m === "PUT") {
+    mockGlobalProxyID = typeof b.proxy_id === "string" || typeof b.proxy_id === "number" ? String(b.proxy_id) : null;
+    return { global_proxy_id: mockGlobalProxyID };
+  }
+  if (seg[0] === "proxies" && seg.length === 2 && m === "PUT") {
+    const item = mockProxies.find((proxy) => proxy.id === seg[1]);
+    if (!item) throw new Error("代理不存在");
+    if (typeof b.name === "string") item.name = b.name;
+    if (typeof b.enabled === "boolean") item.enabled = b.enabled;
+    return structuredClone(item);
+  }
   if (path === "/proxies" && m === "POST") return { id: String(b.id ?? "1") };
-  if (path === "/proxies/global" && m === "PUT")
-    return { global_proxy_id: typeof b.proxy_id === "string" || typeof b.proxy_id === "number" ? String(b.proxy_id) : null };
   if (seg[0] === "proxies" && seg[2] === "warp" && seg.length === 4) {
     const action = seg[3];
     if (action === "register" && b.accept_terms !== true) {
@@ -2423,8 +2454,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return { id: String(seg[1]), name: "WARP", kind: "warp", enabled: true, status: "stopped" };
   }
   if (seg[0] === "proxies" && seg.length === 3 && m === "DELETE") return { deleted: String(seg[2]) };
-  if (seg[0] === "proxies" && seg[2] === "test")
-    return { id: String(seg[1]), name: "代理", kind: "http", enabled: true, status: "healthy" };
+  if (seg[0] === "proxies" && seg[2] === "test" && m === "POST") {
+    // 演示环境不执行联网检测，不能伪造 healthy 或出口 IP。
+    throw new Error("演示模式未执行真实代理检测，请在连接后端的环境验证出口 IP");
+  }
 
   // ── agents 配置更新 ──
   // 阶段 2：Agent 绑定支持渠道+模型三元组。profile_id 缺省时保留旧绑定；null 解绑；

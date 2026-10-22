@@ -30,12 +30,18 @@ type healthRuntimeFixture struct {
 	recoverAtProbe           int
 	resultIP                 string
 	getEntered, getRelease   chan struct{}
+	material                 string
+	afterStop                func()
 }
 
 func (f *healthRuntimeFixture) HealthMaterial(string) (egress.WarpProfile, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.p, "material", f.materialErr
+	material := f.material
+	if material == "" {
+		material = "material"
+	}
+	return f.p, material, f.materialErr
 }
 func (f *healthRuntimeFixture) Get(string) (egress.WarpProfile, error) {
 	f.mu.Lock()
@@ -86,13 +92,23 @@ func (f *healthRuntimeFixture) Reconnect(context.Context, string, string) (egres
 func (f *healthRuntimeFixture) ConfirmStopped(context.Context, string) error {
 	f.mu.Lock()
 	f.stops++
-	entered, release, err := f.stopEntered, f.stopRelease, f.stopErr
+	entered, release, err, after := f.stopEntered, f.stopRelease, f.stopErr, f.afterStop
 	f.mu.Unlock()
 	if entered != nil {
 		entered <- struct{}{}
 	}
 	if release != nil {
 		<-release
+	}
+	if err == nil {
+		f.mu.Lock()
+		if f.p.Phase == "unknown" && f.p.Registered && f.p.Generated {
+			f.p.Phase, f.p.EgressIP = "failed", ""
+		}
+		f.mu.Unlock()
+	}
+	if after != nil {
+		after()
 	}
 	return err
 }
@@ -118,6 +134,24 @@ func healthControllerFixture(t *testing.T) (*WarpHealthController, *db.DB, *heal
 	}
 	if err = store.MigrateWarpHealth(t.Context()); err != nil {
 		t.Fatal(err)
+	}
+	policy, err := store.GlobalWarpHealthPolicy(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !policy.AutoRecoverEnabled {
+		if _, err = store.SetGlobalWarpHealthPolicy(t.Context(), policy.Revision, true); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			current, err := store.GlobalWarpHealthPolicy(context.Background())
+			if err == nil {
+				_, err = store.SetGlobalWarpHealthPolicy(context.Background(), current.Revision, false)
+			}
+			if err != nil {
+				t.Error(err)
+			}
+		})
 	}
 	var id int64
 	if err = store.QueryRow(`INSERT INTO outbound_proxies(name,kind,enabled,status) VALUES('控制器专用','warp',true,'healthy') RETURNING id`).Scan(&id); err != nil {
@@ -347,16 +381,29 @@ func TestWarpHealthControllerResolveChecksActivityBeforeStop(t *testing.T) {
 func TestWarpHealthControllerPolicyOffStillProbesAndReprobeFirst(t *testing.T) {
 	c, d, f, id := healthControllerFixture(t)
 	f.probeErr = errors.New("secret-password-in-runtime-error")
-	s, _ := d.WarpHealth(t.Context(), id)
-	if err := d.WithWarpHealthLifecycle(t.Context(), func(tx *sql.Tx) error { return db.SetWarpAutoRecoveryTx(t.Context(), tx, id, s.Revision, false) }); err != nil {
+	policy, err := d.GlobalWarpHealthPolicy(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalEnabled := policy.AutoRecoverEnabled
+	t.Cleanup(func() {
+		current, readErr := d.GlobalWarpHealthPolicy(context.Background())
+		if readErr == nil {
+			_, readErr = d.SetGlobalWarpHealthPolicy(context.Background(), current.Revision, originalEnabled)
+		}
+		if readErr != nil {
+			t.Error(readErr)
+		}
+	})
+	policy, err = d.SetGlobalWarpHealthPolicy(t.Context(), policy.Revision, false)
+	if err != nil {
 		t.Fatal(err)
 	}
 	runHealthFailures(t, c, d, id, 4)
 	if f.probes != 4 || f.repairs != 0 {
 		t.Fatalf("关维护影响探测: probe=%d repair=%d", f.probes, f.repairs)
 	}
-	s, _ = d.WarpHealth(t.Context(), id)
-	if err := d.WithWarpHealthLifecycle(t.Context(), func(tx *sql.Tx) error { return db.SetWarpAutoRecoveryTx(t.Context(), tx, id, s.Revision, true) }); err != nil {
+	if _, err = d.SetGlobalWarpHealthPolicy(t.Context(), policy.Revision, true); err != nil {
 		t.Fatal(err)
 	}
 	f.recoverAtProbe = 6
@@ -461,6 +508,217 @@ func TestWarpHealthControllerUnknownExitFailureAndForeignOwnerStayBlocked(t *tes
 	}
 	if err = c.ResolveUnknown(t.Context(), id); !errors.Is(err, egress.ErrWarpExitUnknown) || f.stops != 0 {
 		t.Fatalf("同 PID 其他宿主绕过真实证明: %v stop=%d", err, f.stops)
+	}
+}
+
+func TestWarpHealthControllerAutoResolvesOnlyAfterActualExit(t *testing.T) {
+	c, d, f, id := healthControllerFixture(t)
+	f.entered = make(chan struct{}, 1)
+	f.release = make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.RunOnce(ctx, id) }()
+	select {
+	case <-f.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("探测未开始")
+	}
+	cancel()
+	if err := c.RunOnce(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	stops := f.stops
+	f.mu.Unlock()
+	if stops != 0 {
+		t.Fatal("取消后原执行尚未退出却开始自动核对")
+	}
+	close(f.release)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("原执行取消结果: %v", err)
+	}
+	if err := c.RunOnce(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	s, err := d.WarpHealth(t.Context(), id)
+	if err != nil || s.Claim.Token != "" || s.State != "ready" || f.stops != 1 || f.probes != 2 {
+		t.Fatalf("真实退出后未由后台恢复: state=%+v stop=%d probe=%d err=%v", s, f.stops, f.probes, err)
+	}
+}
+
+func TestWarpHealthControllerAutoResolvesAbandonedClaimAndCompleteUnknownProfile(t *testing.T) {
+	for _, claimState := range []string{"active", "unknown"} {
+		t.Run(claimState, func(t *testing.T) {
+			c, d, f, id := healthControllerFixture(t)
+			claim, err := d.BeginWarpHealthProbe(t.Context(), id, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claimState == "unknown" {
+				if err = d.MarkWarpHealthUnknown(t.Context(), claim); err != nil {
+					t.Fatal(err)
+				}
+				f.p.Phase, f.p.EgressIP = "unknown", ""
+			}
+			if err = c.RunOnce(t.Context(), id); err != nil {
+				t.Fatal(err)
+			}
+			s, err := d.WarpHealth(t.Context(), id)
+			if err != nil || s.Claim.Token != "" || s.Revision != claim.Revision+1 || s.State != "ready" || f.stops != 1 || f.probes != 1 {
+				t.Fatalf("后台未安全核对并复探: %+v stop=%d probe=%d err=%v", s, f.stops, f.probes, err)
+			}
+		})
+	}
+}
+
+func TestWarpHealthControllerAutoResolveAdmissionGuards(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, *WarpHealthController, *db.DB, *healthRuntimeFixture, int64, db.WarpHealthClaim)
+	}{
+		{"global-disabled", func(t *testing.T, _ *WarpHealthController, d *db.DB, _ *healthRuntimeFixture, _ int64, _ db.WarpHealthClaim) {
+			p, err := d.GlobalWarpHealthPolicy(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = d.SetGlobalWarpHealthPolicy(t.Context(), p.Revision, false); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				p, err := d.GlobalWarpHealthPolicy(context.Background())
+				if err == nil {
+					_, err = d.SetGlobalWarpHealthPolicy(context.Background(), p.Revision, true)
+				}
+				if err != nil {
+					t.Error(err)
+				}
+			})
+		}},
+		{"policy-read-error", func(_ *testing.T, c *WarpHealthController, _ *db.DB, _ *healthRuntimeFixture, _ int64, _ db.WarpHealthClaim) {
+			c.SetAutoRecoveryAllowed(func(context.Context, int64) (bool, error) { return false, errors.New("策略读取失败") })
+		}},
+		{"node-disabled", func(t *testing.T, _ *WarpHealthController, d *db.DB, _ *healthRuntimeFixture, id int64, _ db.WarpHealthClaim) {
+			if _, err := d.Exec(`UPDATE outbound_proxies SET enabled=false WHERE id=$1`, id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"intent-stopped", func(t *testing.T, _ *WarpHealthController, d *db.DB, _ *healthRuntimeFixture, id int64, _ db.WarpHealthClaim) {
+			if _, err := d.Exec(`UPDATE warp_proxy_health SET desired=false WHERE proxy_id=$1`, id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"material-absent", func(t *testing.T, _ *WarpHealthController, d *db.DB, _ *healthRuntimeFixture, id int64, _ db.WarpHealthClaim) {
+			if _, err := d.Exec(`UPDATE warp_proxy_health SET material='' WHERE proxy_id=$1`, id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"create-pending", func(t *testing.T, _ *WarpHealthController, d *db.DB, _ *healthRuntimeFixture, id int64, _ db.WarpHealthClaim) {
+			if _, err := d.Exec(`INSERT INTO warp_proxy_create_requests(request_key,payload_hash,proxy_id,state) VALUES($1,$2,$3,'pending')`, uuid.NewString(), make([]byte, 32), id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"unknown-registration", func(_ *testing.T, _ *WarpHealthController, _ *db.DB, f *healthRuntimeFixture, _ int64, _ db.WarpHealthClaim) {
+			f.p.Registered, f.p.Generated, f.p.Phase = false, false, "unknown"
+		}},
+		{"material-changed", func(_ *testing.T, _ *WarpHealthController, _ *db.DB, f *healthRuntimeFixture, _ int64, _ db.WarpHealthClaim) {
+			f.material = "changed"
+		}},
+		{"foreign-owner", func(t *testing.T, _ *WarpHealthController, d *db.DB, _ *healthRuntimeFixture, id int64, _ db.WarpHealthClaim) {
+			if _, err := d.Exec(`UPDATE warp_proxy_health SET owner_host='unverified-other-host' WHERE proxy_id=$1`, id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"live-owner", func(t *testing.T, _ *WarpHealthController, d *db.DB, _ *healthRuntimeFixture, id int64, _ db.WarpHealthClaim) {
+			if _, err := d.Exec(`UPDATE warp_proxy_health SET owner_pid=$2 WHERE proxy_id=$1`, id, os.Getppid()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"same-host-execution-running", func(t *testing.T, _ *WarpHealthController, _ *db.DB, _ *healthRuntimeFixture, _ int64, claim db.WarpHealthClaim) {
+			warpHealthExecutions.Store(claim.Token, true)
+			t.Cleanup(func() { warpHealthExecutions.Delete(claim.Token) })
+		}},
+		{"active-resource", func(t *testing.T, _ *WarpHealthController, d *db.DB, _ *healthRuntimeFixture, id int64, _ db.WarpHealthClaim) {
+			// 模拟重启前已经持久化的资源引用；新领取 API 会正确拒绝 unknown claim。
+			if _, err := d.Exec(`INSERT INTO warp_proxy_health_activity(activity_token,proxy_id) VALUES($1,$2)`, uuid.NewString(), id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"manager-guard-blocked", func(_ *testing.T, c *WarpHealthController, _ *db.DB, _ *healthRuntimeFixture, _ int64, _ db.WarpHealthClaim) {
+			c.SetRepairGuard(func(context.Context, *sql.Tx, int64) error { return db.ErrWarpHealthBlocked })
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, d, f, id := healthControllerFixture(t)
+			claim, err := d.BeginWarpHealthProbe(t.Context(), id, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = d.MarkWarpHealthUnknown(t.Context(), claim); err != nil {
+				t.Fatal(err)
+			}
+			tt.prepare(t, c, d, f, id, claim)
+			_ = c.RunOnce(t.Context(), id)
+			s, err := d.WarpHealth(t.Context(), id)
+			if err != nil || s.Claim.Token != claim.Token || s.Revision != claim.Revision || f.stops != 0 || f.probes != 0 || f.repairs != 0 {
+				t.Fatalf("不满足准入却执行或清屏障: %+v stop=%d probe=%d repair=%d err=%v", s, f.stops, f.probes, f.repairs, err)
+			}
+		})
+	}
+}
+
+func TestWarpHealthControllerAutoResolveRechecksAfterStop(t *testing.T) {
+	for _, boundary := range []string{"exit-unknown", "material-changed", "global-disabled", "guard-changed"} {
+		t.Run(boundary, func(t *testing.T) {
+			c, d, f, id := healthControllerFixture(t)
+			claim, err := d.BeginWarpHealthProbe(t.Context(), id, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = d.MarkWarpHealthUnknown(t.Context(), claim); err != nil {
+				t.Fatal(err)
+			}
+			switch boundary {
+			case "exit-unknown":
+				f.stopErr = egress.ErrWarpExitUnknown
+			case "material-changed":
+				f.afterStop = func() { f.material = "changed-after-stop" }
+			case "global-disabled":
+				f.afterStop = func() {
+					p, err := d.GlobalWarpHealthPolicy(t.Context())
+					if err == nil {
+						_, err = d.SetGlobalWarpHealthPolicy(t.Context(), p.Revision, false)
+					}
+					if err != nil {
+						t.Error(err)
+					}
+				}
+				t.Cleanup(func() {
+					p, err := d.GlobalWarpHealthPolicy(context.Background())
+					if err == nil {
+						_, err = d.SetGlobalWarpHealthPolicy(context.Background(), p.Revision, true)
+					}
+					if err != nil {
+						t.Error(err)
+					}
+				})
+			case "guard-changed":
+				checks := 0
+				c.SetRepairGuard(func(context.Context, *sql.Tx, int64) error {
+					checks++
+					if checks > 1 {
+						return db.ErrWarpHealthBlocked
+					}
+					return nil
+				})
+			}
+			_ = c.RunOnce(t.Context(), id)
+			s, err := d.WarpHealth(t.Context(), id)
+			if err != nil || s.Claim.Token != claim.Token || s.ClaimState != "unknown" || s.Revision != claim.Revision || f.stops != 1 || f.probes != 0 || f.repairs != 0 {
+				t.Fatalf("停止后的变化未保留屏障: %+v stop=%d probe=%d repair=%d err=%v", s, f.stops, f.probes, f.repairs, err)
+			}
+		})
 	}
 }
 

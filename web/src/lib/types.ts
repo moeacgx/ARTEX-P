@@ -1775,3 +1775,17 @@ export interface InterceptExecution {
   seq: number;
   items: Activity[];
 }
+
+export type LocalAgentScope = "tasks.read" | "tasks.create" | "skills.read" | "skills.upload";
+
+export interface LocalAgentDevice {
+  fingerprint: string;
+  id: number;
+  name: string;
+  public_key: string;
+  status: "pending" | "approved" | "revoked";
+  scopes: LocalAgentScope[];
+  created_at: string;
+  approved_at?: string;
+  last_used_at?: string;
+}

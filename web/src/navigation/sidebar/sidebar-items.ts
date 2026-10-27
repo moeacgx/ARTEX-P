@@ -8,6 +8,7 @@ import {
   ClipboardList,
   FolderOpen,
   FolderSync,
+  Laptop,
   LayoutDashboard,
   type LucideIcon,
   MessageSquare,
@@ -84,6 +85,7 @@ export const sidebarItems: NavGroup[] = [
     items: [
       { id: "llm", title: "LLM", url: "/system/llm", icon: Brain },
       { id: "agents", title: "Agent", url: "/system/agents", icon: Bot },
+      { id: "local-agents", title: "本地 Agent 接入", url: "/system/local-agents", icon: Laptop },
       { id: "mcp", title: "MCP", url: "/system/mcp", icon: Plug },
       { id: "proxies", title: "代理中心", url: "/system/proxies", icon: Network },
       { id: "skills", title: "Skill", url: "/system/skills", icon: Sparkles },

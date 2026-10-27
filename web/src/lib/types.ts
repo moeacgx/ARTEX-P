@@ -1776,7 +1776,15 @@ export interface InterceptExecution {
   items: Activity[];
 }
 
-export type LocalAgentScope = "tasks.read" | "tasks.create" | "skills.read" | "skills.upload";
+export type LocalAgentScope =
+  | "tasks.read" | "tasks.create" | "tasks.control" | "tasks.message"
+  | "skills.read" | "skills.upload" | "skills.write"
+  | "assets.read" | "assets.write" | "assets.delete"
+  | "workspace.read" | "workspace.write" | "workspace.upload" | "workspace.download" | "workspace.delete"
+  | "conversations.read" | "conversations.create" | "conversations.message" | "conversations.stop"
+  | "discovery.read" | "logs.read"
+  | "llm.read" | "llm.write" | "llm.test"
+  | "tools.read" | "tools.write" | "mcp.read" | "mcp.write";
 
 export interface LocalAgentDevice {
   fingerprint: string;

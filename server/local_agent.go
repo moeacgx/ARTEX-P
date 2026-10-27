@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -23,8 +24,15 @@ import (
 const localAgentBodyLimit = maxSkillZipBytes + 64*1024
 
 var localAgentScopes = map[string]bool{
-	"tasks.read": true, "tasks.create": true,
-	"skills.read": true, "skills.upload": true,
+	"tasks.read": true, "tasks.create": true, "tasks.control": true, "tasks.message": true,
+	"skills.read": true, "skills.upload": true, "skills.write": true,
+	"assets.read": true, "assets.write": true, "assets.delete": true,
+	"workspace.read": true, "workspace.write": true, "workspace.upload": true, "workspace.download": true, "workspace.delete": true,
+	"conversations.read": true, "conversations.create": true, "conversations.message": true, "conversations.stop": true,
+	"discovery.read": true, "logs.read": true,
+	"llm.read": true, "llm.write": true, "llm.test": true,
+	"tools.read": true, "tools.write": true,
+	"mcp.read": true, "mcp.write": true,
 }
 
 type localAgentDevice struct {
@@ -51,6 +59,129 @@ func (s *Server) registerLocalAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/local-agent/tasks", s.localAgentWithScope("tasks.create", s.createTask))
 	mux.HandleFunc("GET /api/local-agent/skills", s.localAgentWithScope("skills.read", s.fsListSkills))
 	mux.HandleFunc("POST /api/local-agent/skills/upload", s.localAgentWithScope("skills.upload", s.fsUploadSkill))
+	mux.HandleFunc("GET /api/local-agent/skills/{name}/download", s.localAgentWithScope("skills.read", s.fsDownloadSkill))
+	mux.HandleFunc("DELETE /api/local-agent/skills/{name}", s.localAgentWithScope("skills.write", s.fsDeleteSkill))
+	mux.HandleFunc("GET /api/local-agent/skills/{name}/files", s.localAgentWithScope("skills.read", s.fsListFiles))
+	mux.HandleFunc("GET /api/local-agent/skills/{name}/files/{file...}", s.localAgentWithScope("skills.read", s.fsReadFile))
+	mux.HandleFunc("PUT /api/local-agent/skills/{name}/files/{file...}", s.localAgentWithScope("skills.write", s.fsWriteFile))
+	mux.HandleFunc("DELETE /api/local-agent/skills/{name}/files/{file...}", s.localAgentWithScope("skills.write", s.fsDeletePath))
+
+	// 任务及主 Agent 对话。路径变量与原 API 保持一致，handler 可直接复用。
+	mux.HandleFunc("POST /api/local-agent/tasks/{id}/control", s.localAgentWithScope("tasks.control", s.control))
+	mux.HandleFunc("POST /api/local-agent/tasks/{id}/intents/{iid}/messages", s.localAgentWithScope("tasks.message", s.sendWorkerMessage))
+	mux.HandleFunc("POST /api/local-agent/tasks/{id}/chat", s.localAgentWithScope("tasks.message", s.localAgentTaskChat))
+	mux.HandleFunc("POST /api/local-agent/tasks/{id}/chat/session", s.localAgentWithScope("tasks.message", s.localAgentNewTaskChatSession))
+	mux.HandleFunc("POST /api/local-agent/chat/upload", s.localAgentWithScopeBody("tasks.message", maxWorkspaceUpload, s.chatUpload))
+	mux.HandleFunc("GET /api/local-agent/tasks/{id}/chat/status", s.localAgentWithScope("tasks.read", s.taskChatStatus))
+	mux.HandleFunc("POST /api/local-agent/tasks/{id}/chat/stop", s.localAgentWithScope("tasks.message", s.stopChat))
+	mux.HandleFunc("GET /api/local-agent/tasks/{id}/llm/resolution", s.localAgentWithScope("llm.read", s.taskLLMResolutionHandler))
+	mux.HandleFunc("PUT /api/local-agent/tasks/{id}/llm", s.localAgentWithScope("llm.write", s.updateTaskLLMProfiles))
+	mux.HandleFunc("GET /api/local-agent/tasks/{id}/coverage", s.localAgentWithScope("discovery.read", s.taskCoverage))
+	mux.HandleFunc("GET /api/local-agent/tasks/{id}/coverage-graph", s.localAgentWithScope("discovery.read", s.taskCoverageGraph))
+	mux.HandleFunc("GET /api/local-agent/tasks/{id}/asset-refs", s.localAgentWithScope("discovery.read", s.taskAssetRefs))
+
+	// 资产。
+	mux.HandleFunc("GET /api/local-agent/assets", s.localAgentWithScope("assets.read", s.listAssets))
+	mux.HandleFunc("GET /api/local-agent/assets/counts", s.localAgentWithScope("assets.read", s.assetCounts))
+	mux.HandleFunc("POST /api/local-agent/assets", s.localAgentWithScope("assets.write", s.insertAssets))
+	mux.HandleFunc("DELETE /api/local-agent/assets", s.localAgentWithScope("assets.delete", s.deleteAssets))
+
+	// 工作空间。上传单独使用 512 MiB 的签名读取上限。
+	mux.HandleFunc("GET /api/local-agent/workspace/list", s.localAgentWithScope("workspace.read", s.wsList))
+	mux.HandleFunc("GET /api/local-agent/workspace/read", s.localAgentWithScope("workspace.read", s.wsRead))
+	mux.HandleFunc("POST /api/local-agent/workspace/write", s.localAgentWithScope("workspace.write", s.wsWrite))
+	mux.HandleFunc("POST /api/local-agent/workspace/mkdir", s.localAgentWithScope("workspace.write", s.wsMkdir))
+	mux.HandleFunc("DELETE /api/local-agent/workspace/delete", s.localAgentWithScope("workspace.delete", s.wsDelete))
+	mux.HandleFunc("GET /api/local-agent/workspace/download", s.localAgentWithScope("workspace.download", s.wsDownload))
+	mux.HandleFunc("POST /api/local-agent/workspace/upload", s.localAgentWithScopeBody("workspace.upload", maxWorkspaceUpload, s.wsUpload))
+
+	// 对话：创建、读取消息、发送和停止分别授权。
+	mux.HandleFunc("GET /api/local-agent/conversations", s.localAgentWithScope("conversations.read", s.pgListConversations))
+	mux.HandleFunc("POST /api/local-agent/conversations", s.localAgentWithScope("conversations.create", s.pgCreateConversation))
+	mux.HandleFunc("GET /api/local-agent/conversations/{id}/messages", s.localAgentWithScope("conversations.read", s.pgConversationMessages))
+	mux.HandleFunc("GET /api/local-agent/conversations/{id}/messages/{seq}", s.localAgentWithScope("conversations.read", s.pgConversationMsgDetail))
+	mux.HandleFunc("POST /api/local-agent/conversations/{id}/messages", s.localAgentWithScope("conversations.message", s.pgSendConversationMessage))
+	mux.HandleFunc("POST /api/local-agent/conversations/{id}/stop", s.localAgentWithScope("conversations.stop", s.pgStopConversation))
+	mux.HandleFunc("PATCH /api/local-agent/conversations/{id}", s.localAgentWithScope("conversations.message", s.pgRenameConversation))
+	mux.HandleFunc("PATCH /api/local-agent/conversations/{id}/profile", s.localAgentWithScope("llm.write", s.pgUpdateConversation))
+
+	// 发现页只读数据。
+	mux.HandleFunc("GET /api/local-agent/discovery/frontier", s.localAgentWithScope("discovery.read", s.frontier))
+	mux.HandleFunc("GET /api/local-agent/discovery/findings", s.localAgentWithScope("discovery.read", s.findings))
+	mux.HandleFunc("GET /api/local-agent/discovery/findings/groups", s.localAgentWithScope("discovery.read", s.findingGroups))
+	mux.HandleFunc("GET /api/local-agent/discovery/findings/asset-tree", s.localAgentWithScope("discovery.read", s.findingAssetTree))
+	mux.HandleFunc("GET /api/local-agent/discovery/findings/stats", s.localAgentWithScope("discovery.read", s.findingStats))
+	mux.HandleFunc("GET /api/local-agent/discovery/findings/{id}", s.localAgentWithScope("discovery.read", s.getFinding))
+	mux.HandleFunc("GET /api/local-agent/discovery/findings/{id}/lineage", s.localAgentWithScope("discovery.read", s.findingLineage))
+	mux.HandleFunc("GET /api/local-agent/discovery/findings/{id}/retests", s.localAgentWithScope("discovery.read", s.listFindingRetests))
+	mux.HandleFunc("GET /api/local-agent/discovery/findings/retests/active", s.localAgentWithScope("discovery.read", s.listActiveFindingRetests))
+	mux.HandleFunc("GET /api/local-agent/discovery/findings/export", s.localAgentWithScope("discovery.read", s.findingsExport))
+	mux.HandleFunc("GET /api/local-agent/discovery/graph", s.localAgentWithScope("discovery.read", s.explorationGraph))
+	mux.HandleFunc("GET /api/local-agent/discovery/nodes", s.localAgentWithScope("discovery.read", s.explorationNodes))
+	mux.HandleFunc("GET /api/local-agent/discovery/activity", s.localAgentWithScope("discovery.read", s.activity))
+	mux.HandleFunc("GET /api/local-agent/discovery/activity/history", s.localAgentWithScope("discovery.read", s.activityHistory))
+	mux.HandleFunc("GET /api/local-agent/discovery/activity/stream", s.localAgentWithScope("discovery.read", s.streamActivity))
+	mux.HandleFunc("GET /api/local-agent/discovery/activity/{seq}", s.localAgentWithScope("discovery.read", s.activityDetail))
+	mux.HandleFunc("GET /api/local-agent/discovery/intents", s.localAgentWithScope("discovery.read", s.intents))
+	mux.HandleFunc("GET /api/local-agent/discovery/main-sessions", s.localAgentWithScope("discovery.read", s.mainSessions))
+	mux.HandleFunc("GET /api/local-agent/discovery/tokens", s.localAgentWithScope("discovery.read", s.tokenStats))
+	mux.HandleFunc("GET /api/local-agent/discovery/stats", s.localAgentWithScope("discovery.read", s.findingStats))
+
+	// 运行日志及系统统计。
+	mux.HandleFunc("GET /api/local-agent/logs", s.localAgentWithScope("logs.read", s.getLogs))
+	mux.HandleFunc("GET /api/local-agent/logs/history", s.localAgentWithScope("logs.read", s.getLogsHistory))
+	mux.HandleFunc("GET /api/local-agent/logs/stream", s.localAgentWithScope("logs.read", s.streamLogs))
+
+	// LLM 配置和渠道；读取 handler 已经确保不会返回 API key。
+	mux.HandleFunc("GET /api/local-agent/llm", s.localAgentWithScope("llm.read", s.getLLM))
+	mux.HandleFunc("POST /api/local-agent/llm", s.localAgentWithScope("llm.write", s.setLLM))
+	mux.HandleFunc("POST /api/local-agent/llm/test", s.localAgentWithScope("llm.test", s.testLLM))
+	mux.HandleFunc("GET /api/local-agent/llm/profiles", s.localAgentWithScope("llm.read", s.pgListProfiles))
+	mux.HandleFunc("POST /api/local-agent/llm/profiles", s.localAgentWithScope("llm.write", s.pgSaveProfile))
+	mux.HandleFunc("DELETE /api/local-agent/llm/profiles/{id}", s.localAgentWithScope("llm.write", s.pgDeleteProfile))
+	mux.HandleFunc("POST /api/local-agent/llm/profiles/active", s.localAgentWithScope("llm.write", s.pgActivateProfile))
+	mux.HandleFunc("GET /api/local-agent/llm/retry-policy", s.localAgentWithScope("llm.read", s.pgGetLLMRetryPolicy))
+	mux.HandleFunc("POST /api/local-agent/llm/retry-policy", s.localAgentWithScope("llm.write", s.pgSaveLLMRetryPolicy))
+	mux.HandleFunc("GET /api/local-agent/llm/pool", s.localAgentWithScope("llm.read", s.pgLLMPoolStatus))
+	mux.HandleFunc("POST /api/local-agent/llm/pool/reset", s.localAgentWithScope("llm.write", s.pgLLMPoolReset))
+	mux.HandleFunc("GET /api/local-agent/llm/profiles/{id}/models", s.localAgentWithScope("llm.read", s.pgGetLLMModels))
+	mux.HandleFunc("PUT /api/local-agent/llm/profiles/{id}/models", s.localAgentWithScope("llm.write", s.pgPutLLMModels))
+	mux.HandleFunc("GET /api/local-agent/llm/pool/routes", s.localAgentWithScope("llm.read", s.pgGetLLMPoolModelRoutes))
+	mux.HandleFunc("PUT /api/local-agent/llm/pool/routes/{id}", s.localAgentWithScope("llm.write", s.pgPutLLMPoolModelRoute))
+	mux.HandleFunc("GET /api/local-agent/llm/records", s.localAgentWithScope("llm.read", s.pgListLLMRecords))
+	mux.HandleFunc("GET /api/local-agent/llm/records/{id}", s.localAgentWithScope("llm.read", s.pgGetLLMRecord))
+	mux.HandleFunc("GET /api/local-agent/llm/records/tasks", s.localAgentWithScope("llm.read", s.pgLLMTasks))
+	mux.HandleFunc("GET /api/local-agent/llm/records/by-model", s.localAgentWithScope("llm.read", s.pgTokenByModel))
+
+	// 工具目录及自定义工具。
+	mux.HandleFunc("GET /api/local-agent/tools", s.localAgentWithScope("tools.read", s.pgListTools))
+	mux.HandleFunc("PUT /api/local-agent/tools/{key}", s.localAgentWithScope("tools.write", s.pgUpdateTool))
+	mux.HandleFunc("POST /api/local-agent/tools/custom", s.localAgentWithScope("tools.write", s.pgCreateCustomTool))
+	mux.HandleFunc("POST /api/local-agent/tools/custom/test", s.localAgentWithScope("tools.write", s.pgTestCustomTool))
+	mux.HandleFunc("PUT /api/local-agent/tools/custom/{key}", s.localAgentWithScope("tools.write", s.pgUpdateCustomTool))
+	mux.HandleFunc("DELETE /api/local-agent/tools/custom/{key}", s.localAgentWithScope("tools.write", s.pgDeleteCustomTool))
+	mux.HandleFunc("POST /api/local-agent/tools/{key}/reset", s.localAgentWithScope("tools.write", s.pgResetTool))
+
+	// MCP 服务器及其工具目录。
+	mux.HandleFunc("GET /api/local-agent/mcp", s.localAgentWithScope("mcp.read", s.pgListMCP))
+	mux.HandleFunc("POST /api/local-agent/mcp", s.localAgentWithScope("mcp.write", s.pgSaveMCP))
+	mux.HandleFunc("DELETE /api/local-agent/mcp/{id}", s.localAgentWithScope("mcp.write", s.pgDeleteMCP))
+	mux.HandleFunc("GET /api/local-agent/mcp/{id}/tools", s.localAgentWithScope("mcp.read", s.pgMCPTools))
+	mux.HandleFunc("POST /api/local-agent/mcp/{id}/refresh", s.localAgentWithScope("mcp.write", s.pgRefreshMCP))
+}
+
+func (s *Server) localAgentTaskChat(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	q.Set("task", r.PathValue("id"))
+	r.URL.RawQuery = q.Encode()
+	s.chat(w, r)
+}
+
+func (s *Server) localAgentNewTaskChatSession(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	q.Set("task", r.PathValue("id"))
+	r.URL.RawQuery = q.Encode()
+	s.newMainSession(w, r)
 }
 
 func (s *Server) localAgentDownload(w http.ResponseWriter, r *http.Request) {
@@ -68,39 +199,69 @@ func (s *Server) localAgentDownload(w http.ResponseWriter, r *http.Request) {
 
 // 签名覆盖方法、完整 RequestURI、时间、一次性 nonce 和请求体摘要。
 func localAgentVerifySignature(r *http.Request, publicKey string, maxBody int64) error {
+	_, err := localAgentVerifySignatureWithCleanup(r, publicKey, maxBody)
+	return err
+}
+
+func localAgentVerifySignatureWithCleanup(r *http.Request, publicKey string, maxBody int64) (func(), error) {
 	key, err := base64.StdEncoding.DecodeString(publicKey)
 	if err != nil || len(key) != ed25519.PublicKeySize {
-		return errors.New("设备公钥无效")
+		return nil, errors.New("设备公钥无效")
 	}
 	timestamp := r.Header.Get("X-ARTEX-Timestamp")
 	when, err := strconv.ParseInt(timestamp, 10, 64)
 	if err != nil || time.Since(time.Unix(when, 0)) > 5*time.Minute || time.Until(time.Unix(when, 0)) > 5*time.Minute {
-		return errors.New("签名时间无效")
+		return nil, errors.New("签名时间无效")
 	}
 	nonce := r.Header.Get("X-ARTEX-Nonce")
 	if len(nonce) < 16 || len(nonce) > 128 {
-		return errors.New("nonce 长度无效")
+		return nil, errors.New("nonce 长度无效")
 	}
 	for _, c := range nonce {
 		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
-			return errors.New("nonce 字符无效")
+			return nil, errors.New("nonce 字符无效")
 		}
 	}
 	sig, err := base64.StdEncoding.DecodeString(r.Header.Get("X-ARTEX-Signature"))
 	if err != nil || len(sig) != ed25519.SignatureSize {
-		return errors.New("签名格式无效")
+		return nil, errors.New("签名格式无效")
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
-	if err != nil || int64(len(body)) > maxBody {
-		return errors.New("请求体过大或不可读取")
+	var digest [sha256.Size]byte
+	var cleanup func()
+	if maxBody > 32<<20 {
+		file, err := os.CreateTemp("", "artex-local-agent-body-*")
+		if err != nil {
+			return nil, errors.New("无法暂存签名请求体")
+		}
+		cleanup = func() { _ = file.Close(); _ = os.Remove(file.Name()) }
+		h := sha256.New()
+		written, copyErr := io.Copy(io.MultiWriter(file, h), io.LimitReader(r.Body, maxBody+1))
+		if copyErr != nil || written > maxBody {
+			cleanup()
+			return nil, errors.New("请求体过大或不可读取")
+		}
+		copy(digest[:], h.Sum(nil))
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			cleanup()
+			return nil, errors.New("无法重放签名请求体")
+		}
+		r.Body = file
+	} else {
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+		if err != nil || int64(len(body)) > maxBody {
+			return nil, errors.New("请求体过大或不可读取")
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		digest = sha256.Sum256(body)
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	digest := sha256.Sum256(body)
 	message := r.Method + "\n" + r.URL.RequestURI() + "\n" + timestamp + "\n" + nonce + "\n" + hex.EncodeToString(digest[:])
 	if !ed25519.Verify(ed25519.PublicKey(key), []byte(message), sig) {
-		return errors.New("设备签名无效")
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil, errors.New("设备签名无效")
 	}
-	return nil
+	return cleanup, nil
 }
 
 func localAgentDeviceRow(row *sql.Row) (d localAgentDevice, err error) {
@@ -258,6 +419,10 @@ func (s *Server) localAgentRevoke(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) localAgentWithScope(scope string, next http.HandlerFunc) http.HandlerFunc {
+	return s.localAgentWithScopeBody(scope, localAgentBodyLimit, next)
+}
+
+func (s *Server) localAgentWithScopeBody(scope string, maxBody int64, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		pg := s.pg(w)
 		if pg == nil {
@@ -277,9 +442,13 @@ func (s *Server) localAgentWithScope(scope string, next http.HandlerFunc) http.H
 			writeErr(w, 503, "读取设备失败")
 			return
 		}
-		if err := localAgentVerifySignature(r, d.PublicKey, localAgentBodyLimit); err != nil {
+		cleanupBody, err := localAgentVerifySignatureWithCleanup(r, d.PublicKey, maxBody)
+		if err != nil {
 			writeErr(w, 401, err.Error())
 			return
+		}
+		if cleanupBody != nil {
+			defer cleanupBody()
 		}
 		if scope != "" && d.Status != "approved" {
 			writeErr(w, 403, "设备未获授权或已撤销")
@@ -367,4 +536,15 @@ func (w *localAgentResponse) Write(body []byte) (int, error) {
 		w.WriteHeader(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(body)
+}
+
+// Flush 保留 SSE handler 所需的 http.Flusher 能力，同时让审计包装器记录
+// 首次写出的响应状态。
+func (w *localAgentResponse) Flush() {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }

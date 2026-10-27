@@ -8,6 +8,8 @@ ARTEX 提供设备审批和 Ed25519 请求签名，使本机编码 Agent 可以�
 
 可在 ARTEX 网页“系统 / 本地 Agent 接入”下载完整 Skill ZIP，解压到本机 Agent 的 Skill 目录后按 `SKILL.md` 操作。该包内嵌于 ARTEX 程序中，服务器不需要保留源码。
 
+同页会显示当前实例的 ARTEX 地址和首次接入提示词，分别复制给本机 Agent 即可。提示词会要求 Agent 展示设备 ID 与 SHA-256 指纹并等待网页审批；没有明确目标和授权范围时，不创建扫描任务。
+
 ```text
 node scripts/artex-agent.mjs auth login --url https://artex.example.com --name 我的本地Agent
 ```

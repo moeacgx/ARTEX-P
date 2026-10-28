@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash, createPrivateKey, generateKeyPairSync, randomBytes, sign } from "node:crypto";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,38 @@ import { fileURLToPath } from "node:url";
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024 - 4096;
 const MAX_WORKSPACE_UPLOAD_BYTES = 512 * 1024 * 1024 - 4096;
 const API_PATH = "/api/local-agent";
+const MIN_TIMEOUT_MS = 1000;
+const MAX_TIMEOUT_MS = 300000;
+
+function checkedTimeout(value) {
+  if (!/^[0-9]+$/.test(String(value)) || !Number.isSafeInteger(Number(value)) || Number(value) < MIN_TIMEOUT_MS || Number(value) > MAX_TIMEOUT_MS) {
+    throw new Error("--timeout-ms 必须为 1000 至 300000 的整数毫秒数");
+  }
+  return Number(value);
+}
+
+function requestTimeout(resource, method, override) {
+  if (override !== undefined) return checkedTimeout(override);
+  if (method === "POST" && /^\/proxies\/[1-9][0-9]*\/test$/.test(resource)) return 45000;
+  // 下载和写入保留原来的等待时间，普通查询尽快返回连接问题。
+  return method === "GET" && !resource.startsWith("/workspace/download?") ? 15000 : 60000;
+}
+
+function requestError(code, message, status) {
+  const error = new Error(message);
+  error.code = code;
+  if (status !== undefined) error.status = status;
+  return error;
+}
+
+function connectionError(error, method) {
+  if (typeof error?.code === "string" && error.code.startsWith("ARTEX_")) return error;
+  const uncertain = method !== "GET" ? "；请求结果不确定，请先核对目标状态，避免重复操作" : "";
+  if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+    return requestError("ARTEX_TIMEOUT", `ARTEX 请求超时，请检查连接或调整 --timeout-ms${uncertain}`);
+  }
+  return requestError("ARTEX_NETWORK", `无法连接 ARTEX，请检查地址、网络或 TLS 连接${uncertain}`);
+}
 
 export function normalizeBaseUrl(input) {
   const url = new URL(String(input).trim());
@@ -32,6 +64,52 @@ export function configDirectory(env = process.env) {
 }
 
 function sha256(body) { return createHash("sha256").update(body).digest("hex"); }
+
+// 清单只描述包内容，版本始终从本地实际文件计算，避免覆盖不完整却虚报已更新。
+export async function getSkillVersion(directory) {
+  try {
+    const script = fileURLToPath(import.meta.url);
+    let root = directory ?? path.resolve(path.dirname(script), "..");
+    let files;
+    let repository = false;
+    try {
+      const manifest = JSON.parse(await readFile(path.join(root, "skill-manifest.json"), "utf8"));
+      if (!/^[a-f0-9]{64}$/.test(manifest.version) || !Array.isArray(manifest.files)) return undefined;
+      files = manifest.files;
+    } catch (error) {
+      if (directory || error.code !== "ENOENT") return undefined;
+      root = path.join(root, "integrations", "local-agent", "artex-agent");
+      repository = true;
+      files = [];
+      async function list(relative = "") {
+        for (const entry of await readdir(path.join(root, relative), { withFileTypes: true })) {
+          if (/^[._]/.test(entry.name) || entry.name === "skill-manifest.json") continue;
+          const name = relative ? `${relative}/${entry.name}` : entry.name;
+          if (entry.isDirectory()) await list(name);
+          else if (entry.isFile()) files.push(name);
+          else throw new Error("技能目录包含非常规文件");
+        }
+      }
+      await list();
+    }
+    if (!files.includes("SKILL.md") || !files.includes("scripts/artex-agent.mjs") || new Set(files).size !== files.length) return undefined;
+    const resolvedRoot = await realpath(root);
+    const digest = createHash("sha256");
+    for (const file of files.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
+      if (typeof file !== "string" || !file || file.includes("\\") || file.split("/").some(part => !part || part === "." || part === "..") || path.isAbsolute(file)) return undefined;
+      const target = await realpath(path.join(root, file));
+      if (!target.startsWith(resolvedRoot + path.sep)) return undefined;
+      // 仓库入口必须上报自身运行代码的版本，不能借用尚未同步的内嵌副本。
+      const content = await readFile(repository && file === "scripts/artex-agent.mjs" ? script : target);
+      const normalized = Buffer.from(content.toString("latin1").replaceAll("\r\n", "\n"), "latin1");
+      digest.update(`${file}\0${sha256(normalized)}\n`);
+    }
+    return digest.digest("hex");
+  } catch {
+    // 保持旧版单文件用法可用；未知版本由页面提示，不能阻断正常请求。
+    return undefined;
+  }
+}
 
 export function generateIdentity(name) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -97,34 +175,53 @@ async function readResponse(response) {
   const text = await response.text();
   let result;
   try { result = JSON.parse(text); }
-  catch { throw new Error(`ARTEX 返回非 JSON 响应（HTTP ${response.status}）`); }
-  if (!response.ok) throw new Error(`ARTEX 请求失败（HTTP ${response.status}）：${result.error ?? "未知错误"}`);
+  catch { result = null; }
+  if (response.status === 401) throw requestError("ARTEX_AUTH_REQUIRED", "ARTEX 设备认证失败（HTTP 401）；运行 auth status 检查身份及审批状态，不要自动重新配对", 401);
+  if (response.status === 403) {
+    // 只接纳权限标识，不把服务端任意错误内容回显到认证提示中。
+    const missingScope = typeof result?.error === "string" ? /^设备缺少权限：\s*([a-z]+\.[a-z]+)$/.exec(result.error)?.[1] : undefined;
+    const message = missingScope
+      ? `ARTEX 设备缺少权限 ${missingScope}（HTTP 403）；在 Agent 接入页面批准该权限后，直接运行原业务命令`
+      : "ARTEX 设备权限不足（HTTP 403）；运行 auth status 查看审批状态及 scopes，并在 Agent 接入页面检查权限";
+    throw requestError("ARTEX_SCOPE_REQUIRED", message, 403);
+  }
+  if (!result) throw requestError("ARTEX_INVALID_RESPONSE", `ARTEX 返回非 JSON 响应（HTTP ${response.status}）`, response.status);
+  if (!response.ok) throw requestError("ARTEX_HTTP_ERROR", `ARTEX 请求失败（HTTP ${response.status}）：${result.error ?? "未知错误"}`, response.status);
   return result;
 }
 
 export class ArtexAgentClient {
-  constructor(identity, fetcher = fetch) { this.identity = identity; this.fetcher = fetcher; }
-  async request(resource, { method = "GET", body, contentType = "application/json" } = {}) {
-    const response = await this.fetchRequest(resource, { method, body, contentType });
-    return readResponse(response);
+  constructor(identity, fetcher = fetch, versionProvider = getSkillVersion, { timeoutMs } = {}) {
+    this.identity = identity; this.fetcher = fetcher; this.versionProvider = versionProvider;
+    this.timeoutMs = timeoutMs === undefined ? undefined : checkedTimeout(timeoutMs);
   }
-  async fetchRequest(resource, { method = "GET", body, contentType = "application/json" } = {}) {
+  async request(resource, { method = "GET", body, contentType = "application/json", timeoutMs } = {}) {
+    const response = await this.fetchRequest(resource, { method, body, contentType, timeoutMs });
+    try { return await readResponse(response); }
+    catch (error) { throw connectionError(error, method); }
+  }
+  async fetchRequest(resource, { method = "GET", body, contentType = "application/json", timeoutMs } = {}) {
     const url = new URL(normalizeBaseUrl(this.identity.baseUrl) + resource);
+    const version = await this.versionProvider();
+    if (/^[a-f0-9]{64}$/.test(version ?? "")) url.searchParams.set("_skill_version", version);
     const bytes = body === undefined ? undefined : Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
     const headers = { accept: "application/json", ...signedHeaders({ method, url, body: bytes, identity: this.identity }) };
     if (bytes) headers["content-type"] = contentType;
+    const timeout = requestTimeout(resource, method, timeoutMs ?? this.timeoutMs);
     let response;
     try {
-      response = await this.fetcher(url, { method, headers, body: bytes, redirect: "error", signal: AbortSignal.timeout(60000) });
-    } catch {
-      throw new Error(method === "GET" ? "无法连接 ARTEX，请检查地址与网络" : "ARTEX 请求结果不确定；请先核对网页任务或 Skill 列表，避免重复操作");
+      response = await this.fetcher(url, { method, headers, body: bytes, redirect: "error", signal: AbortSignal.timeout(timeout) });
+    } catch (error) {
+      throw connectionError(error, method);
     }
     return response;
   }
   async requestBytes(resource) {
     const response = await this.fetchRequest(resource);
-    if (!response.ok) return readResponse(response);
-    return Buffer.from(await response.arrayBuffer());
+    try {
+      if (!response.ok) return await readResponse(response);
+      return Buffer.from(await response.arrayBuffer());
+    } catch (error) { throw connectionError(error, "GET"); }
   }
   async uploadSkill(file, overwrite = false) {
     const info = await stat(file);
@@ -158,15 +255,18 @@ export class ArtexAgentClient {
   }
 }
 
-export async function pairDevice(baseUrl, name, fetcher = fetch) {
+export async function pairDevice(baseUrl, name, fetcher = fetch, timeoutMs = 30000) {
   const identity = { ...generateIdentity(name), baseUrl: normalizeBaseUrl(baseUrl) };
   const proof = sign(null, Buffer.from(`ARTEX local-agent pair v1\n${name}\n${identity.publicKey}`), identity.privateKey).toString("base64");
-  const response = await fetcher(identity.baseUrl + "/pair", {
-    method: "POST", redirect: "error", signal: AbortSignal.timeout(30000),
-    headers: { "content-type": "application/json", "X-ARTEX-Pair-Proof": proof },
-    body: JSON.stringify({ name, public_key: identity.publicKey }),
-  });
-  const result = await readResponse(response);
+  let result;
+  try {
+    const response = await fetcher(identity.baseUrl + "/pair", {
+      method: "POST", redirect: "error", signal: AbortSignal.timeout(checkedTimeout(timeoutMs)),
+      headers: { "content-type": "application/json", "X-ARTEX-Pair-Proof": proof },
+      body: JSON.stringify({ name, public_key: identity.publicKey }),
+    });
+    result = await readResponse(response);
+  } catch (error) { throw connectionError(error, "POST"); }
   if (!result.id) throw new Error("ARTEX 未返回设备 ID");
   return { ...identity, deviceId: result.id, status: result.status };
 }
@@ -210,6 +310,9 @@ async function jsonFile(file) {
 const HELP = `ARTEX 本地 Agent（Node.js 20+，无需 npm 依赖）
   auth login --url <ARTEX地址> [--name <设备名称>]
   auth status
+  proxies list
+  proxies get --id <代理ID>
+  proxies test --id <代理ID>
   tasks list
   tasks get --id <任务ID>
   tasks create --description <描述> [--goal <目标>]
@@ -253,6 +356,8 @@ const HELP = `ARTEX 本地 Agent（Node.js 20+，无需 npm 依赖）
   tools set --key <工具键> --file <工具JSON>
   tools custom-save --file <自定义工具JSON>
   tools custom-delete --key <工具键>
+所有命令支持 --timeout-ms <1000至300000>。普通查询默认15秒，代理检测45秒，写入与下载60秒。
+已配对设备可直接执行上述业务命令，无需每次先运行 auth status；每条业务命令只发送一次请求。
 首次登录后，在 ARTEX 网页“系统 / Agent 接入”核对设备指纹并批准权限。
 身份保存在当前系统用户的私有目录；可通过 ARTEX_AGENT_CONFIG_DIR 选择独立身份目录。
 撤销设备请在 ARTEX 网页操作。创建任务会按 ARTEX 的现有流程启动任务。`;
@@ -263,6 +368,7 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
   const [command, action] = args;
   if (args.length !== 2) throw new Error("请使用 help 查看命令");
   const known = command === "auth" && ["login", "status"].includes(action)
+    || command === "proxies" && ["list", "get", "test"].includes(action)
     || command === "tasks" && ["list", "get", "create", "control", "chat", "chat-session", "chat-status", "chat-stop", "worker-message", "llm-status", "llm-set"].includes(action)
     || command === "skills" && ["list", "upload"].includes(action)
     || command === "workspace" && ["list", "read", "write", "mkdir", "delete", "upload", "download"].includes(action)
@@ -274,6 +380,7 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
     || command === "tools" && ["list", "set", "custom-save", "custom-delete"].includes(action);
   if (!known) throw new Error("命令无效，请使用 help 查看命令");
   const allowedFlags = command === "auth" && action === "login" ? ["url", "name"]
+    : command === "proxies" && ["get", "test"].includes(action) ? ["id"]
     : command === "tasks" && action === "create" ? ["file", "description", "goal"]
     : command === "tasks" && action === "get" ? ["id"]
     : command === "tasks" && action === "control" ? ["id", "action"]
@@ -306,11 +413,12 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
     : command === "tools" && action === "set" ? ["key", "file"]
     : command === "tools" && action === "custom-save" ? ["file"]
     : command === "tools" && action === "custom-delete" ? ["key"] : [];
-  for (const flag of Object.keys(flags)) if (!allowedFlags.includes(flag)) throw new Error(`不支持参数 --${flag}`);
+  for (const flag of Object.keys(flags)) if (flag !== "timeout-ms" && !allowedFlags.includes(flag)) throw new Error(`不支持参数 --${flag}`);
+  const timeoutMs = flags["timeout-ms"] === undefined ? undefined : checkedTimeout(flags["timeout-ms"]);
   const existing = await store.load();
   if (command === "auth" && action === "login") {
     if (existing) throw new Error("当前目录已有设备身份，请运行 auth status；连接其他 ARTEX 请使用独立 ARTEX_AGENT_CONFIG_DIR");
-    const identity = await pairDevice(required(flags, "url"), flags.name ?? `${os.hostname()} (${process.platform})`, fetcher);
+    const identity = await pairDevice(required(flags, "url"), flags.name ?? `${os.hostname()} (${process.platform})`, fetcher, timeoutMs);
     await store.save(identity);
     output({ configured: true, deviceId: String(identity.deviceId), name: identity.name, status: identity.status, fingerprint: identity.fingerprint, message: "请在 ARTEX 网页的 Agent 接入页面核对指纹并批准权限，然后运行 auth status" });
     return;
@@ -319,9 +427,14 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
     if (command === "auth" && action === "status") { output({ configured: false }); return; }
     throw new Error("尚未配置设备，请先运行 auth login --url <ARTEX地址>");
   }
-  const client = new ArtexAgentClient(existing, fetcher);
+  const client = new ArtexAgentClient(existing, fetcher, getSkillVersion, { timeoutMs });
   if (command === "auth") { output({ configured: true, baseUrl: existing.baseUrl, fingerprint: existing.fingerprint, ...await client.request("/status") }); return; }
   if (action === "list" && !["workspace", "assets", "logs"].includes(command)) { output(await client.request(`/${command}`)); return; }
+  if (command === "proxies") {
+    const id = required(flags, "id");
+    if (!/^[1-9][0-9]*$/.test(id)) throw new Error("代理 ID 必须为正整数");
+    output(await client.request(`/proxies/${id}${action === "test" ? "/test" : ""}`, action === "test" ? { method: "POST" } : {})); return;
+  }
   if (command === "tasks" && action === "get") {
     const id = required(flags, "id");
     if (!/^[1-9][0-9]*$/.test(id)) throw new Error("任务 ID 必须为正整数");

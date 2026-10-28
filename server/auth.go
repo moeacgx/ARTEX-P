@@ -149,6 +149,7 @@ func isLocalAgentSignedPath(path string) bool {
 		return true
 	}
 	for _, prefix := range []string{
+		"/api/local-agent/proxies",
 		"/api/local-agent/tasks",
 		"/api/local-agent/chat",
 		"/api/local-agent/skills",

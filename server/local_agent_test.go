@@ -18,11 +18,150 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	localagent "github.com/Autumn-27/artex/integrations/local-agent"
 )
+
+func TestLocalAgentProxyAuthenticationBoundary(t *testing.T) {
+	for _, path := range []string{"/api/local-agent/proxies", "/api/local-agent/proxies/1", "/api/local-agent/proxies/1/test"} {
+		if !isLocalAgentSignedPath(path) {
+			t.Fatalf("设备签名业务路径被管理员 JWT 拦截: %s", path)
+		}
+	}
+	for _, path := range []string{"/api/local-agent/proxies-admin", "/api/local-agent/devices", "/api/local-agent/devices/1/approve", "/api/local-agent/skill.zip"} {
+		if isLocalAgentSignedPath(path) {
+			t.Fatalf("管理员路径被错误放行: %s", path)
+		}
+	}
+	s := &Server{}
+	mux := http.NewServeMux()
+	s.registerLocalAgentRoutes(mux)
+	for _, endpoint := range []struct{ method, path string }{
+		{"GET", "/api/local-agent/proxies"},
+		{"GET", "/api/local-agent/proxies/1"},
+		{"POST", "/api/local-agent/proxies/1/test"},
+	} {
+		w := httptest.NewRecorder()
+		s.requireAuth(mux).ServeHTTP(w, httptest.NewRequest(endpoint.method, endpoint.path, nil))
+		// 无设备签名必须被本地 Agent 鉴权拒绝，不能匿名到达业务处理器。
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("无签名请求未拒绝 %s: %d", endpoint.path, w.Code)
+		}
+	}
+}
+
+func TestLocalAgentProxyPG(t *testing.T) {
+	dsn := os.Getenv("ARTEX_LOCAL_AGENT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("未配置隔离 PostgreSQL")
+	}
+	if err := db.ConfigureProxySecrets(filepath.Join(t.TempDir(), "proxy.key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitializeProxySecrets(); err != nil {
+		t.Fatal(err)
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+	pg.SetMaxOpenConns(1)
+	if _, err := pg.Exec(`CREATE TEMP TABLE local_agent_devices (
+		id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,public_key TEXT UNIQUE NOT NULL,
+		status TEXT NOT NULL DEFAULT 'pending',scopes TEXT[] NOT NULL DEFAULT '{}',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),approved_at TIMESTAMPTZ,last_used_at TIMESTAMPTZ,
+		skill_version TEXT NOT NULL DEFAULT '',skill_reported_at TIMESTAMPTZ);
+		CREATE TEMP TABLE local_agent_nonces(public_key TEXT,nonce TEXT,created_at TIMESTAMPTZ DEFAULT now(),PRIMARY KEY(public_key,nonce));
+		CREATE TEMP TABLE local_agent_audit(id BIGSERIAL PRIMARY KEY,device_id BIGINT,method TEXT,path TEXT,status_code INTEGER,created_at TIMESTAMPTZ DEFAULT now(),completed_at TIMESTAMPTZ);`); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method == http.MethodConnect {
+			// 测试不访问外网；固定 HTTPS 默认目标在此明确失败。
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "ip=8.8.8.8\nwarp=off\n")
+	}))
+	defer proxy.Close()
+	p, err := pg.CreateProxy(&db.Proxy{Name: "本地 Agent 检测", Kind: db.ProxyKindHTTP, URL: strings.Replace(proxy.URL, "://", "://alice:local-proxy-secret@", 1), Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Exec(`DELETE FROM outbound_proxies WHERE id=$1`, p.ID)
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deviceID int64
+	if err := pg.QueryRow(`INSERT INTO local_agent_devices(name,public_key,status) VALUES('测试设备',$1,'approved') RETURNING id`, base64.StdEncoding.EncodeToString(public)).Scan(&deviceID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{m: &Manager{pg: pg}}
+	mux := http.NewServeMux()
+	s.registerLocalAgentRoutes(mux)
+	handler := s.requireAuth(mux)
+	call := func(method, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := signedLocalAgentRequest(t, private, method, path, nil)
+		r.Header.Set("X-ARTEX-Device-ID", strconv.FormatInt(deviceID, 10))
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	path := "/api/local-agent/proxies/" + strconv.FormatInt(p.ID, 10)
+	for _, endpoint := range []struct{ method, path, scope string }{
+		{"GET", "/api/local-agent/proxies", "proxies.read"},
+		{"GET", path, "proxies.read"},
+		{"POST", path + "/test", "proxies.test"},
+	} {
+		w := call(endpoint.method, endpoint.path)
+		if w.Code != 403 || !strings.Contains(w.Body.String(), endpoint.scope) {
+			t.Fatalf("缺权限未拒绝 %s: %d %s", endpoint.path, w.Code, w.Body.String())
+		}
+	}
+	if requests.Load() != 0 {
+		t.Fatal("缺少检测权限仍发起出站请求")
+	}
+	if _, err := pg.Exec(`UPDATE local_agent_devices SET scopes=ARRAY['proxies.read'] WHERE id=$1`, deviceID); err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range []string{"/api/local-agent/proxies", path} {
+		w := call("GET", endpoint)
+		if w.Code != 200 || strings.Contains(w.Body.String(), "local-proxy-secret") {
+			t.Fatalf("读取未成功或泄漏凭据: %d %s", w.Code, w.Body.String())
+		}
+	}
+	if w := call("POST", path+"/test"); w.Code != 403 {
+		t.Fatal("读取权限错误包含检测权限")
+	}
+	if _, err := pg.Exec(`UPDATE local_agent_devices SET scopes=ARRAY['proxies.test'] WHERE id=$1`, deviceID); err != nil {
+		t.Fatal(err)
+	}
+	w := call("POST", path+"/test")
+	if w.Code != 502 {
+		t.Fatalf("固定目标失败仍报告健康: %d %s", w.Code, w.Body.String())
+	}
+	if requests.Load() != 1 || strings.Contains(w.Body.String(), "local-proxy-secret") {
+		t.Fatal("重复探测或输出泄漏代理凭据")
+	}
+	var auditCount int
+	if err := pg.QueryRow(`SELECT count(*) FROM local_agent_audit WHERE device_id=$1 AND status_code=502 AND completed_at IS NOT NULL`, deviceID).Scan(&auditCount); err != nil || auditCount != 1 {
+		t.Fatalf("检测审计数量=%d 错误=%v", auditCount, err)
+	}
+	checked, ip, code := s.probeProxyCenterIP(t.Context(), p.ID, "http://unresolvable.invalid/trace")
+	if code != "" || ip != "8.8.8.8" || checked.Status != db.ProxyStatusHealthy || checked.LastCheckedAt == nil || requests.Load() != 2 {
+		t.Fatalf("本次出口结果错误: IP=%q 代码=%q 请求=%d", ip, code, requests.Load())
+	}
+}
 
 func signedLocalAgentRequest(t *testing.T, private ed25519.PrivateKey, method, path string, body []byte) *http.Request {
 	t.Helper()
@@ -41,6 +180,49 @@ func signedLocalAgentRequest(t *testing.T, private ed25519.PrivateKey, method, p
 	return r
 }
 
+func TestLocalAgentSkillMigrationPG(t *testing.T) {
+	dsn := os.Getenv("ARTEX_LOCAL_AGENT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("未配置隔离 PostgreSQL")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	sqlDB.SetMaxOpenConns(1)
+	// 临时旧表隔离现有数据，验证旧设备经过真实迁移仍然是版本未知。
+	if _, err := sqlDB.Exec(`CREATE TEMP TABLE local_agent_devices(id BIGINT PRIMARY KEY);
+		INSERT INTO local_agent_devices(id) VALUES(1)`); err != nil {
+		t.Fatal(err)
+	}
+	schema, err := os.ReadFile(filepath.Join("..", "db", "schema.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{}
+	for _, statement := range strings.Split(string(schema), ";") {
+		if index := strings.Index(statement, "ALTER TABLE local_agent_devices ADD COLUMN"); index >= 0 {
+			statements = append(statements, statement[index:])
+		}
+	}
+	if len(statements) == 0 {
+		t.Fatal("缺少旧设备版本迁移")
+	}
+	for range 2 {
+		for _, statement := range statements {
+			if _, err := sqlDB.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var version string
+	var reportedAt *time.Time
+	if err := sqlDB.QueryRow(`SELECT skill_version,skill_reported_at FROM local_agent_devices WHERE id=1`).Scan(&version, &reportedAt); err != nil || version != "" || reportedAt != nil {
+		t.Fatalf("旧设备版本=%q 上报=%v 错误=%v", version, reportedAt, err)
+	}
+}
+
 // 仅使用显式测试 DSN；临时表覆盖同名表，生命周期测试不会修改已有设备。
 func TestLocalAgentLifecyclePG(t *testing.T) {
 	dsn := os.Getenv("ARTEX_LOCAL_AGENT_TEST_DSN")
@@ -56,7 +238,8 @@ func TestLocalAgentLifecyclePG(t *testing.T) {
 	_, err = sqlDB.Exec(`CREATE TEMP TABLE local_agent_devices (
 		id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,public_key TEXT UNIQUE NOT NULL,
 		status TEXT NOT NULL DEFAULT 'pending',scopes TEXT[] NOT NULL DEFAULT '{}',
-		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),approved_at TIMESTAMPTZ,last_used_at TIMESTAMPTZ);
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),approved_at TIMESTAMPTZ,last_used_at TIMESTAMPTZ,
+		skill_version TEXT NOT NULL DEFAULT '',skill_reported_at TIMESTAMPTZ);
 		CREATE TEMP TABLE local_agent_nonces(public_key TEXT,nonce TEXT,created_at TIMESTAMPTZ DEFAULT now(),PRIMARY KEY(public_key,nonce));
 		CREATE TEMP TABLE local_agent_audit(id BIGSERIAL PRIMARY KEY,device_id BIGINT,method TEXT,path TEXT,status_code INTEGER,created_at TIMESTAMPTZ DEFAULT now(),completed_at TIMESTAMPTZ);`)
 	if err != nil {
@@ -129,6 +312,72 @@ func TestLocalAgentLifecyclePG(t *testing.T) {
 	if err := sqlDB.QueryRow(`SELECT count(*) FROM local_agent_audit WHERE device_id=$1 AND status_code=201 AND completed_at IS NOT NULL`, id).Scan(&auditCount); err != nil || auditCount != 1 {
 		t.Fatalf("操作审计数量=%d，错误=%v", auditCount, err)
 	}
+	// 上报必须经过验签；只下载新包不能改变设备的安装状态。
+	skill, err := localagent.Metadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := func(version string, tamper bool) map[string]any {
+		t.Helper()
+		path := "/api/local-agent/status"
+		if version != "" {
+			path += "?_skill_version=" + version
+		}
+		r := signedLocalAgentRequest(t, private, http.MethodGet, path, nil)
+		r.Header.Set("X-ARTEX-Device-ID", strconv.FormatInt(id, 10))
+		if tamper {
+			r.URL.RawQuery = "_skill_version=" + skill.Version
+		}
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if tamper {
+			if w.Code != 401 {
+				t.Fatalf("篡改版本应拒绝：%d %s", w.Code, w.Body.String())
+			}
+			return nil
+		}
+		if w.Code != 200 {
+			t.Fatalf("状态上报：%d %s", w.Code, w.Body.String())
+		}
+		var result map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	oldVersion := strings.Repeat("0", 64)
+	if result := status(oldVersion, false); result["skill_version"] != oldVersion || result["skill_update_available"] != true || result["skill_reported_at"] == nil {
+		t.Fatalf("不同技能包未提示更新：%v", result)
+	}
+	status(oldVersion, true)
+	download := httptest.NewRequest(http.MethodGet, "/api/local-agent/skill", nil)
+	download.Header.Set("Authorization", "Bearer "+adminToken)
+	downloadResponse := httptest.NewRecorder()
+	handler.ServeHTTP(downloadResponse, download)
+	if downloadResponse.Code != 200 {
+		t.Fatalf("下载：%d", downloadResponse.Code)
+	}
+	var persisted string
+	if err := sqlDB.QueryRow(`SELECT skill_version FROM local_agent_devices WHERE id=$1`, id).Scan(&persisted); err != nil || persisted != oldVersion {
+		t.Fatalf("篡改或下载不应改变安装版本：%s %v", persisted, err)
+	}
+	if result := status(skill.Version, false); result["skill_update_available"] != false || result["skill_version"] != skill.Version {
+		t.Fatalf("新版上报未消除更新提示：%v", result)
+	}
+	if result := status("", false); result["skill_version"] != "" || result["skill_reported_at"] != nil || result["skill_update_available"] != false {
+		t.Fatalf("旧客户端应显示未知：%v", result)
+	}
+	list := httptest.NewRequest(http.MethodGet, "/api/local-agent/devices", nil)
+	list.Header.Set("Authorization", "Bearer "+adminToken)
+	listed := httptest.NewRecorder()
+	handler.ServeHTTP(listed, list)
+	var overview struct {
+		Devices []localAgentDevice `json:"devices"`
+		Skill   localagent.Info    `json:"skill"`
+	}
+	if err := json.Unmarshal(listed.Body.Bytes(), &overview); err != nil || listed.Code != 200 || len(overview.Devices) != 1 || overview.Skill.Version != skill.Version {
+		t.Fatalf("设备页面缺少版本信息：%d %s %v", listed.Code, listed.Body.String(), err)
+	}
 	if code := admin("/api/local-agent/devices/"+strconv.FormatInt(id, 10)+"/revoke", ""); code != 200 {
 		t.Fatalf("撤销：%d", code)
 	}
@@ -137,6 +386,36 @@ func TestLocalAgentLifecyclePG(t *testing.T) {
 	}
 	if code := admin(approvePath, `{"scopes":["tasks.create"]}`); code != 404 {
 		t.Fatalf("撤销设备被重新审批：%d", code)
+	}
+}
+
+func TestLocalAgentSkillVersionQuery(t *testing.T) {
+	version := strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name, query, want string
+		invalid           bool
+	}{
+		{"旧客户端", "path=hello%20world", "", false},
+		{"已签名版本", "path=hello%20world&_skill_version=" + version, version, false},
+		{"空版本", "_skill_version=", "", true},
+		{"短版本", "_skill_version=abc", "", true},
+		{"非摘要", "_skill_version=" + strings.Repeat("z", 64), "", true},
+		{"大写摘要", "_skill_version=" + strings.Repeat("A", 64), "", true},
+		{"重复参数", "_skill_version=" + version + "&_skill_version=" + version, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/api/local-agent/status?"+tc.query, nil)
+			got, err := localAgentConsumeSkillVersion(r)
+			if (err != nil) != tc.invalid || got != tc.want {
+				t.Fatalf("版本=%q 错误=%v", got, err)
+			}
+			if !tc.invalid && r.URL.Query().Has("_skill_version") {
+				t.Fatal("内部参数传入业务接口")
+			}
+			if strings.HasPrefix(tc.query, "path=") && r.URL.Query().Get("path") != "hello world" {
+				t.Fatal("业务查询参数丢失")
+			}
+		})
 	}
 }
 

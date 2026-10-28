@@ -1,13 +1,33 @@
 ---
 name: artex-agent
-description: 通过本机 Ed25519 设备身份接入 ARTEX，管理任务、工作区、对话、资产、发现数据、日志、LLM 和工具目录；设备权限须在 ARTEX 网页审批，无需管理员密码或平台 Token。
+description: 通过本机 Ed25519 设备身份直接操作 ARTEX：查询和检测代理、管理任务、工作区、资产、对话、发现数据、日志、LLM 和工具；无需管理员密码或平台 Token。
 ---
 
 # ARTEX 本地 Agent
 
 使用本 Skill 的 `scripts/artex-agent.mjs`，要求 Node.js 20 或更高版本，无需安装 npm 包。
 
-先调用 `auth status`。首次接入调用：
+已配对设备直接执行目标业务命令，不需要每次先查 `auth status`。只在首次接入、身份未配置或收到 401 时检查认证；403 若已明确给出缺少的 scope，直接在网页补充权限，不必额外查认证。
+
+常见请求直接使用：
+
+```text
+node <脚本> proxies list
+node <脚本> proxies get --id <代理ID>
+node <脚本> proxies test --id <代理ID>
+node <脚本> tasks list
+node <脚本> workspace list
+node <脚本> assets counts
+node <脚本> llm status
+node <脚本> tools list
+node <脚本> logs list --limit 20
+```
+
+“查代理 / 给我代理 IP”先运行 `proxies list`，从结果读取代理 ID、地址及最近检测结果；用户要求验证是否可用或读取普通代理的实时出口 IP 时，对指定 ID 运行 `proxies test`。检测结果中 `status=healthy` 表示本次检测成功，`egress_ip` 是出口 IP，`last_checked_at` 是检测时间；列表仅代表最近状态，普通代理的出口 IP 仅在本次检测响应中返回。失败可能返回 HTTP 502，检测冲突返回 HTTP 409。不要为这些查询创建任务、对话或调用 LLM，也不通过 CloudSSH 绕行。列表无检测结果时明确说明尚未检测；出口 IP 为空时明确说明未取得，不把配置地址当作出口 IP。
+
+每个业务命令只请求一次目标接口，不自动登录、探测其他接口或重试。普通查询默认 15 秒、代理检测 45 秒，写入与下载 60 秒；可用 `--timeout-ms 30000` 调整，允许 1000–300000 毫秒。超时和网络断开会分别提示；写请求结果不确定时先核对目标状态，不能盲目重放。403 若已显示所缺权限，在网页补充批准该 scope 后直接执行原业务；若未说明所缺权限，再用 `auth status` 检查审批状态。不能靠反复配对解决。
+
+首次接入调用：
 
 ```text
 node <本Skill目录>/scripts/artex-agent.mjs auth login --url https://artex.example.com --name 本地Agent
@@ -65,6 +85,7 @@ node <脚本> tools custom-delete --key <工具键>
 ```
 
 - `tasks.read` 允许查询任务，`tasks.create` 允许创建任务。
+- `proxies.read` 允许查询代理，`proxies.test` 允许检测指定代理；检测使用 ARTEX 已配置的探测目标，不需要用户提供任意 URL。代理返回信息不包含认证密码或配置秘密。
 - `tasks.control` 允许暂停或恢复任务；`tasks.message` 允许向任务主 Agent 发送消息、创建主会话、停止主 Agent 轮次，或向暂停的 Worker 意图发送消息。
 - `tasks llm-status` 查看任务当前模型解析结果；`tasks llm-set` 按 ARTEX 接口格式更新该任务的 LLM 配置，需要 `llm.write` 权限。
 - `skills.read` 允许查询 Skill，`skills.upload` 允许上传 Skill ZIP。
@@ -86,3 +107,11 @@ Windows 私钥使用当前用户 DPAPI 加密保存；其他系统保存于当�
 不读取或打印身份文件、私钥或管理员凭据。仅记录公开设备 ID、指纹、授权状态和必要业务结果。
 HTTP 仅允许本机回环地址，其他部署使用 HTTPS。需要多个独立身份时设置 `ARTEX_AGENT_CONFIG_DIR`。
 撤销访问在 ARTEX 网页完成；本机删除身份文件不等于服务端撤销设备。
+
+## 技能更新通知
+
+每次请求会根据本地 Skill 实际文件计算内容版本，并随设备签名上报。
+ARTEX 网页“本地 Agent 接入”显示各设备是否需要更新；旧版单文件或文件残缺时显示版本未知。
+下载新版 `artex-agent.zip` 后，将其中 `artex-agent` 目录完整覆盖当前 Skill 目录，包含 `skill-manifest.json`。
+更新后执行 `node <脚本> auth status`，让网页确认新版本；仅下载压缩包不代表设备已升级。
+更新只替换 Skill 文件，保留原设备身份目录，不重新配对或重新申请审批。

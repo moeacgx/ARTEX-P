@@ -1777,6 +1777,7 @@ export interface InterceptExecution {
 }
 
 export type LocalAgentScope =
+  | "proxies.read" | "proxies.test"
   | "tasks.read" | "tasks.create" | "tasks.control" | "tasks.message"
   | "skills.read" | "skills.upload" | "skills.write"
   | "assets.read" | "assets.write" | "assets.delete"
@@ -1796,4 +1797,11 @@ export interface LocalAgentDevice {
   created_at: string;
   approved_at?: string;
   last_used_at?: string;
+  skill_version?: string;
+  skill_reported_at?: string | null;
+}
+
+export interface LocalAgentOverview {
+  devices: LocalAgentDevice[];
+  skill?: { version: string };
 }

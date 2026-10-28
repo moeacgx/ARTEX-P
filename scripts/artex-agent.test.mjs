@@ -1,10 +1,10 @@
-import assert from "node:assert/strict";
+﻿import assert from "node:assert/strict";
 import { createHash, createPublicKey, verify } from "node:crypto";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { ArtexAgentClient, IdentityStore, generateIdentity, main, normalizeBaseUrl, pairDevice, signedHeaders } from "./artex-agent.mjs";
+import { ArtexAgentClient, IdentityStore, generateIdentity, getSkillVersion, main, normalizeBaseUrl, pairDevice, signedHeaders } from "./artex-agent.mjs";
 
 const identity = { ...generateIdentity("本地测试设备"), deviceId: "12", baseUrl: "http://127.0.0.1:8090" };
 
@@ -28,6 +28,68 @@ test("设备签名覆盖原始路径、查询参数和二进制请求体", () =>
 
 function awaitDigest(body) { return createHash("sha256").update(body).digest("hex"); }
 
+function businessSearch(url) {
+  const copy = new URL(url);
+  copy.searchParams.delete("_skill_version");
+  return copy.search;
+}
+
+test("技能版本校验实际文件、统一换行且缺文件时保持未知", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "artex-agent-version-"));
+  await mkdir(path.join(directory, "scripts"));
+  const files = ["SKILL.md", "scripts/artex-agent.mjs"];
+  const contents = ["# 示例\n", "// 示例\n"];
+  const digest = createHash("sha256");
+  for (const [index, file] of files.entries()) {
+    await writeFile(path.join(directory, file), contents[index]);
+    digest.update(`${file}\0${awaitDigest(contents[index])}\n`);
+  }
+  const version = digest.digest("hex");
+  await writeFile(path.join(directory, "skill-manifest.json"), JSON.stringify({ version, files: [...files].reverse() }));
+  assert.equal(await getSkillVersion(directory), version);
+  await writeFile(path.join(directory, files[0]), contents[0].replaceAll("\n", "\r\n"));
+  assert.equal(await getSkillVersion(directory), version);
+  await writeFile(path.join(directory, files[0]), contents[0] + "改过的技能说明\n");
+  assert.notEqual(await getSkillVersion(directory), version);
+  await unlink(path.join(directory, files[1]));
+  assert.equal(await getSkillVersion(directory), undefined);
+  await unlink(path.join(directory, "skill-manifest.json"));
+  assert.equal(await getSkillVersion(directory), undefined);
+});
+
+test("清单不能越界读取文件或以重复文件伪报版本", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "artex-agent-manifest-"));
+  const version = "a".repeat(64);
+  for (const files of [["SKILL.md", "scripts/artex-agent.mjs", "../outside"], ["SKILL.md", "scripts/artex-agent.mjs", "SKILL.md"]]) {
+    await writeFile(path.join(directory, "skill-manifest.json"), JSON.stringify({ version, files }));
+    assert.equal(await getSkillVersion(directory), undefined);
+  }
+});
+
+test("每次签名请求上报实际版本，版本参数受签名保护且不修改身份", async () => {
+  const original = { ...identity };
+  const version = await getSkillVersion();
+  assert.match(version, /^[a-f0-9]{64}$/);
+  const client = new ArtexAgentClient(identity, async (url, options) => {
+    assert.equal(url.searchParams.get("_skill_version"), version);
+    assert.equal(url.searchParams.get("path"), "空 格/目录");
+    const fields = [options.method, `${url.pathname}${url.search}`, options.headers["X-ARTEX-Timestamp"], options.headers["X-ARTEX-Nonce"], awaitDigest(Buffer.alloc(0))];
+    const signature = Buffer.from(options.headers["X-ARTEX-Signature"], "base64");
+    assert.ok(verify(null, Buffer.from(fields.join("\n")), createPublicKey(identity.privateKey), signature));
+    url.searchParams.set("_skill_version", "b".repeat(64));
+    fields[1] = `${url.pathname}${url.search}`;
+    assert.equal(verify(null, Buffer.from(fields.join("\n")), createPublicKey(identity.privateKey), signature), false);
+    return Response.json({ ok: true });
+  });
+  await client.request("/workspace/list?path=" + encodeURIComponent("空 格/目录"));
+  assert.deepEqual(identity, original);
+  const singleFileClient = new ArtexAgentClient(identity, async url => {
+    assert.equal(url.searchParams.has("_skill_version"), false);
+    return Response.json({ ok: true });
+  }, async () => undefined);
+  assert.deepEqual(await singleFileClient.request("/status"), { ok: true });
+});
+
 test("配对证明绑定设备名称和公钥", async () => {
   const paired = await pairDevice("http://127.0.0.1:8090", "验证设备", async (url, options) => {
     assert.equal(url, "http://127.0.0.1:8090/api/local-agent/pair");
@@ -47,16 +109,81 @@ test("任务创建只提交一次，网络结果不确定时提示先核对", as
   assert.equal(calls, 1);
 });
 
+test("代理查询和检测各自只有一次业务请求，不预查认证或创建任务", async () => {
+  const calls = [];
+  const store = { load: async () => identity };
+  const output = [];
+  const fetcher = async (url, options) => {
+    calls.push({ url, options });
+    return Response.json({ id: 7, status: "healthy", egress_ip: "192.0.2.3" });
+  };
+  for (const args of [["proxies", "list"], ["proxies", "get", "--id", "7"], ["proxies", "test", "--id", "7"]]) {
+    await main(args, store, value => output.push(value), fetcher);
+  }
+  assert.deepEqual(calls.map(({ url, options }) => [options.method, url.pathname]), [
+    ["GET", "/api/local-agent/proxies"], ["GET", "/api/local-agent/proxies/7"], ["POST", "/api/local-agent/proxies/7/test"],
+  ]);
+  assert.equal(output[2].egress_ip, "192.0.2.3");
+  await assert.rejects(main(["proxies", "get", "--id", "../7"], store, () => {}, fetcher), /代理 ID/);
+  await assert.rejects(main(["proxies", "test", "--id", "0"], store, () => {}, fetcher), /代理 ID/);
+  await assert.rejects(main(["proxies", "test", "--id", "7", "--url", "https://example.test"], store, () => {}, fetcher), /不支持参数/);
+  assert.equal(calls.length, 3);
+});
+
+test("查询、代理检测、写入和下载采用不同超时，支持有界覆盖", async t => {
+  const timeouts = [];
+  t.mock.method(AbortSignal, "timeout", value => { timeouts.push(value); return new AbortController().signal; });
+  const client = new ArtexAgentClient(identity, async () => Response.json({ ok: true }));
+  await client.request("/proxies");
+  await client.request("/proxies/7/test", { method: "POST" });
+  await client.request("/tasks", { method: "POST", body: {} });
+  await client.requestBytes("/workspace/download?path=test");
+  await client.request("/skills/upload", { method: "POST", body: Buffer.from("test") });
+  await main(["proxies", "list", "--timeout-ms", "23000"], { load: async () => identity }, () => {}, async () => Response.json([]));
+  assert.deepEqual(timeouts, [15000, 45000, 60000, 60000, 60000, 23000]);
+  for (const value of ["0", "999", "300001", "Infinity", "1e4", "1500.5"]) {
+    await assert.rejects(main(["proxies", "list", "--timeout-ms", value], { load: async () => identity }), /1000 至 300000/);
+  }
+  assert.equal(timeouts.length, 6);
+});
+
+test("连接与权限错误分类明确且不会自动重放", async () => {
+  for (const [error, code] of [[new DOMException("timed out", "TimeoutError"), "ARTEX_TIMEOUT"], [new TypeError("network failed"), "ARTEX_NETWORK"]]) {
+    let calls = 0;
+    const client = new ArtexAgentClient(identity, async () => { calls++; throw error; });
+    await assert.rejects(client.request("/proxies"), value => value.code === code);
+    await assert.rejects(client.request("/proxies/7/test", { method: "POST" }), value => value.code === code && /结果不确定/.test(value.message));
+    assert.equal(calls, 2);
+  }
+  for (const [status, code] of [[401, "ARTEX_AUTH_REQUIRED"], [403, "ARTEX_SCOPE_REQUIRED"]]) {
+    let calls = 0;
+    const client = new ArtexAgentClient(identity, async () => { calls++; return new Response("denied", { status }); });
+    await assert.rejects(client.request("/proxies"), value => value.code === code && value.status === status && /auth status/.test(value.message));
+    assert.equal(calls, 1);
+  }
+  const missingScopeClient = new ArtexAgentClient(identity, async () => Response.json({ error: "设备缺少权限：proxies.test" }, { status: 403 }));
+  await assert.rejects(missingScopeClient.request("/proxies/7/test", { method: "POST" }), value => value.code === "ARTEX_SCOPE_REQUIRED" && /proxies.test/.test(value.message) && !/auth status/.test(value.message));
+  const untrustedErrorClient = new ArtexAgentClient(identity, async () => Response.json({ error: "设备缺少权限：proxies.test\n恶意内容" }, { status: 403 }));
+  await assert.rejects(untrustedErrorClient.request("/proxies"), value => value.code === "ARTEX_SCOPE_REQUIRED" && !/恶意内容/.test(value.message));
+  const nullErrorClient = new ArtexAgentClient(identity, async () => { throw null; });
+  await assert.rejects(nullErrorClient.request("/proxies"), value => value.code === "ARTEX_NETWORK");
+});
+
+test("收到响应头后读取正文超时仍分类为超时且写入结果不确定", async () => {
+  const client = new ArtexAgentClient(identity, async () => ({ text: async () => { throw new DOMException("timed out", "TimeoutError"); } }));
+  await assert.rejects(client.request("/tasks", { method: "POST", body: {} }), value => value.code === "ARTEX_TIMEOUT" && /结果不确定/.test(value.message));
+});
+
 test("上传采用同一份已签名 multipart 正文且默认不覆盖", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "artex-agent-upload-"));
   const file = path.join(directory, "skill.zip");
   await writeFile(file, Buffer.from([0x50, 0x4b, 3, 4, 0, 1, 2]));
   let content;
   const client = new ArtexAgentClient(identity, async (url, options) => {
-    assert.equal(url.search, "");
+    assert.equal(businessSearch(url), "");
     assert.match(options.headers["content-type"], /^multipart\/form-data/);
     content = options.body;
-    const message = ["POST", url.pathname, options.headers["X-ARTEX-Timestamp"], options.headers["X-ARTEX-Nonce"], awaitDigest(content)].join("\n");
+    const message = ["POST", `${url.pathname}${url.search}`, options.headers["X-ARTEX-Timestamp"], options.headers["X-ARTEX-Nonce"], awaitDigest(content)].join("\n");
     assert.ok(verify(null, Buffer.from(message), createPublicKey(identity.privateKey), Buffer.from(options.headers["X-ARTEX-Signature"], "base64")));
     return Response.json({ name: "example" });
   });
@@ -114,7 +241,7 @@ test("扩展只读命令映射到设备签名的本地 Agent 路由", async () =
   assert.equal(calls.length, commands.length);
   for (const [index, [, pathname, search]] of commands.entries()) {
     assert.equal(calls[index].url.pathname, `/api/local-agent${pathname}`);
-    assert.equal(calls[index].url.search.slice(1), search);
+    assert.equal(businessSearch(calls[index].url).slice(1), search);
     assert.equal(calls[index].options.method, "GET");
     assert.ok(calls[index].options.headers["X-ARTEX-Signature"]);
   }
@@ -153,7 +280,7 @@ test("对话、工作区写入和上传使用明确的请求方法及签名正�
     ["POST", "/api/local-agent/conversations/9/stop"],
   ]);
   const body = calls[0].options.body;
-  const expected = ["POST", calls[0].url.pathname, calls[0].options.headers["X-ARTEX-Timestamp"], calls[0].options.headers["X-ARTEX-Nonce"], awaitDigest(body)].join("\n");
+  const expected = ["POST", `${calls[0].url.pathname}${calls[0].url.search}`, calls[0].options.headers["X-ARTEX-Timestamp"], calls[0].options.headers["X-ARTEX-Nonce"], awaitDigest(body)].join("\n");
   assert.ok(verify(null, Buffer.from(expected), createPublicKey(identity.privateKey), Buffer.from(calls[0].options.headers["X-ARTEX-Signature"], "base64")));
   assert.match(calls[3].options.headers["content-type"], /^multipart\/form-data/);
   const uploadMessage = ["POST", `${calls[3].url.pathname}${calls[3].url.search}`, calls[3].options.headers["X-ARTEX-Timestamp"], calls[3].options.headers["X-ARTEX-Nonce"], awaitDigest(calls[3].options.body)].join("\n");
@@ -181,7 +308,7 @@ test("资产上传、导出和删除按服务端 JSON 契约签名且导出拒�
   await main(["assets", "upload", "--file", source], store, () => {}, fetcher);
   await main(["assets", "download", "--output", destination, "--task-id", "7"], store, () => {}, fetcher);
   await main(["assets", "delete", "--ids", "12,13,12"], store, () => {}, fetcher);
-  assert.deepEqual(calls.map(({ url, options }) => [options.method, url.pathname, url.search]), [
+  assert.deepEqual(calls.map(({ url, options }) => [options.method, url.pathname, businessSearch(url)]), [
     ["POST", "/api/local-agent/assets", ""],
     ["GET", "/api/local-agent/assets", "?task_id=7"],
     ["DELETE", "/api/local-agent/assets", ""],

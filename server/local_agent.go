@@ -36,15 +36,17 @@ var localAgentScopes = map[string]bool{
 }
 
 type localAgentDevice struct {
-	ID          int64      `json:"id"`
-	Name        string     `json:"name"`
-	PublicKey   string     `json:"public_key"`
-	Fingerprint string     `json:"fingerprint"`
-	Status      string     `json:"status"`
-	Scopes      []string   `json:"scopes"`
-	CreatedAt   time.Time  `json:"created_at"`
-	ApprovedAt  *time.Time `json:"approved_at,omitempty"`
-	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+	ID              int64      `json:"id"`
+	Name            string     `json:"name"`
+	PublicKey       string     `json:"public_key"`
+	Fingerprint     string     `json:"fingerprint"`
+	Status          string     `json:"status"`
+	Scopes          []string   `json:"scopes"`
+	CreatedAt       time.Time  `json:"created_at"`
+	ApprovedAt      *time.Time `json:"approved_at,omitempty"`
+	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
+	SkillVersion    string     `json:"skill_version"`
+	SkillReportedAt *time.Time `json:"skill_reported_at,omitempty"`
 }
 
 func (s *Server) registerLocalAgentRoutes(mux *http.ServeMux) {
@@ -266,7 +268,7 @@ func localAgentVerifySignatureWithCleanup(r *http.Request, publicKey string, max
 
 func localAgentDeviceRow(row *sql.Row) (d localAgentDevice, err error) {
 	var scopes []byte
-	err = row.Scan(&d.ID, &d.Name, &d.PublicKey, &d.Status, &scopes, &d.CreatedAt, &d.ApprovedAt, &d.LastUsedAt)
+	err = row.Scan(&d.ID, &d.Name, &d.PublicKey, &d.Status, &scopes, &d.CreatedAt, &d.ApprovedAt, &d.LastUsedAt, &d.SkillVersion, &d.SkillReportedAt)
 	if err == nil {
 		err = json.Unmarshal(scopes, &d.Scopes)
 		d.Fingerprint = localAgentFingerprint(d.PublicKey)
@@ -274,7 +276,7 @@ func localAgentDeviceRow(row *sql.Row) (d localAgentDevice, err error) {
 	return
 }
 
-const localAgentSelect = `SELECT id,name,public_key,status,to_json(scopes),created_at,approved_at,last_used_at FROM local_agent_devices`
+const localAgentSelect = `SELECT id,name,public_key,status,to_json(scopes),created_at,approved_at,last_used_at,skill_version,skill_reported_at FROM local_agent_devices`
 
 func localAgentFingerprint(publicKey string) string {
 	key, _ := base64.StdEncoding.DecodeString(publicKey)
@@ -311,7 +313,7 @@ func (s *Server) localAgentPair(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := localAgentDeviceRow(pg.QueryRow(`INSERT INTO local_agent_devices(name,public_key) VALUES($1,$2)
 		ON CONFLICT (public_key) DO UPDATE SET name=CASE WHEN local_agent_devices.status='pending' THEN EXCLUDED.name ELSE local_agent_devices.name END
-		RETURNING id,name,public_key,status,to_json(scopes),created_at,approved_at,last_used_at`, req.Name, req.PublicKey))
+		RETURNING id,name,public_key,status,to_json(scopes),created_at,approved_at,last_used_at,skill_version,skill_reported_at`, req.Name, req.PublicKey))
 	if err != nil {
 		writeErr(w, 503, "保存配对申请失败")
 		return
@@ -320,6 +322,12 @@ func (s *Server) localAgentPair(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) localAgentListDevices(w http.ResponseWriter, r *http.Request) {
+	skill, err := localagent.Metadata()
+	if err != nil {
+		writeErr(w, 500, "读取本地 Agent Skill 版本失败")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	pg := s.pg(w)
 	if pg == nil {
 		return
@@ -334,7 +342,7 @@ func (s *Server) localAgentListDevices(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var d localAgentDevice
 		var scopes []byte
-		if err := rows.Scan(&d.ID, &d.Name, &d.PublicKey, &d.Status, &scopes, &d.CreatedAt, &d.ApprovedAt, &d.LastUsedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.Name, &d.PublicKey, &d.Status, &scopes, &d.CreatedAt, &d.ApprovedAt, &d.LastUsedAt, &d.SkillVersion, &d.SkillReportedAt); err != nil {
 			writeErr(w, 503, "读取设备失败")
 			return
 		}
@@ -349,7 +357,7 @@ func (s *Server) localAgentListDevices(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "读取设备失败")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"devices": devices})
+	writeJSON(w, 200, map[string]any{"devices": devices, "skill": skill})
 }
 
 func (s *Server) localAgentApprove(w http.ResponseWriter, r *http.Request) {
@@ -479,7 +487,18 @@ func (s *Server) localAgentWithScopeBody(scope string, maxBody int64, next http.
 			writeErr(w, 409, "签名 nonce 已使用")
 			return
 		}
-		_, _ = pg.Exec(`UPDATE local_agent_devices SET last_used_at=now() WHERE id=$1`, id)
+		// 版本来自已经验证且未重放的签名请求，不接受未签名的展示头。
+		version, err := localAgentConsumeSkillVersion(r)
+		if err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		// 旧客户端再次使用同一身份时清为未知，避免沿用其他安装上报的版本。
+		if _, err := pg.Exec(`UPDATE local_agent_devices SET last_used_at=now(),skill_version=$2,
+			skill_reported_at=CASE WHEN $2='' THEN NULL ELSE now() END WHERE id=$1`, id, version); err != nil {
+			writeErr(w, 503, "保存设备技能版本失败，未执行操作")
+			return
+		}
 		if scope == "" {
 			s.localAgentStatus(w, r)
 			return
@@ -503,6 +522,25 @@ func (s *Server) localAgentWithScopeBody(scope string, maxBody int64, next http.
 	}
 }
 
+// 验签后才移除内部参数，防止影响复用的业务处理器和转发请求。
+func localAgentConsumeSkillVersion(r *http.Request) (string, error) {
+	query := r.URL.Query()
+	values, present := query["_skill_version"]
+	if !present {
+		return "", nil
+	}
+	if len(values) != 1 || len(values[0]) != sha256.Size*2 {
+		return "", errors.New("技能版本格式无效")
+	}
+	version := values[0]
+	if _, err := hex.DecodeString(version); err != nil || version != strings.ToLower(version) {
+		return "", errors.New("技能版本格式无效")
+	}
+	query.Del("_skill_version")
+	r.URL.RawQuery = query.Encode()
+	return version, nil
+}
+
 func (s *Server) localAgentStatus(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -514,7 +552,15 @@ func (s *Server) localAgentStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "读取设备失败")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"id": d.ID, "name": d.Name, "status": d.Status, "scopes": d.Scopes})
+	skill, err := localagent.Metadata()
+	if err != nil {
+		writeErr(w, 500, "读取本地 Agent Skill 版本失败")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]any{"id": d.ID, "name": d.Name, "status": d.Status, "scopes": d.Scopes,
+		"skill": skill, "skill_version": d.SkillVersion, "skill_reported_at": d.SkillReportedAt,
+		"skill_update_available": d.SkillVersion != "" && d.SkillVersion != skill.Version})
 }
 
 type localAgentResponse struct {

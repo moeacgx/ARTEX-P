@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash, createPrivateKey, generateKeyPairSync, randomBytes, sign } from "node:crypto";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +32,52 @@ export function configDirectory(env = process.env) {
 }
 
 function sha256(body) { return createHash("sha256").update(body).digest("hex"); }
+
+// 清单只描述包内容，版本始终从本地实际文件计算，避免覆盖不完整却虚报已更新。
+export async function getSkillVersion(directory) {
+  try {
+    const script = fileURLToPath(import.meta.url);
+    let root = directory ?? path.resolve(path.dirname(script), "..");
+    let files;
+    let repository = false;
+    try {
+      const manifest = JSON.parse(await readFile(path.join(root, "skill-manifest.json"), "utf8"));
+      if (!/^[a-f0-9]{64}$/.test(manifest.version) || !Array.isArray(manifest.files)) return undefined;
+      files = manifest.files;
+    } catch (error) {
+      if (directory || error.code !== "ENOENT") return undefined;
+      root = path.join(root, "integrations", "local-agent", "artex-agent");
+      repository = true;
+      files = [];
+      async function list(relative = "") {
+        for (const entry of await readdir(path.join(root, relative), { withFileTypes: true })) {
+          if (/^[._]/.test(entry.name) || entry.name === "skill-manifest.json") continue;
+          const name = relative ? `${relative}/${entry.name}` : entry.name;
+          if (entry.isDirectory()) await list(name);
+          else if (entry.isFile()) files.push(name);
+          else throw new Error("技能目录包含非常规文件");
+        }
+      }
+      await list();
+    }
+    if (!files.includes("SKILL.md") || !files.includes("scripts/artex-agent.mjs") || new Set(files).size !== files.length) return undefined;
+    const resolvedRoot = await realpath(root);
+    const digest = createHash("sha256");
+    for (const file of files.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
+      if (typeof file !== "string" || !file || file.includes("\\") || file.split("/").some(part => !part || part === "." || part === "..") || path.isAbsolute(file)) return undefined;
+      const target = await realpath(path.join(root, file));
+      if (!target.startsWith(resolvedRoot + path.sep)) return undefined;
+      // 仓库入口必须上报自身运行代码的版本，不能借用尚未同步的内嵌副本。
+      const content = await readFile(repository && file === "scripts/artex-agent.mjs" ? script : target);
+      const normalized = Buffer.from(content.toString("latin1").replaceAll("\r\n", "\n"), "latin1");
+      digest.update(`${file}\0${sha256(normalized)}\n`);
+    }
+    return digest.digest("hex");
+  } catch {
+    // 保持旧版单文件用法可用；未知版本由页面提示，不能阻断正常请求。
+    return undefined;
+  }
+}
 
 export function generateIdentity(name) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -103,13 +149,15 @@ async function readResponse(response) {
 }
 
 export class ArtexAgentClient {
-  constructor(identity, fetcher = fetch) { this.identity = identity; this.fetcher = fetcher; }
+  constructor(identity, fetcher = fetch, versionProvider = getSkillVersion) { this.identity = identity; this.fetcher = fetcher; this.versionProvider = versionProvider; }
   async request(resource, { method = "GET", body, contentType = "application/json" } = {}) {
     const response = await this.fetchRequest(resource, { method, body, contentType });
     return readResponse(response);
   }
   async fetchRequest(resource, { method = "GET", body, contentType = "application/json" } = {}) {
     const url = new URL(normalizeBaseUrl(this.identity.baseUrl) + resource);
+    const version = await this.versionProvider();
+    if (/^[a-f0-9]{64}$/.test(version ?? "")) url.searchParams.set("_skill_version", version);
     const bytes = body === undefined ? undefined : Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
     const headers = { accept: "application/json", ...signedHeaders({ method, url, body: bytes, identity: this.identity }) };
     if (bytes) headers["content-type"] = contentType;

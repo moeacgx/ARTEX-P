@@ -1796,4 +1796,11 @@ export interface LocalAgentDevice {
   created_at: string;
   approved_at?: string;
   last_used_at?: string;
+  skill_version?: string;
+  skill_reported_at?: string | null;
+}
+
+export interface LocalAgentOverview {
+  devices: LocalAgentDevice[];
+  skill?: { version: string };
 }

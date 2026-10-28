@@ -1447,6 +1447,10 @@ CREATE TABLE IF NOT EXISTS local_agent_devices (
     last_used_at TIMESTAMPTZ
 );
 
+-- 旧设备不推断版本；以最近一次已验签的客户端请求为准。
+ALTER TABLE local_agent_devices ADD COLUMN IF NOT EXISTS skill_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE local_agent_devices ADD COLUMN IF NOT EXISTS skill_reported_at TIMESTAMPTZ;
+
 -- 签名请求 nonce 只允许使用一次，避免时间窗口内重放创建任务或上传 Skill。
 CREATE TABLE IF NOT EXISTS local_agent_nonces (
     public_key TEXT NOT NULL,

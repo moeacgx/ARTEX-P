@@ -164,13 +164,16 @@ jobs:
       - name: 在线目录文件摘要校验
         run: node scripts/check-catalog.mjs
       - name: 本地 Agent 客户端与 Skill 同步校验
-        run: node --test --test-timeout=60000 scripts/artex-agent.test.mjs
+        run: |
+          go test ./integrations/local-agent -count=1 -timeout 60s
+          node --test --test-timeout=60000 scripts/artex-agent.test.mjs
       - run: npm ci --ignore-scripts
         working-directory: web
       - name: 前端类型和更新流程
         working-directory: web
         run: |
           npx tsc --noEmit
+          timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/local-agent-skill.test.mjs src/lib/local-agent-overview-api.test.mjs
           timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/catalog-api.test.mjs
           timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/warp-health-api.test.mjs src/lib/proxy-center.test.mjs src/lib/warp-create-intent.test.mjs src/lib/warp-create-api.test.mjs src/lib/proxy-warp-register.test.mjs
           timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/update-flow.test.mjs src/lib/update-api.test.mjs src/lib/fofa-settings.test.mjs src/lib/skill-download-api.test.mjs src/lib/chat-mentions.test.mjs src/lib/chat-mentions-api.test.mjs

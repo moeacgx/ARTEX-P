@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash, createPublicKey, verify } from "node:crypto";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { ArtexAgentClient, IdentityStore, generateIdentity, main, normalizeBaseUrl, pairDevice, signedHeaders } from "./artex-agent.mjs";
+import { ArtexAgentClient, IdentityStore, generateIdentity, getSkillVersion, main, normalizeBaseUrl, pairDevice, signedHeaders } from "./artex-agent.mjs";
 
 const identity = { ...generateIdentity("本地测试设备"), deviceId: "12", baseUrl: "http://127.0.0.1:8090" };
 
@@ -27,6 +27,68 @@ test("设备签名覆盖原始路径、查询参数和二进制请求体", () =>
 });
 
 function awaitDigest(body) { return createHash("sha256").update(body).digest("hex"); }
+
+function businessSearch(url) {
+  const copy = new URL(url);
+  copy.searchParams.delete("_skill_version");
+  return copy.search;
+}
+
+test("技能版本校验实际文件、统一换行且缺文件时保持未知", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "artex-agent-version-"));
+  await mkdir(path.join(directory, "scripts"));
+  const files = ["SKILL.md", "scripts/artex-agent.mjs"];
+  const contents = ["# 示例\n", "// 示例\n"];
+  const digest = createHash("sha256");
+  for (const [index, file] of files.entries()) {
+    await writeFile(path.join(directory, file), contents[index]);
+    digest.update(`${file}\0${awaitDigest(contents[index])}\n`);
+  }
+  const version = digest.digest("hex");
+  await writeFile(path.join(directory, "skill-manifest.json"), JSON.stringify({ version, files: [...files].reverse() }));
+  assert.equal(await getSkillVersion(directory), version);
+  await writeFile(path.join(directory, files[0]), contents[0].replaceAll("\n", "\r\n"));
+  assert.equal(await getSkillVersion(directory), version);
+  await writeFile(path.join(directory, files[0]), contents[0] + "改过的技能说明\n");
+  assert.notEqual(await getSkillVersion(directory), version);
+  await unlink(path.join(directory, files[1]));
+  assert.equal(await getSkillVersion(directory), undefined);
+  await unlink(path.join(directory, "skill-manifest.json"));
+  assert.equal(await getSkillVersion(directory), undefined);
+});
+
+test("清单不能越界读取文件或以重复文件伪报版本", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "artex-agent-manifest-"));
+  const version = "a".repeat(64);
+  for (const files of [["SKILL.md", "scripts/artex-agent.mjs", "../outside"], ["SKILL.md", "scripts/artex-agent.mjs", "SKILL.md"]]) {
+    await writeFile(path.join(directory, "skill-manifest.json"), JSON.stringify({ version, files }));
+    assert.equal(await getSkillVersion(directory), undefined);
+  }
+});
+
+test("每次签名请求上报实际版本，版本参数受签名保护且不修改身份", async () => {
+  const original = { ...identity };
+  const version = await getSkillVersion();
+  assert.match(version, /^[a-f0-9]{64}$/);
+  const client = new ArtexAgentClient(identity, async (url, options) => {
+    assert.equal(url.searchParams.get("_skill_version"), version);
+    assert.equal(url.searchParams.get("path"), "空 格/目录");
+    const fields = [options.method, `${url.pathname}${url.search}`, options.headers["X-ARTEX-Timestamp"], options.headers["X-ARTEX-Nonce"], awaitDigest(Buffer.alloc(0))];
+    const signature = Buffer.from(options.headers["X-ARTEX-Signature"], "base64");
+    assert.ok(verify(null, Buffer.from(fields.join("\n")), createPublicKey(identity.privateKey), signature));
+    url.searchParams.set("_skill_version", "b".repeat(64));
+    fields[1] = `${url.pathname}${url.search}`;
+    assert.equal(verify(null, Buffer.from(fields.join("\n")), createPublicKey(identity.privateKey), signature), false);
+    return Response.json({ ok: true });
+  });
+  await client.request("/workspace/list?path=" + encodeURIComponent("空 格/目录"));
+  assert.deepEqual(identity, original);
+  const singleFileClient = new ArtexAgentClient(identity, async url => {
+    assert.equal(url.searchParams.has("_skill_version"), false);
+    return Response.json({ ok: true });
+  }, async () => undefined);
+  assert.deepEqual(await singleFileClient.request("/status"), { ok: true });
+});
 
 test("配对证明绑定设备名称和公钥", async () => {
   const paired = await pairDevice("http://127.0.0.1:8090", "验证设备", async (url, options) => {
@@ -53,10 +115,10 @@ test("上传采用同一份已签名 multipart 正文且默认不覆盖", async 
   await writeFile(file, Buffer.from([0x50, 0x4b, 3, 4, 0, 1, 2]));
   let content;
   const client = new ArtexAgentClient(identity, async (url, options) => {
-    assert.equal(url.search, "");
+    assert.equal(businessSearch(url), "");
     assert.match(options.headers["content-type"], /^multipart\/form-data/);
     content = options.body;
-    const message = ["POST", url.pathname, options.headers["X-ARTEX-Timestamp"], options.headers["X-ARTEX-Nonce"], awaitDigest(content)].join("\n");
+    const message = ["POST", `${url.pathname}${url.search}`, options.headers["X-ARTEX-Timestamp"], options.headers["X-ARTEX-Nonce"], awaitDigest(content)].join("\n");
     assert.ok(verify(null, Buffer.from(message), createPublicKey(identity.privateKey), Buffer.from(options.headers["X-ARTEX-Signature"], "base64")));
     return Response.json({ name: "example" });
   });
@@ -114,7 +176,7 @@ test("扩展只读命令映射到设备签名的本地 Agent 路由", async () =
   assert.equal(calls.length, commands.length);
   for (const [index, [, pathname, search]] of commands.entries()) {
     assert.equal(calls[index].url.pathname, `/api/local-agent${pathname}`);
-    assert.equal(calls[index].url.search.slice(1), search);
+    assert.equal(businessSearch(calls[index].url).slice(1), search);
     assert.equal(calls[index].options.method, "GET");
     assert.ok(calls[index].options.headers["X-ARTEX-Signature"]);
   }
@@ -153,7 +215,7 @@ test("对话、工作区写入和上传使用明确的请求方法及签名正�
     ["POST", "/api/local-agent/conversations/9/stop"],
   ]);
   const body = calls[0].options.body;
-  const expected = ["POST", calls[0].url.pathname, calls[0].options.headers["X-ARTEX-Timestamp"], calls[0].options.headers["X-ARTEX-Nonce"], awaitDigest(body)].join("\n");
+  const expected = ["POST", `${calls[0].url.pathname}${calls[0].url.search}`, calls[0].options.headers["X-ARTEX-Timestamp"], calls[0].options.headers["X-ARTEX-Nonce"], awaitDigest(body)].join("\n");
   assert.ok(verify(null, Buffer.from(expected), createPublicKey(identity.privateKey), Buffer.from(calls[0].options.headers["X-ARTEX-Signature"], "base64")));
   assert.match(calls[3].options.headers["content-type"], /^multipart\/form-data/);
   const uploadMessage = ["POST", `${calls[3].url.pathname}${calls[3].url.search}`, calls[3].options.headers["X-ARTEX-Timestamp"], calls[3].options.headers["X-ARTEX-Nonce"], awaitDigest(calls[3].options.body)].join("\n");
@@ -181,7 +243,7 @@ test("资产上传、导出和删除按服务端 JSON 契约签名且导出拒�
   await main(["assets", "upload", "--file", source], store, () => {}, fetcher);
   await main(["assets", "download", "--output", destination, "--task-id", "7"], store, () => {}, fetcher);
   await main(["assets", "delete", "--ids", "12,13,12"], store, () => {}, fetcher);
-  assert.deepEqual(calls.map(({ url, options }) => [options.method, url.pathname, url.search]), [
+  assert.deepEqual(calls.map(({ url, options }) => [options.method, url.pathname, businessSearch(url)]), [
     ["POST", "/api/local-agent/assets", ""],
     ["GET", "/api/local-agent/assets", "?task_id=7"],
     ["DELETE", "/api/local-agent/assets", ""],

@@ -548,6 +548,18 @@ type FindingTaskOption struct {
 // FindingStats returns whole-table counts (by severity + pending) and the sorted
 // set of distinct vuln classes.
 func (d *DB) FindingStats() (*FindingStats, error) {
+	return d.findingStats(0)
+}
+
+// FindingStatsForTask 仅统计指定任务，避免本地 Agent 把全局计数当作任务结果。
+func (d *DB) FindingStatsForTask(taskID int64) (*FindingStats, error) {
+	if taskID <= 0 {
+		return nil, fmt.Errorf("任务 ID 必须为正整数")
+	}
+	return d.findingStats(taskID)
+}
+
+func (d *DB) findingStats(taskID int64) (*FindingStats, error) {
 	st := &FindingStats{VulnClasses: []string{}, Tasks: []FindingTaskOption{}}
 	err := d.QueryRow(`SELECT
 		COUNT(*),
@@ -556,11 +568,11 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 		COUNT(*) FILTER (WHERE severity = 'high'),
 		COUNT(*) FILTER (WHERE severity = 'medium'),
 		COUNT(*) FILTER (WHERE severity = 'low')
-		FROM findings`).Scan(&st.Total, &st.Pending, &st.Critical, &st.High, &st.Medium, &st.Low)
+		FROM findings WHERE ($1::bigint=0 OR task_id=$1)`, taskID).Scan(&st.Total, &st.Pending, &st.Critical, &st.High, &st.Medium, &st.Low)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := d.Query(`SELECT DISTINCT vulnclass FROM findings WHERE vulnclass <> '' ORDER BY vulnclass`)
+	rows, err := d.Query(`SELECT DISTINCT vulnclass FROM findings WHERE vulnclass <> '' AND ($1::bigint=0 OR task_id=$1) ORDER BY vulnclass`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -580,9 +592,9 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 	trows, err := d.Query(`SELECT f.task_id, COALESCE(t.name, ''), COALESCE(t.description, ''), COUNT(*)
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id
-		WHERE f.task_id IS NOT NULL
+		WHERE f.task_id IS NOT NULL AND ($1::bigint=0 OR f.task_id=$1)
 		GROUP BY f.task_id, t.name, t.description
-		ORDER BY MAX(f.created_at) DESC`)
+		ORDER BY MAX(f.created_at) DESC`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -597,7 +609,7 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 	if err := trows.Err(); err != nil {
 		return nil, err
 	}
-	archived, err := d.archivedTaskAggregates()
+	archived, err := d.archivedTaskAggregatesForTask(taskID)
 	if err != nil {
 		return nil, err
 	}

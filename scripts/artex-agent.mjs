@@ -23,7 +23,7 @@ function requestTimeout(resource, method, override) {
   if (override !== undefined) return checkedTimeout(override);
   if (method === "POST" && /^\/proxies\/[1-9][0-9]*\/test$/.test(resource)) return 45000;
   // 下载和写入保留原来的等待时间，普通查询尽快返回连接问题。
-  return method === "GET" && !resource.startsWith("/workspace/download?") ? 15000 : 60000;
+  return method === "GET" && !resource.startsWith("/workspace/download?") && !/^\/skills\/[^/]+\/download$/.test(resource) ? 15000 : 60000;
 }
 
 function requestError(code, message, status) {
@@ -278,9 +278,12 @@ function parseArguments(argv) {
     const value = argv[index];
     if (!value.startsWith("--")) { args.push(value); continue; }
     const name = value.slice(2);
-    if (["overwrite", "help"].includes(name)) { flags[name] = true; continue; }
+    if (["overwrite", "help", "all"].includes(name)) {
+      if (Object.hasOwn(flags, name)) throw new Error(`参数 --${name} 重复`);
+      flags[name] = true; continue;
+    }
     const next = argv[++index];
-    if (!next || next.startsWith("--")) throw new Error(`缺少 --${name} 的值`);
+    if (next === undefined || next.startsWith("--")) throw new Error(`缺少 --${name} 的值`);
     if (Object.hasOwn(flags, name)) throw new Error(`参数 --${name} 重复`);
     flags[name] = next;
   }
@@ -302,10 +305,51 @@ function optionalQuery(flags, names, aliases = {}) {
 }
 
 async function jsonFile(file) {
-  const body = JSON.parse(await readFile(file, "utf8"));
+  let body;
+  try { body = JSON.parse((await readFile(file, "utf8")).replace(/^\uFEFF/, "")); }
+  catch (error) {
+    if (error instanceof SyntaxError) throw new Error("JSON 文件格式无效，请使用 UTF-8 JSON 对象；检查引号和逗号");
+    throw error;
+  }
   if (!body || Array.isArray(body) || typeof body !== "object") throw new Error("JSON 必须为对象");
   return body;
 }
+
+function numericID(value) {
+  if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error("ID 必须为不超过 9007199254740991 的正整数");
+  return Number(value);
+}
+
+function skillResource(flags, withFile = false) {
+  const name = required(flags, "name");
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) throw new Error("Skill 名称只能包含字母、数字、下划线和连字符");
+  const root = `/skills/${encodeURIComponent(name)}`;
+  if (!withFile) return root;
+  const file = required(flags, "path");
+  if (file.includes("\\") || file.split("/").some(v => !v || v === "." || v === "..")) throw new Error("Skill 文件需为包内相对路径，使用 / 分隔");
+  return `${root}/files/${file.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+// 只读扩展统一记录参数与真实路由，不向任意地址转发请求。
+const READ_COMMANDS = {
+  "conversations agents": ["/conversations/agents", []],
+  "tasks coverage": ["/tasks/:id/coverage", ["id"]],
+  "tasks coverage-graph": ["/tasks/:id/coverage-graph", ["id"]],
+  "tasks asset-refs": ["/tasks/:id/asset-refs", ["id", "asset-id"]],
+  "discover frontier": ["/discovery/frontier", ["task-id", "limit"]],
+  "discover intents": ["/discovery/intents", ["task-id", "limit", "page", "before"]],
+  "discover main-sessions": ["/discovery/main-sessions", ["task-id"]],
+  "discover tokens": ["/discovery/tokens", ["task-id"]],
+  "discover finding": ["/discovery/findings/:id", ["id", "context-task"]],
+  "discover lineage": ["/discovery/findings/:id/lineage", ["id"]],
+  "discover retests": ["/discovery/findings/:id/retests", ["id"]],
+  "discover activity-detail": ["/discovery/activity/:id", ["id", "task-id"]],
+  "llm pool": ["/llm/pool", []],
+  "llm retry-policy": ["/llm/retry-policy", []],
+  "llm models": ["/llm/profiles/:id/models", ["id"]],
+  "mcp list": ["/mcp", []],
+  "mcp tools": ["/mcp/:id/tools", ["id"]],
+};
 
 const HELP = `ARTEX 本地 Agent（Node.js 20+，无需 npm 依赖）
   auth login --url <ARTEX地址> [--name <设备名称>]
@@ -327,6 +371,12 @@ const HELP = `ARTEX 本地 Agent（Node.js 20+，无需 npm 依赖）
   tasks llm-set --id <任务ID> --file <LLM配置JSON>
   skills list
   skills upload --file <Skill ZIP路径> [--overwrite]
+  skills download --name <Skill名称> --output <本地ZIP文件>
+  skills files --name <Skill名称>
+  skills read --name <Skill名称> --path <包内文件>
+  skills write --name <Skill名称> --path <包内文件> (--content <内容> | --file <本地文件>)
+  skills delete --name <Skill名称>
+  skills delete-file --name <Skill名称> --path <包内文件>
   workspace list [--path <目录>]
   workspace read --path <文件>
   workspace write --path <文件> (--content <内容> | --file <文本文件>)
@@ -335,9 +385,9 @@ const HELP = `ARTEX 本地 Agent（Node.js 20+，无需 npm 依赖）
   workspace upload --file <本地文件> [--path <目标目录>]
   workspace download --path <文件> --output <本地文件>
   assets list [--type <类型>] [--company-id <ID>] [--task-id <ID>]
-  assets counts
+  assets counts [--task-id <ID>]
   assets upload --file <资产JSON文件>
-  assets download --output <本地JSON文件> [--type <类型>] [--company-id <ID>] [--task-id <ID>]
+  assets download --output <本地JSON文件> [--type <类型>] [--company-id <ID>] [--task-id <ID>] [--limit <数量>] [--offset <起点>] [--dsl <筛选>] [--all]
   assets delete --ids <ID列表，例如 1,2,3>
   conversations list
   conversations create --agent-key <Agent键> [--title <标题>]
@@ -355,9 +405,13 @@ const HELP = `ARTEX 本地 Agent（Node.js 20+，无需 npm 依赖）
   tools list
   tools set --key <工具键> --file <工具JSON>
   tools custom-save --file <自定义工具JSON>
+  tools custom-update --key <工具键> --file <自定义工具JSON>
   tools custom-delete --key <工具键>
+只读扩展命令：
+${Object.entries(READ_COMMANDS).map(([command, [, flags]]) => `  ${command}${flags.map(flag => ` [--${flag} <值>]`).join("")}`).join("\n")}
+带 :id 的命令必须提供 --id。资产默认仅下载一页，--all 按指定范围逐页下载并核对完整性。
 所有命令支持 --timeout-ms <1000至300000>。普通查询默认15秒，代理检测45秒，写入与下载60秒。
-已配对设备可直接执行上述业务命令，无需每次先运行 auth status；每条业务命令只发送一次请求。
+已配对设备直接执行业务命令，无需每次先运行 auth status；常规命令一次请求，资产 --all 每页一次，无自动重试。
 首次登录后，在 ARTEX 网页“系统 / Agent 接入”核对设备指纹并批准权限。
 身份保存在当前系统用户的私有目录；可通过 ARTEX_AGENT_CONFIG_DIR 选择独立身份目录。
 撤销设备请在 ARTEX 网页操作。创建任务会按 ARTEX 的现有流程启动任务。`;
@@ -366,20 +420,21 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
   const { args, flags } = parseArguments(argv);
   if (!args.length || flags.help || args[0] === "help") { process.stdout.write(HELP + "\n"); return; }
   const [command, action] = args;
+  const readCommand = READ_COMMANDS[`${command} ${action}`];
   if (args.length !== 2) throw new Error("请使用 help 查看命令");
-  const known = command === "auth" && ["login", "status"].includes(action)
+  const known = readCommand || command === "auth" && ["login", "status"].includes(action)
     || command === "proxies" && ["list", "get", "test"].includes(action)
     || command === "tasks" && ["list", "get", "create", "control", "chat", "chat-session", "chat-status", "chat-stop", "worker-message", "llm-status", "llm-set"].includes(action)
-    || command === "skills" && ["list", "upload"].includes(action)
+    || command === "skills" && ["list", "upload", "download", "files", "read", "write", "delete", "delete-file"].includes(action)
     || command === "workspace" && ["list", "read", "write", "mkdir", "delete", "upload", "download"].includes(action)
     || command === "assets" && ["list", "counts", "upload", "download", "delete"].includes(action)
     || command === "conversations" && ["list", "create", "messages", "send", "stop"].includes(action)
     || command === "discover" && ["findings", "stats", "graph", "nodes", "activity"].includes(action)
     || command === "logs" && ["list", "history"].includes(action)
     || command === "llm" && ["status", "profiles", "set", "profile-save", "activate"].includes(action)
-    || command === "tools" && ["list", "set", "custom-save", "custom-delete"].includes(action);
+    || command === "tools" && ["list", "set", "custom-save", "custom-update", "custom-delete"].includes(action);
   if (!known) throw new Error("命令无效，请使用 help 查看命令");
-  const allowedFlags = command === "auth" && action === "login" ? ["url", "name"]
+  const allowedFlags = readCommand ? readCommand[1] : command === "auth" && action === "login" ? ["url", "name"]
     : command === "proxies" && ["get", "test"].includes(action) ? ["id"]
     : command === "tasks" && action === "create" ? ["file", "description", "goal"]
     : command === "tasks" && action === "get" ? ["id"]
@@ -390,6 +445,10 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
     : command === "tasks" && action === "llm-status" ? ["id"]
     : command === "tasks" && action === "llm-set" ? ["id", "file"]
     : command === "skills" && action === "upload" ? ["file", "overwrite"]
+    : command === "skills" && action === "download" ? ["name", "output"]
+    : command === "skills" && ["files", "delete"].includes(action) ? ["name"]
+    : command === "skills" && ["read", "delete-file"].includes(action) ? ["name", "path"]
+    : command === "skills" && action === "write" ? ["name", "path", "content", "file"]
     : command === "workspace" && action === "list" ? ["path"]
     : command === "workspace" && action === "read" ? ["path"]
     : command === "workspace" && action === "write" ? ["path", "content", "file"]
@@ -398,22 +457,29 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
     : command === "workspace" && action === "download" ? ["path", "output"]
     : command === "assets" && action === "list" ? ["type", "company-id", "task-id", "limit", "offset", "dsl"]
     : command === "assets" && action === "upload" ? ["file"]
-    : command === "assets" && action === "download" ? ["output", "type", "company-id", "task-id", "limit", "offset", "dsl"]
+    : command === "assets" && action === "counts" ? ["task-id"]
+    : command === "assets" && action === "download" ? ["output", "type", "company-id", "task-id", "limit", "offset", "dsl", "all"]
     : command === "assets" && action === "delete" ? ["ids"]
     : command === "conversations" && action === "create" ? ["agent-key", "title", "file"]
     : command === "conversations" && action === "messages" ? ["id", "since", "before", "limit"]
-    : command === "conversations" && ["send", "stop"].includes(action) ? ["id", "message"]
+    : command === "conversations" && action === "send" ? ["id", "message"]
+    : command === "conversations" && action === "stop" ? ["id"]
     : command === "discover" && action === "findings" ? ["task-id", "page", "limit", "filter"]
     : command === "discover" && action === "nodes" ? ["task-id", "page", "size", "kind", "state", "q", "order"]
-    : command === "discover" ? ["task-id", "limit", "offset", "since", "before"]
+    : command === "discover" && action === "activity" ? ["task-id", "limit", "since"]
+    : command === "discover" ? ["task-id"]
     : command === "logs" && action === "list" ? ["since", "limit"]
     : command === "logs" && action === "history" ? ["before", "limit"]
     : command === "llm" && ["set", "profile-save"].includes(action) ? ["file"]
     : command === "llm" && action === "activate" ? ["id"]
-    : command === "tools" && action === "set" ? ["key", "file"]
+    : command === "tools" && ["set", "custom-update"].includes(action) ? ["key", "file"]
     : command === "tools" && action === "custom-save" ? ["file"]
     : command === "tools" && action === "custom-delete" ? ["key"] : [];
   for (const flag of Object.keys(flags)) if (flag !== "timeout-ms" && !allowedFlags.includes(flag)) throw new Error(`不支持参数 --${flag}`);
+  for (const name of ["id", "task-id", "company-id", "intent-id", "context-task", "asset-id"]) {
+    if (flags[name] !== undefined && !/^[1-9][0-9]*$/.test(flags[name])) throw new Error(command === "proxies" && name === "id" ? "代理 ID 必须为正整数" : `--${name} 必须为正整数`);
+    if (flags[name] !== undefined && BigInt(flags[name]) > 9223372036854775807n) throw new Error(`--${name} 超过服务端 ID 上限 9223372036854775807`);
+  }
   const timeoutMs = flags["timeout-ms"] === undefined ? undefined : checkedTimeout(flags["timeout-ms"]);
   const existing = await store.load();
   if (command === "auth" && action === "login") {
@@ -428,6 +494,16 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
     throw new Error("尚未配置设备，请先运行 auth login --url <ARTEX地址>");
   }
   const client = new ArtexAgentClient(existing, fetcher, getSkillVersion, { timeoutMs });
+  if (readCommand) {
+    if (command === "tasks" && action === "asset-refs") required(flags, "asset-id");
+    let resource = readCommand[0];
+    if (resource.includes(":id")) {
+      const id = required(flags, "id");
+      if (!/^[1-9][0-9]*$/.test(id)) throw new Error("ID 必须为正整数");
+      resource = resource.replace(":id", id);
+    }
+    output(await client.request(resource + optionalQuery(flags, readCommand[1].filter(v => v !== "id"), { "task-id": "task" }))); return;
+  }
   if (command === "auth") { output({ configured: true, baseUrl: existing.baseUrl, fingerprint: existing.fingerprint, ...await client.request("/status") }); return; }
   if (action === "list" && !["workspace", "assets", "logs"].includes(command)) { output(await client.request(`/${command}`)); return; }
   if (command === "proxies") {
@@ -466,19 +542,35 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
   }
   if (command === "tasks") {
     if (flags.file && (flags.description || flags.goal)) throw new Error("--file 不能与 --description 或 --goal 同时使用");
-    const body = flags.file ? JSON.parse(await readFile(flags.file, "utf8")) : { description: required(flags, "description"), goal: flags.goal ?? "" };
+    const body = flags.file ? await jsonFile(flags.file) : { description: required(flags, "description"), goal: flags.goal ?? "" };
     if (!body || Array.isArray(body) || typeof body !== "object") throw new Error("任务 JSON 必须为对象");
     output(await client.request("/tasks", { method: "POST", body }));
     return;
   }
-  if (command === "skills") { output(await client.uploadSkill(required(flags, "file"), flags.overwrite === true)); return; }
+  if (command === "skills") {
+    if (action === "upload") { output(await client.uploadSkill(required(flags, "file"), flags.overwrite === true)); return; }
+    const resource = skillResource(flags, ["read", "write", "delete-file"].includes(action));
+    if (action === "download") {
+      const destination = required(flags, "output");
+      const data = await client.requestBytes(resource + "/download");
+      await writeFile(destination, data, { flag: "wx" });
+      output({ path: destination, bytes: data.length }); return;
+    }
+    if (action === "write") {
+      if ((flags.content === undefined) === (flags.file === undefined)) throw new Error("必须提供 --content 或 --file，且不能同时使用");
+      const content = flags.file !== undefined ? await readFile(required(flags, "file"), "utf8") : flags.content;
+      output(await client.request(resource, { method: "PUT", body: { content } })); return;
+    }
+    output(await client.request(resource + (action === "files" ? "/files" : ""), ["delete", "delete-file"].includes(action) ? { method: "DELETE" } : {})); return;
+  }
   if (command === "workspace") {
     if (action === "list" || action === "read") {
       output(await client.request(`/workspace/${action}${optionalQuery(flags, ["path"])}`)); return;
     }
     if (action === "write") {
       if (flags.content !== undefined && flags.file !== undefined) throw new Error("--content 不能与 --file 同时使用");
-      const content = flags.file ? await readFile(required(flags, "file"), "utf8") : required(flags, "content");
+      if (flags.content === undefined && flags.file === undefined) throw new Error("必须提供 --content 或 --file");
+      const content = flags.file !== undefined ? await readFile(required(flags, "file"), "utf8") : flags.content;
       output(await client.request("/workspace/write", { method: "POST", body: { path: required(flags, "path"), content } })); return;
     }
     if (action === "mkdir") { output(await client.request("/workspace/mkdir", { method: "POST", body: { path: required(flags, "path") } })); return; }
@@ -487,7 +579,7 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
     output(await client.downloadWorkspace(required(flags, "path"), required(flags, "output"))); return;
   }
   if (command === "assets") {
-    if (action === "counts") { output(await client.request("/assets/counts")); return; }
+    if (action === "counts") { output(await client.request(`/assets/counts${optionalQuery(flags, ["task-id"])}`)); return; }
     const queryFlags = ["type", "company-id", "task-id", "limit", "offset", "dsl"];
     if (action === "list") { output(await client.request(`/assets${optionalQuery(flags, queryFlags)}`)); return; }
     if (action === "upload") {
@@ -498,17 +590,34 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
     if (action === "delete") {
       const rawIDs = required(flags, "ids").split(",").map(value => value.trim());
       if (rawIDs.some(value => !/^[1-9][0-9]*$/.test(value))) throw new Error("--ids 必须是逗号分隔的正整数列表");
-      output(await client.request("/assets", { method: "DELETE", body: { ids: [...new Set(rawIDs.map(Number))] } })); return;
+      output(await client.request("/assets", { method: "DELETE", body: { ids: [...new Set(rawIDs.map(numericID))] } })); return;
     }
-    const result = await client.request(`/assets${optionalQuery(flags, queryFlags)}`);
     const destination = required(flags, "output");
+    if (flags.all && (flags.limit !== undefined || flags.offset !== undefined)) throw new Error("--all 不能与 --limit 或 --offset 同时使用");
+    if (flags.all && !["type", "task-id", "company-id", "dsl"].some(v => typeof flags[v] === "string" && flags[v].trim())) throw new Error("--all 必须指定 --type、--task-id、--company-id 或 --dsl 的导出范围");
+    let result = await client.request(`/assets${optionalQuery(flags.all ? { ...flags, limit: "200" } : flags, queryFlags)}`);
+    if (flags.all) {
+      const assets = [...(result.assets ?? [])];
+      const total = result.total;
+      if (!Number.isSafeInteger(total) || total < 0 || !Array.isArray(result.assets)) throw new Error("资产分页响应格式无效，未写入导出文件");
+      while (assets.length < total) {
+        if (!result.assets.length) throw new Error("资产分页提前结束，未写入不完整导出；请重新核对筛选范围");
+        result = await client.request(`/assets${optionalQuery({ ...flags, limit: "200", offset: String(assets.length) }, queryFlags)}`);
+        if (result.total !== total || !Array.isArray(result.assets)) throw new Error("导出期间资产数量变化，未写入不完整导出；请重新查询");
+        assets.push(...result.assets);
+      }
+      if (assets.length !== total || new Set(assets.map(v => v.id)).size !== total) throw new Error("导出期间分页发生重复或变化，未写入不完整导出");
+      result = { assets, count: assets.length, total };
+    }
     const content = Buffer.from(JSON.stringify(result, null, 2) + "\n", "utf8");
     await writeFile(destination, content, { flag: "wx" });
-    output({ path: destination, bytes: content.length }); return;
+    const count = result.assets?.length ?? result.count;
+    output({ path: destination, bytes: content.length, count, total: result.total, complete: Number(flags.offset ?? 0) === 0 && count === result.total, ...(flags.all ? {} : { message: "默认仅下载一页；完整导出指定范围并添加 --all" }) }); return;
   }
   if (command === "conversations") {
     if (action === "list") { output(await client.request("/conversations")); return; }
     if (action === "create") {
+      if (flags.file !== undefined && (flags["agent-key"] !== undefined || flags.title !== undefined)) throw new Error("--file 不能与 --agent-key 或 --title 同时使用");
       const body = flags.file ? await jsonFile(required(flags, "file")) : { agent_key: required(flags, "agent-key"), title: flags.title ?? "" };
       output(await client.request("/conversations", { method: "POST", body })); return;
     }
@@ -521,7 +630,7 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
   if (command === "discover") {
     const names = action === "findings" ? ["task-id", "page", "limit", "filter"]
       : action === "nodes" ? ["task-id", "page", "size", "kind", "state", "q", "order"]
-      : ["task-id", "limit", "offset", "since", "before"];
+      : action === "activity" ? ["task-id", "limit", "since"] : ["task-id"];
     const suffix = optionalQuery(flags, names, { "task-id": "task" });
     output(await client.request(`/discovery/${action}${suffix}`)); return;
   }
@@ -535,7 +644,7 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
     if (action === "profile-save") { output(await client.request("/llm/profiles", { method: "POST", body: await jsonFile(required(flags, "file")) })); return; }
     const id = required(flags, "id");
     if (!/^[1-9][0-9]*$/.test(id)) throw new Error("档案 ID 必须为正整数");
-    output(await client.request("/llm/profiles/active", { method: "POST", body: { id: Number(id) } })); return;
+    output(await client.request("/llm/profiles/active", { method: "POST", body: { id: numericID(id) } })); return;
   }
   if (command === "tools") {
     if (action === "list") { output(await client.request("/tools")); return; }
@@ -544,6 +653,7 @@ export async function main(argv = process.argv.slice(2), store = new IdentitySto
       output(await client.request(`/tools/${encodeURIComponent(key)}`, { method: "PUT", body: await jsonFile(required(flags, "file")) })); return;
     }
     if (action === "custom-save") { output(await client.request("/tools/custom", { method: "POST", body: await jsonFile(required(flags, "file")) })); return; }
+    if (action === "custom-update") { output(await client.request(`/tools/custom/${encodeURIComponent(required(flags, "key"))}`, { method: "PUT", body: await jsonFile(required(flags, "file")) })); return; }
     const key = required(flags, "key");
     output(await client.request(`/tools/custom/${encodeURIComponent(key)}`, { method: "DELETE" })); return;
   }

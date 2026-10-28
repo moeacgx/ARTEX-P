@@ -12,7 +12,43 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestProxyProbeReturnsObservedIPOnce(t *testing.T) {
+	for _, observed := range []string{"8.8.8.8", "2606:4700:4700::1111", "invalid", ""} {
+		t.Run(observed, func(t *testing.T) {
+			var requests atomic.Int64
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				fmt.Fprintf(w, "ip=%s\nwarp=off\n", observed)
+			}))
+			defer proxy.Close()
+			ip, err := ProbeProxyIP(t.Context(), proxy.URL, "http://unresolvable.invalid/trace", false)
+			want := observed
+			if net.ParseIP(observed) == nil {
+				want = ""
+			}
+			if err != nil || ip != want || requests.Load() != 1 {
+				t.Fatalf("出口=%q 预期=%q 请求=%d 错误=%v", ip, want, requests.Load(), err)
+			}
+		})
+	}
+}
+
+func TestProxyProbeCancellationIsBounded(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer proxy.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	ip, err := ProbeProxyIP(ctx, proxy.URL, "http://unresolvable.invalid/trace", false)
+	if err == nil || ip != "" || time.Since(start) > time.Second {
+		t.Fatalf("取消未及时失败: 出口=%q 错误=%v", ip, err)
+	}
+}
 
 func TestProxyProbeHTTPAndWarpAreReal(t *testing.T) {
 	var requests atomic.Int64

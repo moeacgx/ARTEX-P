@@ -41,6 +41,8 @@ import {
 import type { LocalAgentDevice, LocalAgentScope } from "@/lib/types";
 
 const scopes: { value: LocalAgentScope; label: string; description: string }[] = [
+  { value: "proxies.read", label: "读取代理", description: "查看代理地址、健康状态和已检测的出口 IP，不包含凭据" },
+  { value: "proxies.test", label: "检测代理", description: "通过指定代理检查连通性和出口 IP，不启动或恢复代理" },
   { value: "tasks.read", label: "读取任务", description: "查看任务列表和状态" },
   { value: "tasks.create", label: "创建任务", description: "提交新任务，可能启动实际执行" },
   { value: "tasks.control", label: "控制任务", description: "暂停、恢复和停止任务执行" },
@@ -149,6 +151,8 @@ export default function LocalAgentsPage() {
     ? `请使用我刚安装的 ARTEX 本地 Agent Skill 接入此实例。\nARTEX 地址：${serverUrl}\n\n先阅读 Skill 的 SKILL.md 并检查 auth status。若尚未配对，运行 auth login，使用上面的地址和一个清晰的本机设备名称。然后把设备名称、设备 ID 和 SHA-256 指纹展示给我，并停下来等待我在 ARTEX「本地 Agent 接入」页面核对和审批最小权限。不要索取或读取管理员密码、JWT、API Key 或本机私钥。\n\n获批后再检查 auth status，并且只使用已批准的权限和我在本对话明确给出的任务范围。没有我明确指定的目标和授权范围时，不创建会执行扫描的任务。上传 Skill 时使用我明确提供的文件；除非我明确要求覆盖，不覆盖同名 Skill。`
     : "正在读取当前 ARTEX 地址…";
 
+  const proxyPrompt = `请使用已安装的 ARTEX 本地 Agent Skill 查询 ${serverUrl} 的代理。已配对时直接运行 proxies list，无需先查 auth status。若我要求检测连通性，再对我指定的代理 ID 运行 proxies test --id <ID>，直接报告本次状态、检测时间和出口 IP，区分代理入口地址与出口 IP。不要为查询创建任务或对话。缺少 proxies.read 或 proxies.test 权限时，明确告诉我在此页审批相应权限，不重复请求、不绕过权限。`;
+
   async function copyText(value: string, label: string) {
     if (!value || !serverUrl) return;
     try {
@@ -204,7 +208,7 @@ export default function LocalAgentsPage() {
         <div>
           <h1 className="font-semibold text-2xl">本地 Agent 接入</h1>
           <p className="mt-1 text-muted-foreground text-sm">
-            核对设备公钥后批准，并为每台设备单独授予任务与 Skill 权限。
+            核对设备公钥后批准，并为每台设备单独授予代理、任务、Skill 等权限。
           </p>
         </div>
         <Button variant="outline" onClick={() => void load()} disabled={loading}>
@@ -302,7 +306,11 @@ export default function LocalAgentsPage() {
               <Clipboard className="mr-2 size-4" />
               复制更新提示词
             </Button>
-            <p className="text-sm text-muted-foreground">
+            <Button variant="outline" disabled={!serverUrl} onClick={() => void copyText(proxyPrompt, "查询代理提示词")}>
+              <Clipboard className="mr-2 size-4" />
+              复制查询代理提示词
+            </Button>
+            <p className="text-muted-foreground text-sm">
               需要 Node.js 20 或更高版本。首次配对后，请核对设备指纹并只批准所需权限。
             </p>
           </div>

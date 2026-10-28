@@ -56,6 +56,15 @@ func TestWarpHealthControllerProbeNowRunsFreshProbe(t *testing.T) {
 }
 
 func TestWarpHealthControllerProbeNowPreservesUnknownClaim(t *testing.T) {
+	testWarpHealthImmediateProbePreservesUnknownClaim(t, false)
+}
+
+func TestWarpHealthControllerProbeOnlyNowPreservesUnknownClaim(t *testing.T) {
+	testWarpHealthImmediateProbePreservesUnknownClaim(t, true)
+}
+
+func testWarpHealthImmediateProbePreservesUnknownClaim(t *testing.T, probeOnly bool) {
+	t.Helper()
 	c, d, f, id := healthControllerFixture(t)
 	claim, err := d.BeginWarpHealthProbe(t.Context(), id, time.Now())
 	if err != nil {
@@ -64,12 +73,41 @@ func TestWarpHealthControllerProbeNowPreservesUnknownClaim(t *testing.T) {
 	if err = d.MarkWarpHealthUnknown(t.Context(), claim); err != nil {
 		t.Fatal(err)
 	}
-	if err = c.ProbeNow(t.Context(), id); !errors.Is(err, db.ErrWarpHealthBlocked) {
+	if probeOnly {
+		err = c.ProbeOnlyNow(t.Context(), id)
+	} else {
+		err = c.ProbeNow(t.Context(), id)
+	}
+	if !errors.Is(err, db.ErrWarpHealthBlocked) {
 		t.Fatalf("立即检测未拒绝未知执行: %v", err)
 	}
 	state, err := d.WarpHealth(t.Context(), id)
 	if err != nil || state.Claim.Token != claim.Token || state.ClaimState != "unknown" || f.stops != 0 || f.probes != 0 || f.repairs != 0 {
 		t.Fatalf("立即检测接管了遗留屏障: %+v stop=%d probes=%d repairs=%d err=%v", state, f.stops, f.probes, f.repairs, err)
+	}
+}
+
+func TestWarpHealthControllerProbeOnlyNowNeverRecovers(t *testing.T) {
+	c, d, f, id := healthControllerFixture(t)
+	d.SetMaxOpenConns(1)
+	f.probeErr = errors.New("offline")
+	count := c.policy.FailureThreshold + 1
+	for i := 0; i < count; i++ {
+		if err := c.ProbeOnlyNow(t.Context(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state, err := d.WarpHealth(t.Context(), id)
+	if err != nil || state.Failures != count || state.EgressIP != "" || state.Claim.Token != "" || f.probes != count || f.repairs != 0 || f.stops != 0 {
+		t.Fatalf("纯探测未保留失败结果或触发恢复: %+v probes=%d repairs=%d stops=%d err=%v", state, f.probes, f.repairs, f.stops, err)
+	}
+	policy, err := d.GlobalWarpHealthPolicy(t.Context())
+	if err != nil || !policy.AutoRecoverEnabled || !state.AutoRecoverEnabled || !state.Desired {
+		t.Fatalf("纯探测改变恢复策略或节点意图: global=%+v state=%+v err=%v", policy, state, err)
+	}
+	// 管理端仍保留原有恢复能力，本地检测不通过修改全局策略来抑制恢复。
+	if err = c.ProbeNow(t.Context(), id); err != nil || f.repairs != 1 {
+		t.Fatalf("管理端恢复行为改变: repairs=%d err=%v", f.repairs, err)
 	}
 }
 

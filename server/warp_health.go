@@ -198,16 +198,21 @@ func (c *WarpHealthController) execute(ctx context.Context, execution *db.WarpHe
 	return p, err, bounded.Err() != nil || !stopped
 }
 func (c *WarpHealthController) RunOnce(ctx context.Context, id int64) error {
-	return c.runOnce(ctx, id, false)
+	return c.runOnce(ctx, id, false, true)
 }
 
 // ProbeNow 供管理端立即检测使用；未准入不能被解释为本次检测成功。
 // 只清除周期门槛，不接管遗留 claim，也不改变节点意图或全局恢复策略。
 func (c *WarpHealthController) ProbeNow(ctx context.Context, id int64) error {
-	return c.runOnce(ctx, id, true)
+	return c.runOnce(ctx, id, true, true)
 }
 
-func (c *WarpHealthController) runOnce(ctx context.Context, id int64, immediate bool) error {
+// ProbeOnlyNow 供本地 Agent 检测使用，失败只保存结果，绝不触发恢复或接管遗留执行。
+func (c *WarpHealthController) ProbeOnlyNow(ctx context.Context, id int64) error {
+	return c.runOnce(ctx, id, true, false)
+}
+
+func (c *WarpHealthController) runOnce(ctx context.Context, id int64, immediate, allowRecovery bool) error {
 	c.mu.Lock()
 	closed := c.closed
 	if !closed {
@@ -302,7 +307,7 @@ func (c *WarpHealthController) runOnce(ctx context.Context, id int64, immediate 
 	}
 	_ = execution.Close()
 	execution = nil
-	if success || state.Failures < c.policy.FailureThreshold {
+	if !allowRecovery || success || state.Failures < c.policy.FailureThreshold {
 		return nil
 	}
 	c.mu.Lock()

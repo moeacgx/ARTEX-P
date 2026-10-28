@@ -344,6 +344,14 @@ func (s *Server) deleteWarpProxy(ctx context.Context, id int64) error {
 }
 
 func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
+	s.testProxyWithRecovery(w, r, true)
+}
+
+func (s *Server) testLocalAgentProxy(w http.ResponseWriter, r *http.Request) {
+	s.testProxyWithRecovery(w, r, false)
+}
+
+func (s *Server) testProxyWithRecovery(w http.ResponseWriter, r *http.Request, allowRecovery bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
 		writeErr(w, 400, "invalid proxy id")
@@ -357,12 +365,14 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 	if p.Kind != db.ProxyKindWarp {
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
-		checked, code := s.probeProxyCenter(ctx, id, "")
+		checked, ip, code := s.probeProxyCenterIP(ctx, id, "")
 		if code != "" {
 			writeErr(w, 502, "代理检测失败或状态未保存")
 			return
 		}
-		writeJSON(w, 200, s.runtimeProxyDTO(checked))
+		dto := s.runtimeProxyDTO(checked)
+		dto.EgressIP = ip
+		writeJSON(w, 200, dto)
 		return
 	}
 	pending, err := s.m.pg.WarpCreatePending(id)
@@ -379,7 +389,12 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 502, "WARP 健康控制器不可用")
 		return
 	}
-	if err = rt.health.ProbeNow(r.Context(), id); err != nil {
+	if allowRecovery {
+		err = rt.health.ProbeNow(r.Context(), id)
+	} else {
+		err = rt.health.ProbeOnlyNow(r.Context(), id)
+	}
+	if err != nil {
 		if errors.Is(err, db.ErrWarpHealthBlocked) || errors.Is(err, db.ErrProxyInUse) {
 			writeErr(w, 409, "WARP 当前无法检测，请等待现有操作完成并确认节点已启用运行")
 		} else {

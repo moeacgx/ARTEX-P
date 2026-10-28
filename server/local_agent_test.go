@@ -26,6 +26,34 @@ import (
 	localagent "github.com/Autumn-27/artex/integrations/local-agent"
 )
 
+func TestLocalAgentProxyAuthenticationBoundary(t *testing.T) {
+	for _, path := range []string{"/api/local-agent/proxies", "/api/local-agent/proxies/1", "/api/local-agent/proxies/1/test"} {
+		if !isLocalAgentSignedPath(path) {
+			t.Fatalf("设备签名业务路径被管理员 JWT 拦截: %s", path)
+		}
+	}
+	for _, path := range []string{"/api/local-agent/proxies-admin", "/api/local-agent/devices", "/api/local-agent/devices/1/approve", "/api/local-agent/skill.zip"} {
+		if isLocalAgentSignedPath(path) {
+			t.Fatalf("管理员路径被错误放行: %s", path)
+		}
+	}
+	s := &Server{}
+	mux := http.NewServeMux()
+	s.registerLocalAgentRoutes(mux)
+	for _, endpoint := range []struct{ method, path string }{
+		{"GET", "/api/local-agent/proxies"},
+		{"GET", "/api/local-agent/proxies/1"},
+		{"POST", "/api/local-agent/proxies/1/test"},
+	} {
+		w := httptest.NewRecorder()
+		s.requireAuth(mux).ServeHTTP(w, httptest.NewRequest(endpoint.method, endpoint.path, nil))
+		// 无设备签名必须被本地 Agent 鉴权拒绝，不能匿名到达业务处理器。
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("无签名请求未拒绝 %s: %d", endpoint.path, w.Code)
+		}
+	}
+}
+
 func TestLocalAgentProxyPG(t *testing.T) {
 	dsn := os.Getenv("ARTEX_LOCAL_AGENT_TEST_DSN")
 	if dsn == "" {

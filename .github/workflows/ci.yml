@@ -75,7 +75,11 @@ jobs:
         with:
           node-version: '22'
       - name: 本地 Agent 设备与真实 CLI 业务回归
-        run: ARTEX_LOCAL_AGENT_TEST_DSN="$ARTEX_PG_DSN" timeout 60s go test ./server -run '^TestLocalAgent' -count=1 -timeout 60s
+        env:
+          ARTEX_LOCAL_AGENT_TEST_DSN: postgres://artex_test:artex_test@127.0.0.1:5432/artex_local_agent_test?sslmode=disable
+        run: |
+          psql "$ARTEX_PG_DSN" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE artex_local_agent_test'
+          timeout 60s go test ./server -run '^TestLocalAgent' -count=1 -timeout 60s
       - name: 报告触发及真实写回回归
         run: >-
           timeout 60s go test ./server

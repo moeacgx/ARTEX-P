@@ -142,12 +142,28 @@ node <脚本> mcp tools --id <MCP服务器ID>
 {"assets":[{"type":"root_domain","domain":"example.com"}]}
 ```
 
-任务 LLM 配置先用 `llm profiles` 取得现有档案 ID、`tasks llm-status` 查看原链。下面在 PowerShell 将该真实 ID 写成有效 JSON，不编造 ID；示例会将任务切换为单档案链，确认用户要求后再执行 `tasks llm-set --id <任务ID> --file task-llm.json`：
+### 切换任务当前模型，保留原链
 
-```powershell
-$profileId = [long](Read-Host '输入刚查询到的真实档案 ID')
-@{llm_profile_ids=@($profileId); active_llm_profile_id=$profileId} |
-  ConvertTo-Json | Set-Content -Encoding utf8 task-llm.json
+用户说“切换到已有备用档案”时，只改变激活项，不删除原链成员、重排顺序或丢弃模型绑定。已明确授权的目标直接执行，不要求用户再次手工输入已查询到的 ID。
+
+1. 用 `llm profiles` 匹配用户指定的真实档案；用 `tasks get --id <任务ID>` 读取完整 `members`、`llm_profile_ids` 和激活位置。`tasks llm-status` 只返回各角色的实际解析结果，不能用于取得完整原链。
+2. 若 `members` 非空：完整保留每个成员的 `profile_id`、`model_mode`、`model_id` 及数组顺序，请求体只包含原 `members` 和目标成员的 `active_position`（从 0 开始）。不要改用 `llm_profile_ids`，否则会丢失成员的模型绑定。
+3. 若没有成员定义而只有 `llm_profile_ids`：保留完整数组，仅设置 `active_llm_profile_id`。将所选结构写成 JSON，执行一次 `tasks llm-set --id <任务ID> --file task-llm.json`。不要混用两种结构，也不要把返回对象整体原样回传。
+4. 回读 `tasks get` 核对原链、顺序和模型绑定未变，且激活项符合目标；再用 `tasks llm-status` 核对主 Agent 等角色的 `profile_id`、模型与 `available`。若 `source=agent_binding`，任务设置不一定改变该角色；明确说明实际生效范围，不擅自改角色绑定或全局档案。只有确认用户要求的目标角色已生效，才按原请求用 `tasks chat` 发送一次继续处理消息。
+5. 写请求断线或超时：先按第 4 步回读，不盲重放；已生效则继续后续通知，仍无法确认则报告未确认。消息发送也只执行一次，接收成功或 `running=true` 不代表整个任务已完成。
+
+**🔴 CHECKPOINT：** 档案名称重复、同档案有多个候选模型、目标不在当前链中或原配置无法完整读取时，先用对应读取命令定位；仍有歧义才询问用户是追加成员、选择哪个模型还是替换整链。仅在用户明确要求替换整条链时，才构造单档案链。不要因为当前解析结果只有一个档案，就推断原链也只有一个。
+
+以下仅展示请求形状：只有实际查询所得 ID、成员和顺序恰为示例时才直接使用；其余情况从查询结果生成，不照抄示例 ID。旧式链原为 `[7,9]`、需激活 9：
+
+```json
+{"llm_profile_ids":[7,9],"active_llm_profile_id":9}
+```
+
+成员式链原有两个指定模型、需激活第二项时，保留原成员定义：
+
+```json
+{"members":[{"profile_id":"7","model_mode":"fixed-model","model_id":"71"},{"profile_id":"9","model_mode":"fixed-model","model_id":"91"}],"active_position":1}
 ```
 
 LLM 档案（`llm profile-save --file profile.json`）：字段是 `format`，不是 `provider`。下面是结构模板，地址、模型和密钥必须在本地换成供应商的实际值；新建不填 `id`，编辑则先查档案并保留完整配置。不要打印密钥文件或把密钥写入对话、日志、版本库。

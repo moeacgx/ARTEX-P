@@ -1,12 +1,14 @@
 # 本地 Agent 接入
 
-ARTEX 提供设备审批和 Ed25519 请求签名，使本机编码 Agent 可以查询任务、创建任务、查询 Skill 和上传 Skill，无需向 Agent 提供管理员 JWT。
+ARTEX 提供设备审批和 Ed25519 请求签名，使本机编码 Agent 可以在最小权限下操作任务、工作区、资产、对话、发现数据、日志、LLM 和工具，无需向 Agent 提供管理员 JWT。
 
 ## 快速使用
 
 本机需要 Node.js 20 或更高版本，不需要安装 npm 依赖：
 
 可在 ARTEX 网页“系统 / 本地 Agent 接入”下载完整 Skill ZIP，解压到本机 Agent 的 Skill 目录后按 `SKILL.md` 操作。该包内嵌于 ARTEX 程序中，服务器不需要保留源码。
+
+同页会显示当前实例的 ARTEX 地址和首次接入提示词，分别复制给本机 Agent 即可。提示词会要求 Agent 展示设备 ID 与 SHA-256 指纹并等待网页审批；没有明确目标和授权范围时，不创建扫描任务。
 
 ```text
 node scripts/artex-agent.mjs auth login --url https://artex.example.com --name 我的本地Agent
@@ -21,6 +23,14 @@ node scripts/artex-agent.mjs tasks get --id <任务ID>
 node scripts/artex-agent.mjs tasks create --description "检查已授权测试环境" --goal "只检查目标 example.test 的可用性"
 node scripts/artex-agent.mjs skills list
 node scripts/artex-agent.mjs skills upload --file ./example-skill.zip
+node scripts/artex-agent.mjs workspace list
+node scripts/artex-agent.mjs assets list --task-id <任务ID>
+node scripts/artex-agent.mjs conversations send --id <会话ID> --message "请汇报当前进度"
+node scripts/artex-agent.mjs tasks chat --id <任务ID> --message "向任务主 Agent 发送的消息"
+node scripts/artex-agent.mjs discover findings --task-id <任务ID>
+node scripts/artex-agent.mjs logs list
+node scripts/artex-agent.mjs llm profiles
+node scripts/artex-agent.mjs tools list
 ```
 
 创建任务会复用网页的现有任务启动流程。复杂任务使用 `tasks create --file task.json`，JSON 字段与现有任务创建接口一致。
@@ -35,7 +45,17 @@ node scripts/artex-agent.mjs skills upload --file ./example-skill.zip
 默认目录在 Windows 为 `%LOCALAPPDATA%/ARTEX/local-agent`，其他平台为 `$XDG_CONFIG_HOME/artex/local-agent`（未设置时为 `~/.config/artex/local-agent`）。
 通过 `ARTEX_AGENT_CONFIG_DIR` 可以为不同 ARTEX 部署选择独立身份目录。身份已存在时登录命令不会覆盖。
 
-网页分别审批 `tasks.read`、`tasks.create`、`skills.read`、`skills.upload`。未获批、权限不匹配或已撤销的设备会由服务端拒绝。
+网页按能力分别审批权限：
+
+- 任务：`tasks.read`、`tasks.create`、`tasks.control`、`tasks.message`
+- Skill：`skills.read`、`skills.upload`、`skills.write`
+- 资产：`assets.read`、`assets.write`、`assets.delete`
+- 工作区：`workspace.read`、`workspace.write`、`workspace.upload`、`workspace.download`、`workspace.delete`
+- 对话：`conversations.read`、`conversations.create`、`conversations.message`、`conversations.stop`
+- 数据读取：`discovery.read`、`logs.read`、`llm.read`、`tools.read`、`mcp.read`
+- 配置写入：`llm.write`、`llm.test`、`tools.write`、`mcp.write`
+
+未获批、权限不匹配或已撤销的设备会由服务端拒绝。LLM、工具和 MCP 写权限会改变 Agent 的运行能力，只在明确需要时授予。
 网页撤销立即阻止后续业务请求。请勿读取、展示或分享身份文件。
 
 请求签名包含 HTTP 方法、完整请求路径与查询参数、秒级时间戳、随机 nonce 和 SHA-256 正文摘要。

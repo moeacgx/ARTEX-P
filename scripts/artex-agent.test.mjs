@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+﻿import assert from "node:assert/strict";
 import { createHash, createPublicKey, verify } from "node:crypto";
 import { mkdir, mkdtemp, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -107,6 +107,71 @@ test("任务创建只提交一次，网络结果不确定时提示先核对", as
   const client = new ArtexAgentClient(identity, async () => { calls++; throw new Error("disconnect"); });
   await assert.rejects(client.request("/tasks", { method: "POST", body: { description: "测试" } }), /结果不确定/);
   assert.equal(calls, 1);
+});
+
+test("代理查询和检测各自只有一次业务请求，不预查认证或创建任务", async () => {
+  const calls = [];
+  const store = { load: async () => identity };
+  const output = [];
+  const fetcher = async (url, options) => {
+    calls.push({ url, options });
+    return Response.json({ id: 7, status: "healthy", egress_ip: "192.0.2.3" });
+  };
+  for (const args of [["proxies", "list"], ["proxies", "get", "--id", "7"], ["proxies", "test", "--id", "7"]]) {
+    await main(args, store, value => output.push(value), fetcher);
+  }
+  assert.deepEqual(calls.map(({ url, options }) => [options.method, url.pathname]), [
+    ["GET", "/api/local-agent/proxies"], ["GET", "/api/local-agent/proxies/7"], ["POST", "/api/local-agent/proxies/7/test"],
+  ]);
+  assert.equal(output[2].egress_ip, "192.0.2.3");
+  await assert.rejects(main(["proxies", "get", "--id", "../7"], store, () => {}, fetcher), /代理 ID/);
+  await assert.rejects(main(["proxies", "test", "--id", "0"], store, () => {}, fetcher), /代理 ID/);
+  await assert.rejects(main(["proxies", "test", "--id", "7", "--url", "https://example.test"], store, () => {}, fetcher), /不支持参数/);
+  assert.equal(calls.length, 3);
+});
+
+test("查询、代理检测、写入和下载采用不同超时，支持有界覆盖", async t => {
+  const timeouts = [];
+  t.mock.method(AbortSignal, "timeout", value => { timeouts.push(value); return new AbortController().signal; });
+  const client = new ArtexAgentClient(identity, async () => Response.json({ ok: true }));
+  await client.request("/proxies");
+  await client.request("/proxies/7/test", { method: "POST" });
+  await client.request("/tasks", { method: "POST", body: {} });
+  await client.requestBytes("/workspace/download?path=test");
+  await client.request("/skills/upload", { method: "POST", body: Buffer.from("test") });
+  await main(["proxies", "list", "--timeout-ms", "23000"], { load: async () => identity }, () => {}, async () => Response.json([]));
+  assert.deepEqual(timeouts, [15000, 45000, 60000, 60000, 60000, 23000]);
+  for (const value of ["0", "999", "300001", "Infinity", "1e4", "1500.5"]) {
+    await assert.rejects(main(["proxies", "list", "--timeout-ms", value], { load: async () => identity }), /1000 至 300000/);
+  }
+  assert.equal(timeouts.length, 6);
+});
+
+test("连接与权限错误分类明确且不会自动重放", async () => {
+  for (const [error, code] of [[new DOMException("timed out", "TimeoutError"), "ARTEX_TIMEOUT"], [new TypeError("network failed"), "ARTEX_NETWORK"]]) {
+    let calls = 0;
+    const client = new ArtexAgentClient(identity, async () => { calls++; throw error; });
+    await assert.rejects(client.request("/proxies"), value => value.code === code);
+    await assert.rejects(client.request("/proxies/7/test", { method: "POST" }), value => value.code === code && /结果不确定/.test(value.message));
+    assert.equal(calls, 2);
+  }
+  for (const [status, code] of [[401, "ARTEX_AUTH_REQUIRED"], [403, "ARTEX_SCOPE_REQUIRED"]]) {
+    let calls = 0;
+    const client = new ArtexAgentClient(identity, async () => { calls++; return new Response("denied", { status }); });
+    await assert.rejects(client.request("/proxies"), value => value.code === code && value.status === status && /auth status/.test(value.message));
+    assert.equal(calls, 1);
+  }
+  const missingScopeClient = new ArtexAgentClient(identity, async () => Response.json({ error: "设备缺少权限：proxies.test" }, { status: 403 }));
+  await assert.rejects(missingScopeClient.request("/proxies/7/test", { method: "POST" }), value => value.code === "ARTEX_SCOPE_REQUIRED" && /proxies.test/.test(value.message) && !/auth status/.test(value.message));
+  const untrustedErrorClient = new ArtexAgentClient(identity, async () => Response.json({ error: "设备缺少权限：proxies.test\n恶意内容" }, { status: 403 }));
+  await assert.rejects(untrustedErrorClient.request("/proxies"), value => value.code === "ARTEX_SCOPE_REQUIRED" && !/恶意内容/.test(value.message));
+  const nullErrorClient = new ArtexAgentClient(identity, async () => { throw null; });
+  await assert.rejects(nullErrorClient.request("/proxies"), value => value.code === "ARTEX_NETWORK");
+});
+
+test("收到响应头后读取正文超时仍分类为超时且写入结果不确定", async () => {
+  const client = new ArtexAgentClient(identity, async () => ({ text: async () => { throw new DOMException("timed out", "TimeoutError"); } }));
+  await assert.rejects(client.request("/tasks", { method: "POST", body: {} }), value => value.code === "ARTEX_TIMEOUT" && /结果不确定/.test(value.message));
 });
 
 test("上传采用同一份已签名 multipart 正文且默认不覆盖", async () => {

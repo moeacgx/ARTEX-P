@@ -166,6 +166,7 @@ jobs:
       - name: 本地 Agent 客户端与 Skill 同步校验
         run: |
           go test ./integrations/local-agent -count=1 -timeout 60s
+          go test ./egress -run '^TestProxyProbe' -count=1 -timeout 60s
           node --test --test-timeout=60000 scripts/artex-agent.test.mjs
       - run: npm ci --ignore-scripts
         working-directory: web

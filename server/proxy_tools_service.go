@@ -257,27 +257,36 @@ func validProxyProbeTarget(raw string) bool {
 
 // probeProxyCenter 不依赖当前任务、全局出口或环境代理；只检测所选档案。
 func (s *Server) probeProxyCenter(ctx context.Context, id int64, target string) (*db.Proxy, string) {
+	p, _, code := s.probeProxyCenterIP(ctx, id, target)
+	return p, code
+}
+
+// IP 来自本次数据面响应，沿用检测并发限制和状态持久化，不能另外重复探测。
+func (s *Server) probeProxyCenterIP(ctx context.Context, id int64, target string) (*db.Proxy, string, string) {
 	p, err := s.m.pg.GetProxyContext(ctx, id)
 	if err != nil {
-		return nil, "proxy_unavailable"
+		return nil, "", "proxy_unavailable"
 	}
 	if !p.Enabled {
-		return p, "proxy_disabled"
+		return p, "", "proxy_disabled"
 	}
 	// 工具不隐式启动 WARP；其专属管理接口仍保留原生命周期行为。
 	if p.Kind == db.ProxyKindWarp {
-		return p, "unsupported_proxy_kind"
+		return p, "", "unsupported_proxy_kind"
 	}
 	select {
 	case proxyProbeSlots <- struct{}{}:
 		defer func() { <-proxyProbeSlots }()
 	case <-ctx.Done():
-		return p, "probe_timeout"
+		return p, "", "probe_timeout"
 	}
+	var ip string
 	if p.Kind == db.ProxyKindResin {
-		err = (&resinAdapter{target: target}).probe(ctx, p)
+		if err = resinConfig(p).Probe(ctx); err == nil {
+			ip, err = egress.ProbeProxyIP(ctx, resinTaskProxyURL(p, "probe_"+strconv.FormatInt(p.ID, 10)), target, false)
+		}
 	} else {
-		err = egress.ProbeProxy(ctx, p.URL, target, false)
+		ip, err = egress.ProbeProxyIP(ctx, p.URL, target, false)
 	}
 	status, message := db.ProxyStatusHealthy, ""
 	code := ""
@@ -291,10 +300,10 @@ func (s *Server) probeProxyCenter(ctx context.Context, id int64, target string) 
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	if err := s.m.pg.SaveProxyProbe(saveCtx, p, status, message, now); err != nil {
-		return p, "status_not_saved"
+		return p, "", "status_not_saved"
 	}
 	p.Status, p.LastError, p.LastCheckedAt = status, message, &now
-	return p, code
+	return p, ip, code
 }
 
 // 所有 HTTP/工具检测共用进程级上限，防止并行批次放大网络并发。

@@ -1777,6 +1777,7 @@ export interface InterceptExecution {
 }
 
 export type LocalAgentScope =
+  | "proxies.read" | "proxies.test"
   | "tasks.read" | "tasks.create" | "tasks.control" | "tasks.message"
   | "skills.read" | "skills.upload" | "skills.write"
   | "assets.read" | "assets.write" | "assets.delete"

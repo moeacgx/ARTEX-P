@@ -18,12 +18,122 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
 	localagent "github.com/Autumn-27/artex/integrations/local-agent"
 )
+
+func TestLocalAgentProxyPG(t *testing.T) {
+	dsn := os.Getenv("ARTEX_LOCAL_AGENT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("未配置隔离 PostgreSQL")
+	}
+	if err := db.ConfigureProxySecrets(filepath.Join(t.TempDir(), "proxy.key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitializeProxySecrets(); err != nil {
+		t.Fatal(err)
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+	pg.SetMaxOpenConns(1)
+	if _, err := pg.Exec(`CREATE TEMP TABLE local_agent_devices (
+		id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,public_key TEXT UNIQUE NOT NULL,
+		status TEXT NOT NULL DEFAULT 'pending',scopes TEXT[] NOT NULL DEFAULT '{}',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),approved_at TIMESTAMPTZ,last_used_at TIMESTAMPTZ,
+		skill_version TEXT NOT NULL DEFAULT '',skill_reported_at TIMESTAMPTZ);
+		CREATE TEMP TABLE local_agent_nonces(public_key TEXT,nonce TEXT,created_at TIMESTAMPTZ DEFAULT now(),PRIMARY KEY(public_key,nonce));
+		CREATE TEMP TABLE local_agent_audit(id BIGSERIAL PRIMARY KEY,device_id BIGINT,method TEXT,path TEXT,status_code INTEGER,created_at TIMESTAMPTZ DEFAULT now(),completed_at TIMESTAMPTZ);`); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method == http.MethodConnect {
+			// 测试不访问外网；固定 HTTPS 默认目标在此明确失败。
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "ip=8.8.8.8\nwarp=off\n")
+	}))
+	defer proxy.Close()
+	p, err := pg.CreateProxy(&db.Proxy{Name: "本地 Agent 检测", Kind: db.ProxyKindHTTP, URL: strings.Replace(proxy.URL, "://", "://alice:local-proxy-secret@", 1), Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Exec(`DELETE FROM outbound_proxies WHERE id=$1`, p.ID)
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deviceID int64
+	if err := pg.QueryRow(`INSERT INTO local_agent_devices(name,public_key,status) VALUES('测试设备',$1,'approved') RETURNING id`, base64.StdEncoding.EncodeToString(public)).Scan(&deviceID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{m: &Manager{pg: pg}}
+	mux := http.NewServeMux()
+	s.registerLocalAgentRoutes(mux)
+	handler := s.requireAuth(mux)
+	call := func(method, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := signedLocalAgentRequest(t, private, method, path, nil)
+		r.Header.Set("X-ARTEX-Device-ID", strconv.FormatInt(deviceID, 10))
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	path := "/api/local-agent/proxies/" + strconv.FormatInt(p.ID, 10)
+	for _, endpoint := range []struct{ method, path, scope string }{
+		{"GET", "/api/local-agent/proxies", "proxies.read"},
+		{"GET", path, "proxies.read"},
+		{"POST", path + "/test", "proxies.test"},
+	} {
+		w := call(endpoint.method, endpoint.path)
+		if w.Code != 403 || !strings.Contains(w.Body.String(), endpoint.scope) {
+			t.Fatalf("缺权限未拒绝 %s: %d %s", endpoint.path, w.Code, w.Body.String())
+		}
+	}
+	if requests.Load() != 0 {
+		t.Fatal("缺少检测权限仍发起出站请求")
+	}
+	if _, err := pg.Exec(`UPDATE local_agent_devices SET scopes=ARRAY['proxies.read'] WHERE id=$1`, deviceID); err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range []string{"/api/local-agent/proxies", path} {
+		w := call("GET", endpoint)
+		if w.Code != 200 || strings.Contains(w.Body.String(), "local-proxy-secret") {
+			t.Fatalf("读取未成功或泄漏凭据: %d %s", w.Code, w.Body.String())
+		}
+	}
+	if w := call("POST", path+"/test"); w.Code != 403 {
+		t.Fatal("读取权限错误包含检测权限")
+	}
+	if _, err := pg.Exec(`UPDATE local_agent_devices SET scopes=ARRAY['proxies.test'] WHERE id=$1`, deviceID); err != nil {
+		t.Fatal(err)
+	}
+	w := call("POST", path+"/test")
+	if w.Code != 502 {
+		t.Fatalf("固定目标失败仍报告健康: %d %s", w.Code, w.Body.String())
+	}
+	if requests.Load() != 1 || strings.Contains(w.Body.String(), "local-proxy-secret") {
+		t.Fatal("重复探测或输出泄漏代理凭据")
+	}
+	var auditCount int
+	if err := pg.QueryRow(`SELECT count(*) FROM local_agent_audit WHERE device_id=$1 AND status_code=502 AND completed_at IS NOT NULL`, deviceID).Scan(&auditCount); err != nil || auditCount != 1 {
+		t.Fatalf("检测审计数量=%d 错误=%v", auditCount, err)
+	}
+	checked, ip, code := s.probeProxyCenterIP(t.Context(), p.ID, "http://unresolvable.invalid/trace")
+	if code != "" || ip != "8.8.8.8" || checked.Status != db.ProxyStatusHealthy || checked.LastCheckedAt == nil || requests.Load() != 2 {
+		t.Fatalf("本次出口结果错误: IP=%q 代码=%q 请求=%d", ip, code, requests.Load())
+	}
+}
 
 func signedLocalAgentRequest(t *testing.T, private ed25519.PrivateKey, method, path string, body []byte) *http.Request {
 	t.Helper()

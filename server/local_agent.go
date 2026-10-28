@@ -33,6 +33,7 @@ var localAgentScopes = map[string]bool{
 	"llm.read": true, "llm.write": true, "llm.test": true,
 	"tools.read": true, "tools.write": true,
 	"mcp.read": true, "mcp.write": true,
+	"proxies.read": true, "proxies.test": true,
 }
 
 type localAgentDevice struct {
@@ -56,6 +57,9 @@ func (s *Server) registerLocalAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/local-agent/devices/{id}/approve", s.localAgentApprove)
 	mux.HandleFunc("POST /api/local-agent/devices/{id}/revoke", s.localAgentRevoke)
 	mux.HandleFunc("GET /api/local-agent/status", s.localAgentWithScope("", s.localAgentStatus))
+	mux.HandleFunc("GET /api/local-agent/proxies", s.localAgentWithScope("proxies.read", s.listProxies))
+	mux.HandleFunc("GET /api/local-agent/proxies/{id}", s.localAgentWithScope("proxies.read", s.getProxy))
+	mux.HandleFunc("POST /api/local-agent/proxies/{id}/test", s.localAgentWithScope("proxies.test", s.testProxy))
 	mux.HandleFunc("GET /api/local-agent/tasks", s.localAgentWithScope("tasks.read", s.listTasks))
 	mux.HandleFunc("GET /api/local-agent/tasks/{id}", s.localAgentWithScope("tasks.read", s.getTask))
 	mux.HandleFunc("POST /api/local-agent/tasks", s.localAgentWithScope("tasks.create", s.createTask))

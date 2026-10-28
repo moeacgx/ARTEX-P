@@ -357,12 +357,14 @@ func (s *Server) testProxy(w http.ResponseWriter, r *http.Request) {
 	if p.Kind != db.ProxyKindWarp {
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
-		checked, code := s.probeProxyCenter(ctx, id, "")
+		checked, ip, code := s.probeProxyCenterIP(ctx, id, "")
 		if code != "" {
 			writeErr(w, 502, "代理检测失败或状态未保存")
 			return
 		}
-		writeJSON(w, 200, s.runtimeProxyDTO(checked))
+		dto := s.runtimeProxyDTO(checked)
+		dto.EgressIP = ip
+		writeJSON(w, 200, dto)
 		return
 	}
 	pending, err := s.m.pg.WarpCreatePending(id)

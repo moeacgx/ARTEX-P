@@ -68,6 +68,8 @@ import type {
   LLMRetryPolicy,
   LLMSelection,
   LLMTask,
+  LocalAgentDevice,
+  LocalAgentScope,
   MCPServer,
   MCPTool,
   MissingSkill,
@@ -265,6 +267,13 @@ export const api = {
   initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
   changePassword: (oldPassword: string, newPassword: string) =>
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+
+  // 本地 Agent 管理接口沿用管理员会话，业务调用使用独立设备签名。
+  localAgentDevices: () =>
+    get<{ devices: LocalAgentDevice[] }>("/local-agent/devices").then((response) => arr(response.devices)),
+  approveLocalAgent: (id: number, scopes: LocalAgentScope[]) =>
+    post<{ ok: boolean }>(`/local-agent/devices/${id}/approve`, { scopes }),
+  revokeLocalAgent: (id: number) => post<{ ok: boolean }>(`/local-agent/devices/${id}/revoke`),
 
   // ---- tasks ----
   tasks: () =>

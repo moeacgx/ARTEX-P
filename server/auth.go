@@ -120,7 +120,12 @@ func extractToken(r *http.Request) string {
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" {
+		// 本地 Agent 业务端点使用设备签名鉴权；设备列表、审批、撤销以及
+		// Skill 下载包仍然必须走管理员 JWT。未知 local-agent 路径最终由
+		// ServeMux 返回 404，不会获得任何业务处理器。
+		localAgentSigned := isLocalAgentSignedPath(p)
+		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" || localAgentSigned ||
+			p == "/api/local-agent/pair" {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -135,6 +140,32 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// isLocalAgentSignedPath 只放行已注册的设备签名业务路由。
+// 未知路径必须继续走管理员 JWT，避免路径拼写错误意外变成匿名入口。
+func isLocalAgentSignedPath(path string) bool {
+	if path == "/api/local-agent/status" {
+		return true
+	}
+	for _, prefix := range []string{
+		"/api/local-agent/tasks",
+		"/api/local-agent/chat",
+		"/api/local-agent/skills",
+		"/api/local-agent/assets",
+		"/api/local-agent/workspace",
+		"/api/local-agent/conversations",
+		"/api/local-agent/discovery",
+		"/api/local-agent/logs",
+		"/api/local-agent/llm",
+		"/api/local-agent/tools",
+		"/api/local-agent/mcp",
+	} {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // GET /api/auth/status — reports whether the admin password has been initialised.

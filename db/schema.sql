@@ -1434,3 +1434,35 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- 本地 Agent 设备公钥及管理员授予的最小权限。撤销状态保留，阻止旧密钥重新配对。
+CREATE TABLE IF NOT EXISTS local_agent_devices (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    public_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','revoked')),
+    scopes TEXT[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    approved_at TIMESTAMPTZ,
+    last_used_at TIMESTAMPTZ
+);
+
+-- 签名请求 nonce 只允许使用一次，避免时间窗口内重放创建任务或上传 Skill。
+CREATE TABLE IF NOT EXISTS local_agent_nonces (
+    public_key TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (public_key, nonce)
+);
+CREATE INDEX IF NOT EXISTS idx_local_agent_nonces_created ON local_agent_nonces(created_at);
+
+-- 仅记录设备身份、接口和结果；请求正文不进入审计。
+CREATE TABLE IF NOT EXISTS local_agent_audit (
+    id BIGSERIAL PRIMARY KEY,
+    device_id BIGINT NOT NULL REFERENCES local_agent_devices(id),
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    status_code INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);

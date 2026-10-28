@@ -138,13 +138,14 @@ test("查询、代理检测、写入和下载采用不同超时，支持有界�
   await client.request("/proxies/7/test", { method: "POST" });
   await client.request("/tasks", { method: "POST", body: {} });
   await client.requestBytes("/workspace/download?path=test");
+  await client.requestBytes("/skills/sample/download");
   await client.request("/skills/upload", { method: "POST", body: Buffer.from("test") });
   await main(["proxies", "list", "--timeout-ms", "23000"], { load: async () => identity }, () => {}, async () => Response.json([]));
-  assert.deepEqual(timeouts, [15000, 45000, 60000, 60000, 60000, 23000]);
+  assert.deepEqual(timeouts, [15000, 45000, 60000, 60000, 60000, 60000, 23000]);
   for (const value of ["0", "999", "300001", "Infinity", "1e4", "1500.5"]) {
     await assert.rejects(main(["proxies", "list", "--timeout-ms", value], { load: async () => identity }), /1000 至 300000/);
   }
-  assert.equal(timeouts.length, 6);
+  assert.equal(timeouts.length, 7);
 });
 
 test("连接与权限错误分类明确且不会自动重放", async () => {
@@ -358,4 +359,136 @@ test("可复制 Skill 中的独立客户端与仓库入口保持一致", async (
   const canonical = await readFile(new URL("./artex-agent.mjs", import.meta.url));
   const bundled = await readFile(new URL("../integrations/local-agent/artex-agent/scripts/artex-agent.mjs", import.meta.url));
   assert.ok(canonical.equals(bundled), "修改客户端后须同步 Skill 包内的独立脚本");
+});
+
+test("Windows BOM JSON 可用于任务、资产、模型和工具且不回显坏文件内容", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "artex-bom-"));
+  const source = path.join(directory, "input.json");
+  const store = { load: async () => identity };
+  const calls = [];
+  const fetcher = async (_url, options) => { calls.push(JSON.parse(options.body)); return Response.json({ ok: true }); };
+  for (const args of [["tasks", "create"], ["assets", "upload"], ["llm", "set"], ["tools", "custom-save"]]) {
+    await writeFile(source, '\uFEFF' + JSON.stringify({ assets: [], description: "测试" }));
+    await main([...args, "--file", source], store, () => {}, fetcher);
+  }
+  assert.equal(calls.length, 4);
+  await writeFile(source, '\uFEFF{"api_key":"private-value",}');
+  await assert.rejects(main(["llm", "set", "--file", source], store, () => {}, fetcher), error => /JSON 文件格式无效/.test(error.message) && !error.message.includes("private-value"));
+  assert.equal(calls.length, 4);
+});
+
+test("大整数写目标和被忽略的参数在发送前拒绝", async () => {
+  const store = { load: async () => identity };
+  let calls = 0;
+  const fetcher = async () => { calls++; return Response.json({ ok: true }); };
+  for (const args of [["assets", "delete", "--ids", "9007199254740993"], ["llm", "activate", "--id", "9007199254740993"]]) {
+    await assert.rejects(main(args, store, () => {}, fetcher), /9007199254740991/);
+  }
+  await assert.rejects(main(["conversations", "stop", "--id", "1", "--message", "不能丢弃"], store, () => {}, fetcher), /不支持参数/);
+  await assert.rejects(main(["discover", "stats", "--limit", "2"], store, () => {}, fetcher), /不支持参数/);
+  await assert.rejects(main(["assets", "list", "--task-id", "0"], store, () => {}, fetcher), /正整数/);
+  await assert.rejects(main(["assets", "download", "--all", "--task-id", "9223372036854775808", "--output", "unused.json"], store, () => {}, fetcher), /服务端 ID 上限/);
+  await assert.rejects(main(["tasks", "asset-refs", "--id", "50"], store, () => {}, fetcher), /缺少 --asset-id/);
+  assert.equal(calls, 0);
+});
+
+test("资产完整导出按服务端页长推进，单页下载明确显示未完整", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "artex-export-"));
+  const destination = path.join(directory, "all.json");
+  const store = { load: async () => identity };
+  const offsets = [];
+  const fetcher = async url => {
+    assert.equal(url.searchParams.get("type"), "ip");
+    const offset = Number(url.searchParams.get("offset") ?? 0);
+    offsets.push(offset);
+    return Response.json({ total: 3, count: offset ? 1 : 2, assets: offset ? [{ id: 3, type: "ip", ip: "192.0.2.3" }] : [{ id: 1 }, { id: 2 }] });
+  };
+  const output = [];
+  await main(["assets", "download", "--type", "ip", "--all", "--output", destination], store, v => output.push(v), fetcher);
+  assert.deepEqual(offsets, [0, 2]);
+  assert.equal(output[0].complete, true);
+  assert.equal(output[0].count, 3);
+  const data = JSON.parse(await readFile(destination, "utf8"));
+  assert.equal(data.assets.length, 3);
+  await main(["assets", "upload", "--file", destination], store, () => {}, async (_url, options) => {
+    assert.equal(JSON.parse(options.body).assets.length, 3);
+    return Response.json({ count: 3 });
+  });
+  await main(["assets", "download", "--type", "ip", "--output", path.join(directory, "page.json")], store, v => output.push(v), fetcher);
+  assert.equal(output[1].complete, false);
+  assert.match(output[1].message, /一页/);
+});
+
+test("完整导出发现重复、数量变化、中断时不留下成功文件或自动重试", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "artex-export-fail-"));
+  const store = { load: async () => identity };
+  for (const mode of ["duplicate", "changed", "network", "empty"]) {
+    const destination = path.join(directory, mode + ".json");
+    let calls = 0;
+    const fetcher = async () => {
+      calls++;
+      if (calls === 1) return Response.json({ assets: [{ id: 1 }], total: 2 });
+      if (mode === "network") throw new TypeError("fetch failed");
+      return Response.json({ assets: mode === "empty" ? [] : [{ id: mode === "duplicate" ? 1 : 2 }], total: mode === "changed" ? 3 : 2 });
+    };
+    await assert.rejects(main(["assets", "download", "--all", "--type", "ip", "--output", destination], store, () => {}, fetcher));
+    assert.equal(calls, 2);
+    await assert.rejects(stat(destination), /ENOENT/);
+  }
+});
+
+test("Skill 文件读取、下载、修改和自定义工具更新使用精确签名路由", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "artex-skill-files-"));
+  const file = path.join(directory, "tool.json");
+  await writeFile(file, JSON.stringify({ kind: "command", exec: { command: "printf ok" } }));
+  const store = { load: async () => identity };
+  const calls = [];
+  const fetcher = async (url, options) => {
+    calls.push([options.method, url.pathname, options.body && JSON.parse(options.body)]);
+    return url.pathname.endsWith("/download") ? new Response(Buffer.from([80, 75, 3, 4])) : Response.json({ ok: true });
+  };
+  await main(["skills", "files", "--name", "sample"], store, () => {}, fetcher);
+  await main(["skills", "read", "--name", "sample", "--path", "references/说明.md"], store, () => {}, fetcher);
+  await main(["skills", "write", "--name", "sample", "--path", "SKILL.md", "--content", ""], store, () => {}, fetcher);
+  await main(["skills", "download", "--name", "sample", "--output", path.join(directory, "skill.zip")], store, () => {}, fetcher);
+  await main(["tools", "custom-update", "--key", "custom_one", "--file", file], store, () => {}, fetcher);
+  await main(["workspace", "write", "--path", "empty.txt", "--content", ""], store, () => {}, fetcher);
+  assert.deepEqual(calls.map(v => v.slice(0, 2)), [
+    ["GET", "/api/local-agent/skills/sample/files"],
+    ["GET", "/api/local-agent/skills/sample/files/references/%E8%AF%B4%E6%98%8E.md"],
+    ["PUT", "/api/local-agent/skills/sample/files/SKILL.md"],
+    ["GET", "/api/local-agent/skills/sample/download"],
+    ["PUT", "/api/local-agent/tools/custom/custom_one"],
+    ["POST", "/api/local-agent/workspace/write"],
+  ]);
+  assert.deepEqual(calls[2][2], { content: "" });
+  assert.deepEqual(calls[5][2], { path: "empty.txt", content: "" });
+  await assert.rejects(main(["skills", "read", "--name", "sample", "--path", "../secret"], store, () => {}, fetcher), /相对路径/);
+  assert.equal(calls.length, 6);
+});
+
+test("新增只读入口不创建任务、对话或触发模型", async () => {
+  const store = { load: async () => identity };
+  const cases = [
+    [["conversations", "agents"], "/conversations/agents", ""],
+    [["tasks", "coverage", "--id", "50"], "/tasks/50/coverage", ""],
+    [["tasks", "asset-refs", "--id", "50", "--asset-id", "7"], "/tasks/50/asset-refs", "?asset_id=7"],
+    [["discover", "intents", "--task-id", "50"], "/discovery/intents", "?task=50"],
+    [["discover", "intents", "--task-id", "50", "--page", "1", "--before", "10", "--limit", "20"], "/discovery/intents", "?task=50&limit=20&page=1&before=10"],
+    [["discover", "finding", "--id", "12", "--context-task", "50"], "/discovery/findings/12", "?context_task=50"],
+    [["llm", "models", "--id", "2"], "/llm/profiles/2/models", ""],
+    [["mcp", "tools", "--id", "2"], "/mcp/2/tools", ""],
+    [["assets", "counts", "--task-id", "50"], "/assets/counts", "?task_id=50"],
+  ];
+  let calls = 0;
+  for (const [args, resource, query] of cases) {
+    await main(args, store, () => {}, async (url, options) => {
+      calls++;
+      assert.equal(options.method, "GET");
+      assert.equal(url.pathname, "/api/local-agent" + resource);
+      assert.equal(businessSearch(url), query);
+      return Response.json({ ok: true });
+    });
+  }
+  assert.equal(calls, cases.length);
 });

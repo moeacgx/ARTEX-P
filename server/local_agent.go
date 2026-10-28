@@ -103,6 +103,7 @@ func (s *Server) registerLocalAgentRoutes(mux *http.ServeMux) {
 
 	// 对话：创建、读取消息、发送和停止分别授权。
 	mux.HandleFunc("GET /api/local-agent/conversations", s.localAgentWithScope("conversations.read", s.pgListConversations))
+	mux.HandleFunc("GET /api/local-agent/conversations/agents", s.localAgentWithScope("conversations.read", s.localAgentConversationAgents))
 	mux.HandleFunc("POST /api/local-agent/conversations", s.localAgentWithScope("conversations.create", s.pgCreateConversation))
 	mux.HandleFunc("GET /api/local-agent/conversations/{id}/messages", s.localAgentWithScope("conversations.read", s.pgConversationMessages))
 	mux.HandleFunc("GET /api/local-agent/conversations/{id}/messages/{seq}", s.localAgentWithScope("conversations.read", s.pgConversationMsgDetail))
@@ -131,7 +132,7 @@ func (s *Server) registerLocalAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/local-agent/discovery/intents", s.localAgentWithScope("discovery.read", s.intents))
 	mux.HandleFunc("GET /api/local-agent/discovery/main-sessions", s.localAgentWithScope("discovery.read", s.mainSessions))
 	mux.HandleFunc("GET /api/local-agent/discovery/tokens", s.localAgentWithScope("discovery.read", s.tokenStats))
-	mux.HandleFunc("GET /api/local-agent/discovery/stats", s.localAgentWithScope("discovery.read", s.findingStats))
+	mux.HandleFunc("GET /api/local-agent/discovery/stats", s.localAgentWithScope("discovery.read", s.localAgentFindingStats))
 
 	// 运行日志及系统统计。
 	mux.HandleFunc("GET /api/local-agent/logs", s.localAgentWithScope("logs.read", s.getLogs))
@@ -169,7 +170,7 @@ func (s *Server) registerLocalAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/local-agent/tools/{key}/reset", s.localAgentWithScope("tools.write", s.pgResetTool))
 
 	// MCP 服务器及其工具目录。
-	mux.HandleFunc("GET /api/local-agent/mcp", s.localAgentWithScope("mcp.read", s.pgListMCP))
+	mux.HandleFunc("GET /api/local-agent/mcp", s.localAgentWithScope("mcp.read", s.localAgentMCPServers))
 	mux.HandleFunc("POST /api/local-agent/mcp", s.localAgentWithScope("mcp.write", s.pgSaveMCP))
 	mux.HandleFunc("DELETE /api/local-agent/mcp/{id}", s.localAgentWithScope("mcp.write", s.pgDeleteMCP))
 	mux.HandleFunc("GET /api/local-agent/mcp/{id}/tools", s.localAgentWithScope("mcp.read", s.pgMCPTools))

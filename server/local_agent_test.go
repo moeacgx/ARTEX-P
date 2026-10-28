@@ -480,7 +480,7 @@ func TestLocalAgentCLIBusinessPG(t *testing.T) {
 			t.Fatalf("管理员操作：%d %s", response.StatusCode, b)
 		}
 	}
-	admin("approve", `{"scopes":["tasks.read","tasks.create","skills.read","skills.upload"]}`)
+	admin("approve", `{"scopes":["tasks.read","tasks.create","skills.read","skills.upload","skills.write","workspace.read","workspace.write","workspace.upload","workspace.download","assets.read","assets.write","conversations.read","conversations.create"]}`)
 	cli("auth", "status")
 	var created struct {
 		ID string `json:"id"`
@@ -506,8 +506,74 @@ func TestLocalAgentCLIBusinessPG(t *testing.T) {
 		t.Fatal(err)
 	}
 	cli("skills", "list")
+	cli("skills", "files", "--name", "local-cli-proof")
+	cli("skills", "write", "--name", "local-cli-proof", "--path", "references/proof.txt", "--content", "技能往返测试")
+	if out := cli("skills", "read", "--name", "local-cli-proof", "--path", "references/proof.txt"); !bytes.Contains(out, []byte("技能往返测试")) {
+		t.Fatalf("技能读取未返回实际内容: %s", out)
+	}
+	downloadedSkill := filepath.Join(t.TempDir(), "download.zip")
+	cli("skills", "download", "--name", "local-cli-proof", "--output", downloadedSkill)
+	zr, err := zip.OpenReader(downloadedSkill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	if _, err := zr.Open("local-cli-proof/references/proof.txt"); err != nil {
+		t.Fatalf("下载包缺少实际写入文件: %v", err)
+	}
+	cli("workspace", "mkdir", "--path", "cli-audit")
+	cli("workspace", "write", "--path", "cli-audit/proof.txt", "--content", "工作区往返测试")
+	if out := cli("workspace", "read", "--path", "cli-audit/proof.txt"); !bytes.Contains(out, []byte("工作区往返测试")) {
+		t.Fatalf("工作区读取未返回实际内容: %s", out)
+	}
+	binary := []byte{0, 1, 127, 128, 255}
+	uploaded := filepath.Join(t.TempDir(), "binary.dat")
+	if err := os.WriteFile(uploaded, binary, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cli("workspace", "upload", "--path", "cli-audit", "--file", uploaded)
+	downloaded := filepath.Join(t.TempDir(), "binary.dat")
+	cli("workspace", "download", "--path", "cli-audit/binary.dat", "--output", downloaded)
+	if content, err := os.ReadFile(downloaded); err != nil || sha256.Sum256(content) != sha256.Sum256(binary) {
+		t.Fatalf("工作区二进制 SHA 不一致: %v", err)
+	}
+	assetsFile := filepath.Join(t.TempDir(), "assets.json")
+	if err := os.WriteFile(assetsFile, []byte(`{"assets":[{"type":"ip","ip":"192.0.2.211"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var imported struct {
+		Results []struct {
+			ID int64 `json:"id"`
+		} `json:"results"`
+		Errors []any `json:"errors"`
+	}
+	if err := json.Unmarshal(cli("assets", "upload", "--file", assetsFile), &imported); err != nil || len(imported.Errors) != 0 || len(imported.Results) != 1 {
+		t.Fatalf("资产写入失败: %+v %v", imported, err)
+	}
+	defer m.pg.Exec(`DELETE FROM assets WHERE id=$1`, imported.Results[0].ID)
+	exportedFile := filepath.Join(t.TempDir(), "export.json")
+	cli("assets", "download", "--type", "ip", "--dsl", `ip="192.0.2.211"`, "--all", "--output", exportedFile)
+	var exported struct {
+		Assets []db.Asset `json:"assets"`
+	}
+	content, err := os.ReadFile(exportedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(content, &exported); err != nil || len(exported.Assets) != 1 || exported.Assets[0].IP != "192.0.2.211" {
+		t.Fatalf("资产导出未返回实际写入内容: %s %v", content, err)
+	}
+	var catalog struct {
+		Agents []struct {
+			Key string `json:"key"`
+		} `json:"agents"`
+	}
+	if err := json.Unmarshal(cli("conversations", "agents"), &catalog); err != nil || len(catalog.Agents) == 0 {
+		t.Fatalf("Agent 目录为空: %v", err)
+	}
+	cli("conversations", "create", "--agent-key", catalog.Agents[0].Key, "--title", "CLI隔离验证")
 	var count int
-	if err := m.pg.QueryRow(`SELECT count(*) FROM local_agent_audit WHERE device_id=$1 AND status_code IN (200,201) AND completed_at IS NOT NULL`, paired.DeviceID).Scan(&count); err != nil || count != 2 {
+	if err := m.pg.QueryRow(`SELECT count(*) FROM local_agent_audit WHERE device_id=$1 AND status_code IN (200,201) AND completed_at IS NOT NULL`, paired.DeviceID).Scan(&count); err != nil || count != 8 {
 		t.Fatalf("业务审计数量=%d: %v", count, err)
 	}
 	admin("revoke", "")

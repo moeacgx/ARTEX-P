@@ -231,6 +231,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if err := s.seedFOFASkill(); err != nil {
 			log.Printf("[fofa] 内置 Skill 初始化失败: %v", err)
 		}
+		if err := s.seedXiequTools(); err != nil {
+			log.Printf("[xiequ] 白名单工具初始化失败: %v", err)
+		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools, m) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
@@ -780,6 +783,7 @@ func (s *Server) Handler() http.Handler {
 	s.RegisterLLMModelRoutes(mux)
 	s.RegisterProxyActionRoutes(mux)
 	s.registerFOFARoutes(mux)
+	s.registerXiequRoutes(mux)
 
 	// Auth routes — exempt from JWT check (handled in requireAuth)
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
@@ -3559,7 +3563,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"web_search_proxy":         proxy,                           // 独立出口代理(http/https/socks5)，空=直连
 		"global_proxy":             maskProxyURL(s.m.GlobalProxy()), // 兼容旧 UI 的脱敏回显；新 UI 使用代理编号
 		"python_interpreter":       strings.TrimSpace(pyStored),     // 用户/自动设的值(空=用运行时检测)
-		"workers":                  s.m.Workers(),                   // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"workers":                  s.m.Workers(),                   // 并发工作 agent 数(默认3)；运行中的任务会即时扩缩容
 		"task_concurrency_enabled": concOn,                          // 任务并发上限开关(默认关)
 		"task_concurrency_limit":   concLimit,                       // 同时运行任务上限(开启后默认5)
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
@@ -3631,7 +3635,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
 		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
 		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
-		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
+		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；运行中的任务会即时扩缩容
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
@@ -3708,6 +3712,12 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		if err := s.m.SetWorkers(*req.Workers); err != nil {
 			writeErr(w, 400, err.Error())
 			return
+		}
+		// 已启动任务也立即扩缩容；未启动任务仍会在 Engine.Run 读取新值。
+		if s.engine != nil {
+			for _, task := range s.m.List() {
+				s.engine.ScaleWorkers(task, *req.Workers)
+			}
 		}
 	}
 	if req.ConcurrencyEnabled != nil || req.ConcurrencyLimit != nil {

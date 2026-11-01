@@ -159,7 +159,7 @@ func TestProviderNonStreamingBodyIdleTimeout(t *testing.T) {
 func TestProviderTimeoutDefaults(t *testing.T) {
 	t.Setenv("ARTEX_LLM_RESPONSE_HEADER_TIMEOUT", "0")
 	t.Setenv("ARTEX_LLM_RESPONSE_BODY_IDLE_TIMEOUT", "invalid")
-	if defaultLLMResponseHeaderTimeout != 60*time.Second {
+	if defaultLLMResponseHeaderTimeout != 180*time.Second {
 		t.Fatalf("header default=%s", defaultLLMResponseHeaderTimeout)
 	}
 	if defaultLLMResponseBodyIdleTimeout != 120*time.Second {
@@ -176,12 +176,59 @@ func TestProviderTimeoutDefaults(t *testing.T) {
 		t.Fatalf("global client timeout=%s", client.Timeout)
 	}
 	bounded := client.Transport.(quotaAwareTransport).base.(responseTimeoutTransport)
-	if bounded.headerTimeout != 60*time.Second || bounded.bodyIdle != 120*time.Second {
+	if bounded.headerTimeout != 180*time.Second || bounded.bodyIdle != 120*time.Second {
 		t.Fatalf("defaults=%+v", bounded)
 	}
 	t.Setenv("ARTEX_LLM_RESPONSE_HEADER_TIMEOUT", "2s")
-	if got := configuredTimeout(0, "ARTEX_LLM_RESPONSE_HEADER_TIMEOUT", time.Minute); got != 2*time.Second {
-		t.Fatalf("configured header=%s", got)
+	client, err = quotaAwareHTTPClient("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bounded = client.Transport.(quotaAwareTransport).base.(responseTimeoutTransport)
+	if bounded.headerTimeout != 2*time.Second {
+		t.Fatalf("environment override header=%s", bounded.headerTimeout)
+	}
+}
+
+func TestProviderOpenAIResponsesAllowsSlowHeaderWithinConfiguredTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("path=%q, want /v1/responses", r.URL.Path)
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		time.Sleep(150 * time.Millisecond)
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"延迟首响应已完成\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	cfg := timeoutTestConfig(server.URL+"/v1", 200*time.Millisecond, time.Second)
+	cfg.Format = llm.FormatOpenAIResponses
+	provider, err := cfg.NewProvider()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc := llm.NewAccumulator()
+	completed := false
+	for ev, err := range provider.Stream(t.Context(), llm.CompletionRequest{Messages: []llm.Message{llm.UserText("ping")}}) {
+		if err != nil {
+			t.Fatalf("slow OpenAI Responses header failed: %v", err)
+		}
+		acc.Add(ev)
+		if ev.Type == llm.SEMessageDelta && ev.StopReason == "end_turn" {
+			completed = true
+		}
+	}
+	if got := acc.Message().Text(); got != "延迟首响应已完成" {
+		t.Errorf("text=%q, want 延迟首响应已完成", got)
+	}
+	if !completed {
+		t.Error("未捕获到 Responses 结束事件")
 	}
 }
 

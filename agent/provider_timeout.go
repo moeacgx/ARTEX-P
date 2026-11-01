@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	defaultLLMResponseHeaderTimeout   = 60 * time.Second
+	defaultLLMResponseHeaderTimeout   = 180 * time.Second
 	defaultLLMResponseBodyIdleTimeout = 120 * time.Second
 )
 

@@ -77,7 +77,7 @@ func TestTerminalTextAbortedNamesCauseAndHangingTool(t *testing.T) {
 	if !strings.Contains(summary, "规划者") || strings.Contains(summary, "\n") {
 		t.Fatalf("unexpected summary: %q", summary)
 	}
-	for _, want := range []string{"killed_by_planner", "aborted_tools", "7 轮", "Bash", "未返回结果", "1200"} {
+	for _, want := range []string{"killed_by_planner", "aborted_tools", "执行到第 7 轮（SDK 轮次）", "Bash", "尚未观察到返回事件", "距调用事件", "1200"} {
 		if !strings.Contains(detail, want) {
 			t.Errorf("detail missing %q:\n%s", want, detail)
 		}
@@ -118,7 +118,7 @@ func TestTerminalTextCompletedToolNotBlamed(t *testing.T) {
 	trace.start("tu_1", "Read", `{"path":"/etc/hosts"}`)
 	trace.done("tu_1")
 	_, detail := terminalText(ctx, &harness.Terminal{Reason: harness.ReasonAbortedStreaming}, trace)
-	if strings.Contains(detail, "未返回结果") || !strings.Contains(detail, "已正常返回") {
+	if strings.Contains(detail, "尚未观察到返回事件") || !strings.Contains(detail, "本次捕获到返回事件") {
 		t.Fatalf("completed tool was blamed:\n%s", detail)
 	}
 }
@@ -134,6 +134,82 @@ func TestTerminalTextNonAbortReasons(t *testing.T) {
 	}, trace)
 	if !strings.Contains(summary, "model_error") || !strings.Contains(detail, "429 rate limited") {
 		t.Fatalf("model_error detail incomplete: %q\n%s", summary, detail)
+	}
+}
+
+func TestTerminalTextModelErrorReportsObservedProgress(t *testing.T) {
+	tests := []struct {
+		name     string
+		turns    int
+		toolName string
+		pending  bool
+		want     []string
+	}{
+		{
+			name:     "completed tool after many turns",
+			turns:    35,
+			toolName: "Bash",
+			want:     []string{"执行到第 35 轮（SDK 轮次）", "最后工具 Bash 本次捕获到返回事件"},
+		},
+		{
+			name:     "pending tool",
+			turns:    2,
+			toolName: "Bash",
+			pending:  true,
+			want:     []string{"执行到第 2 轮（SDK 轮次）", "最后工具 Bash 尚未观察到返回事件", "距调用事件"},
+		},
+		{
+			name:  "no tool call",
+			turns: 1,
+			want:  []string{"执行到第 1 轮（SDK 轮次）", "本次运行尚未发出工具调用"},
+		},
+		{
+			name: "SDK turn count unavailable",
+			want: []string{"SDK 未报告轮次", "本次运行尚未发出工具调用"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trace := &runTrace{startedAt: time.Now()}
+			if tt.toolName != "" {
+				trace.start("tool-1", tt.toolName, `{"command":"example"}`)
+				if !tt.pending {
+					trace.done("tool-1")
+				}
+			}
+
+			summary, detail := terminalText(context.Background(), &harness.Terminal{
+				Reason: harness.ReasonModelError,
+				Err:    errors.New("context deadline exceeded"),
+				Turns:  tt.turns,
+			}, trace)
+
+			for _, want := range append([]string{"最终总结未生成"}, tt.want...) {
+				if !strings.Contains(summary, want) {
+					t.Errorf("summary missing %q: %q", want, summary)
+				}
+			}
+			if strings.Contains(summary, "基本没真正探成") {
+				t.Errorf("summary makes an unsupported claim about execution: %q", summary)
+			}
+			if !strings.Contains(detail, "context deadline exceeded") {
+				t.Errorf("detail lost underlying error: %s", detail)
+			}
+			if !strings.Contains(detail, "已记录的工具轨迹可供核查") {
+				t.Errorf("详情缺少谨慎的轨迹说明: %s", detail)
+			}
+			if tt.turns > 0 && !strings.Contains(detail, tt.want[0]) {
+				t.Errorf("详情未注明 SDK 轮次口径: %s", detail)
+			}
+			if tt.pending {
+				for _, text := range []string{summary, detail} {
+					if !strings.Contains(text, "距调用事件") || strings.Contains(text, "已运行") || strings.Contains(text, "仍在执行") {
+						t.Errorf("pending 状态超出了可观测事件事实: %s", text)
+					}
+				}
+			}
+		})
 	}
 }
 

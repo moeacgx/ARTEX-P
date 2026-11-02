@@ -276,11 +276,14 @@ type Manager struct {
 	proxyEngine   *Engine // 启动时安装，协调所有任务出口使用者与回收
 	proxyBarriers sync.Map
 	proxyTickets  sync.Map
-	mu            sync.RWMutex
-	tasks         map[string]*Task
-	active        string
-	trafficOn     bool // 流量捕获开关（默认关；settings.traffic_capture）
-	llmRecOn      bool // LLM 录制开关（默认关；settings.llm_record）
+	// xiequWhitelistMu serializes management API reads/writes and public-IP
+	// refreshes for this process. The persistent state remains in PostgreSQL.
+	xiequWhitelistMu sync.Mutex
+	mu               sync.RWMutex
+	tasks            map[string]*Task
+	active           string
+	trafficOn        bool // 流量捕获开关（默认关；settings.traffic_capture）
+	llmRecOn         bool // LLM 录制开关（默认关；settings.llm_record）
 	// 联网搜索开关与来源（默认关；settings.web_search_*）。brave-free 需要 braveKey；tavily 需要 tavilyKey。
 	// webSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关。
 	webSearchOn      bool
@@ -362,8 +365,8 @@ func (m *Manager) SetConcurrency(enabled bool, limit int) error {
 	return m.pg.SetSetting(settingConcurrencyOn, strconv.FormatBool(enabled))
 }
 
-// Workers returns the configured concurrent work-agent count (default 3). Read
-// per-task at engine.Run, so a change applies to tasks started afterwards.
+// Workers returns the configured concurrent work-agent count (default 3).
+// Engine.Run reads it for new tasks and the settings handler resizes live tasks.
 func (m *Manager) Workers() int {
 	v, ok, err := m.pg.GetSetting(settingWorkers)
 	if err != nil || !ok {
@@ -377,6 +380,7 @@ func (m *Manager) Workers() int {
 }
 
 // SetWorkers persists the concurrent work-agent count. Values <=0 are rejected.
+// The settings handler applies the new value to live pools after persisting it.
 func (m *Manager) SetWorkers(n int) error {
 	if n <= 0 {
 		return fmt.Errorf("workers 必须 >0")

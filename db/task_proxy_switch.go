@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,9 +21,10 @@ type taskOperationLeaseKey struct {
 	taskID   int64
 }
 type taskOperationLease struct {
-	conn *sql.Conn
-	refs int
-	txMu *sync.Mutex
+	conn    *sql.Conn
+	refs    int
+	txMu    *sync.Mutex
+	session *taskOperationSession
 }
 
 type taskOperationSession struct {
@@ -74,41 +77,86 @@ func (d *DB) Close() error {
 func taskProxySessionKey(id int64) int64 { return int64(0x5357500000000000) ^ id }
 
 func (d *DB) acquireTaskOperationSession(id int64) (*taskOperationLease, bool, error) {
+	return d.acquireTaskOperationSessionContext(context.Background(), id)
+}
+
+func (d *DB) acquireTaskOperationSessionContext(ctx context.Context, id int64) (*taskOperationLease, bool, error) {
 	k := taskOperationLeaseKey{database: d.DB, taskID: id}
-	taskOperationLeases.Lock()
-	defer taskOperationLeases.Unlock()
-	if lease := taskOperationLeases.leases[k]; lease != nil {
-		lease.refs++
-		return lease, false, nil
-	}
-	// 每实例仅保留一个共享锁会话；业务池即使只有一条连接也能正常出站。
-	session := taskOperationLeases.sessions[d.DB]
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if session == nil {
-		conn, err := d.taskOperationLockConn(ctx)
-		if err != nil {
-			return nil, false, err
+	for attempt := 0; attempt < 2; attempt++ {
+		taskOperationLeases.Lock()
+		session := taskOperationLeases.sessions[d.DB]
+		if session != nil {
+			pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			session.txMu.Lock()
+			err := session.conn.PingContext(pingCtx)
+			session.txMu.Unlock()
+			cancel()
+			if err != nil {
+				// A dead checked-out session poisons every cached lease that
+				// shares it. Drop the whole group and reconnect once instead of
+				// returning "connection is already closed" forever.
+				d.dropTaskOperationSessionLocked(session)
+				taskOperationLeases.Unlock()
+				_ = session.conn.Close()
+				continue
+			}
 		}
-		session = &taskOperationSession{conn: conn, txMu: &sync.Mutex{}}
-	}
-	session.txMu.Lock()
-	defer session.txMu.Unlock()
-	var locked bool
-	if err := session.conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock_shared($1)`, taskProxySessionKey(id)).Scan(&locked); err != nil || !locked {
-		if session.tasks == 0 {
-			_ = session.conn.Close()
+
+		if lease := taskOperationLeases.leases[k]; lease != nil {
+			lease.refs++
+			taskOperationLeases.Unlock()
+			return lease, false, nil
 		}
-		if err != nil {
-			return nil, false, err
+
+		// 每实例仅保留一个共享锁会话；业务池即使只有一条连接也能正常出站。
+		if session == nil {
+			conn, err := d.taskOperationLockConn(ctx)
+			if err != nil {
+				taskOperationLeases.Unlock()
+				return nil, false, err
+			}
+			session = &taskOperationSession{conn: conn, txMu: &sync.Mutex{}}
 		}
-		return nil, false, ErrProxyInUse
+
+		lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		session.txMu.Lock()
+		var locked bool
+		err := session.conn.QueryRowContext(lockCtx, `SELECT pg_try_advisory_lock_shared($1)`, taskProxySessionKey(id)).Scan(&locked)
+		session.txMu.Unlock()
+		cancel()
+		if err != nil || !locked {
+			if session.tasks == 0 {
+				delete(taskOperationLeases.sessions, d.DB)
+			}
+			taskOperationLeases.Unlock()
+			if session.tasks == 0 {
+				_ = session.conn.Close()
+			}
+			if err != nil {
+				return nil, false, err
+			}
+			return nil, false, ErrProxyInUse
+		}
+
+		lease := &taskOperationLease{conn: session.conn, refs: 1, txMu: session.txMu, session: session}
+		session.tasks++
+		taskOperationLeases.sessions[d.DB] = session
+		taskOperationLeases.leases[k] = lease
+		taskOperationLeases.Unlock()
+		return lease, true, nil
 	}
-	lease := &taskOperationLease{conn: session.conn, refs: 1, txMu: session.txMu}
-	session.tasks++
-	taskOperationLeases.sessions[d.DB] = session
-	taskOperationLeases.leases[k] = lease
-	return lease, true, nil
+	return nil, false, sql.ErrConnDone
+}
+
+func (d *DB) dropTaskOperationSessionLocked(session *taskOperationSession) {
+	for key, lease := range taskOperationLeases.leases {
+		if key.database == d.DB && lease.session == session {
+			delete(taskOperationLeases.leases, key)
+		}
+	}
+	if taskOperationLeases.sessions[d.DB] == session {
+		delete(taskOperationLeases.sessions, d.DB)
+	}
 }
 
 func (d *DB) releaseTaskOperationSession(id int64) error {
@@ -295,14 +343,23 @@ func taskProxyStateTx(tx *sql.Tx, id int64) (TaskProxyState, error) {
 
 // 普通准入与切换共锁，返回准入时的权威快照，保证另一 Manager 的缓存更新。
 func (d *DB) AcquireTaskOperation(id int64) (TaskProxyState, error) {
+	return d.AcquireTaskOperationContext(context.Background(), id)
+}
+
+func (d *DB) AcquireTaskOperationContext(ctx context.Context, id int64) (TaskProxyState, error) {
 	var s TaskProxyState
-	lease, _, err := d.acquireTaskOperationSession(id)
+	lease, freshLease, err := d.acquireTaskOperationSessionContext(ctx, id)
 	if err != nil {
 		return s, err
 	}
 	lease.txMu.Lock()
 	err = d.withProxySwitchLifecycle(lease.conn, func(tx *sql.Tx) error {
 		var err error
+		if freshLease {
+			if err = repairStaleTaskOperationActivityTx(tx, id); err != nil {
+				return err
+			}
+		}
 		policy, err := proxyPolicyTx(tx, ProxySubject{Kind: "task", ID: id})
 		if err != nil {
 			return err
@@ -359,9 +416,152 @@ operation_owners=jsonb_set(task_operation_activity.operation_owners,ARRAY[pg_bac
 	})
 	lease.txMu.Unlock()
 	if err != nil {
-		_ = d.releaseTaskOperationSession(id)
+		if isTaskOperationConnectionError(err) {
+			taskOperationLeases.Lock()
+			if current := taskOperationLeases.sessions[d.DB]; current == lease.session {
+				d.dropTaskOperationSessionLocked(current)
+			}
+			taskOperationLeases.Unlock()
+			_ = lease.conn.Close()
+		} else {
+			_ = d.releaseTaskOperationSession(id)
+		}
 	}
 	return s, err
+}
+
+func isTaskOperationConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection is already closed") ||
+		strings.Contains(msg, "bad connection") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset")
+}
+
+// repairStaleTaskOperationActivityTx removes only owners whose dedicated
+// advisory-lock backend no longer exists. Live sessions from another ARTEX
+// instance keep their rows and continue to protect the task.
+func repairStaleTaskOperationActivityTx(tx *sql.Tx, taskID int64) error {
+	live := map[int64]bool{}
+	rows, err := tx.Query(`SELECT DISTINCT l.pid::bigint
+FROM pg_locks l
+WHERE l.locktype='advisory'
+  AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())
+  AND l.classid=(($1::bigint >> 32) & 4294967295)::oid
+  AND l.objid=($1::bigint & 4294967295)::oid
+  AND l.objsubid=1
+  AND l.granted
+  AND l.mode='ShareLock'`, taskProxySessionKey(taskID))
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var pid int64
+		if err = rows.Scan(&pid); err != nil {
+			rows.Close()
+			return err
+		}
+		live[pid] = true
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+
+	var activeCount int64
+	var ownersRaw []byte
+	if err = tx.QueryRow(`SELECT active_count,operation_owners FROM task_operation_activity WHERE task_id=$1 FOR UPDATE`, taskID).Scan(&activeCount, &ownersRaw); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		ownersRaw = []byte(`{}`)
+	}
+	owners := map[string]int64{}
+	if err = json.Unmarshal(ownersRaw, &owners); err != nil {
+		return err
+	}
+	stalePIDs := map[int64]bool{}
+	for rawPID := range owners {
+		var pid int64
+		pid, err = strconv.ParseInt(rawPID, 10, 64)
+		if err != nil {
+			return err
+		}
+		if !live[pid] {
+			stalePIDs[pid] = true
+			delete(owners, rawPID)
+		}
+	}
+
+	type staleActivity struct {
+		token string
+	}
+	activities := []staleActivity{}
+	rows, err = tx.Query(`SELECT a.token,a.backend_pid::bigint
+FROM proxy_subject_activity a
+JOIN proxy_subject_policies p ON p.id=a.policy_id
+WHERE p.task_id=$1`, taskID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var activity staleActivity
+		var backendPID int64
+		if err = rows.Scan(&activity.token, &backendPID); err != nil {
+			rows.Close()
+			return err
+		}
+		if !live[backendPID] {
+			stalePIDs[backendPID] = true
+			activities = append(activities, activity)
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if len(stalePIDs) == 0 {
+		return nil
+	}
+
+	for _, activity := range activities {
+		if _, err = tx.Exec(`DELETE FROM warp_proxy_health_activity WHERE activity_token::text=$1`, activity.token); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`DELETE FROM proxy_subject_activity WHERE token=$1`, activity.token); err != nil {
+			return err
+		}
+	}
+	var liveTaskActivities int64
+	if err = tx.QueryRow(`SELECT count(*) FROM proxy_subject_activity a JOIN proxy_subject_policies p ON p.id=a.policy_id WHERE p.task_id=$1 AND a.kind='task'`, taskID).Scan(&liveTaskActivities); err != nil {
+		return err
+	}
+	if liveTaskActivities == 0 {
+		if _, err = tx.Exec(`DELETE FROM task_proxy_activity WHERE task_id=$1`, taskID); err != nil {
+			return err
+		}
+	} else if _, err = tx.Exec(`UPDATE task_proxy_activity SET active_count=$2 WHERE task_id=$1`, taskID, liveTaskActivities); err != nil {
+		return err
+	}
+
+	activeCount = 0
+	for _, count := range owners {
+		activeCount += count
+	}
+	ownersRaw, err = json.Marshal(owners)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE task_operation_activity SET active_count=$2,operation_owners=$3 WHERE task_id=$1`, taskID, activeCount, ownersRaw)
+	return err
 }
 
 func (d *DB) ReleaseTaskOperation(id int64) error {

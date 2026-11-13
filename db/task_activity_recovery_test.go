@@ -4,9 +4,81 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+func TestTaskOperationLeaseReconnectsAndClearsDeadOwner(t *testing.T) {
+	d, _, task := plannerRunTestDBs(t)
+	first, err := d.AcquireTaskOperation(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ioToken, err := d.AcquireProxyIOOperation(ProxySubject{Kind: "task", ID: task.ID}, first.Revision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ioToken == "" {
+		t.Fatal("proxy I/O token missing")
+	}
+
+	key := taskOperationLeaseKey{database: d.DB, taskID: task.ID}
+	taskOperationLeases.Lock()
+	lease := taskOperationLeases.leases[key]
+	if lease == nil {
+		taskOperationLeases.Unlock()
+		t.Fatal("task operation lease missing")
+	}
+	lease.txMu.Lock()
+	var backendPID int64
+	err = lease.conn.QueryRowContext(t.Context(), `SELECT pg_backend_pid()`).Scan(&backendPID)
+	lease.txMu.Unlock()
+	taskOperationLeases.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var terminated bool
+	if err = d.QueryRow(`SELECT pg_terminate_backend($1)`, backendPID).Scan(&terminated); err != nil {
+		t.Skipf("cannot terminate test backend: %v", err)
+	}
+	if !terminated {
+		t.Skip("test backend was already gone")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var lockAlive bool
+		if err = d.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1)`, backendPID).Scan(&lockAlive); err != nil {
+			t.Fatal(err)
+		}
+		if !lockAlive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("terminated backend %d still holds locks", backendPID)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	second, err := d.AcquireTaskOperationContext(t.Context(), task.ID)
+	if err != nil {
+		t.Fatalf("reconnect after dead lease: %v", err)
+	}
+	if second.OperationToken == "" || second.OperationToken == first.OperationToken {
+		t.Fatalf("expected a new operation token, first=%q second=%q", first.OperationToken, second.OperationToken)
+	}
+	var staleActivities int
+	if err = d.QueryRow(`SELECT count(*) FROM proxy_subject_activity a JOIN proxy_subject_policies p ON p.id=a.policy_id WHERE p.task_id=$1 AND a.backend_pid=$2`, task.ID, backendPID).Scan(&staleActivities); err != nil {
+		t.Fatal(err)
+	}
+	if staleActivities != 0 {
+		t.Fatalf("dead backend still owns %d proxy activities", staleActivities)
+	}
+	if err = d.ReleaseTaskOperationToken(task.ID, second.OperationToken); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestTaskActivityRecoveryReleasesOnlyOwnedWarpTokens(t *testing.T) {
 	first, _, task := plannerRunTestDBs(t)

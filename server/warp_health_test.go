@@ -178,6 +178,81 @@ func runHealthFailures(t *testing.T, c *WarpHealthController, d *db.DB, id int64
 		}
 	}
 }
+
+type startupRuntimeFixture struct {
+	*healthRuntimeFixture
+	running bool
+	starts  int
+}
+
+func (f *startupRuntimeFixture) Running(string) bool { return f.running }
+func (f *startupRuntimeFixture) EnsureRunning(ctx context.Context, id, material string) (egress.WarpProfile, error) {
+	f.starts++
+	f.running = true
+	return f.Probe(ctx, id)
+}
+func TestWarpControllerRestoresExitedProcessBeforeNetworkBackoff(t *testing.T) {
+	c, d, f, id := healthControllerFixture(t)
+	r := &startupRuntimeFixture{healthRuntimeFixture: f}
+	c.runtime = r
+	if _, err := d.Exec(`UPDATE warp_proxy_health SET failures=5,next_recovery_at=now()+interval '1 day' WHERE proxy_id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RunOnce(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	if r.starts != 1 || !r.running {
+		t.Fatalf("未恢复期望运行器: %d", r.starts)
+	}
+	s, err := d.WarpHealth(t.Context(), id)
+	if err != nil || s.State != "ready" || s.RecoveryAttempts != 0 {
+		t.Fatalf("启动误计为故障重连: %+v %v", s, err)
+	}
+	f.probeErr = errors.New("temporary offline")
+	runHealthFailures(t, c, d, id, 4)
+	if f.repairs != 0 || r.starts != 1 {
+		t.Fatal("网络失败触发存活进程重启")
+	}
+}
+
+func TestWarpStartupRespectsMaintenancePolicy(t *testing.T) {
+	for _, mode := range []string{"global_off", "denied", "read_error"} {
+		t.Run(mode, func(t *testing.T) {
+			c, d, f, id := healthControllerFixture(t)
+			r := &startupRuntimeFixture{healthRuntimeFixture: f}
+			c.runtime = r
+			if mode == "global_off" {
+				policy, err := d.GlobalWarpHealthPolicy(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = d.SetGlobalWarpHealthPolicy(t.Context(), policy.Revision, false); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					p, err := d.GlobalWarpHealthPolicy(context.Background())
+					if err == nil {
+						_, err = d.SetGlobalWarpHealthPolicy(context.Background(), p.Revision, true)
+					}
+					if err != nil {
+						t.Error(err)
+					}
+				})
+			} else {
+				c.SetAutoRecoveryAllowed(func(context.Context, int64) (bool, error) {
+					if mode == "read_error" {
+						return true, errors.New("policy unavailable")
+					}
+					return false, nil
+				})
+			}
+			_ = c.RunOnce(t.Context(), id)
+			if r.starts != 0 {
+				t.Fatalf("%s still started process", mode)
+			}
+		})
+	}
+}
 func TestWarpHealthControllerThresholdSameIPAndPolicy(t *testing.T) {
 	c, d, f, id := healthControllerFixture(t)
 	f.probeErr = errors.New("offline")

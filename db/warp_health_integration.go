@@ -122,6 +122,30 @@ func (d *DB) BeginWarpHealthDelete(ctx context.Context, execution *WarpHealthExe
 	return claim, err
 }
 
+// BeginWarpStartup 恢复已确认退出的期望运行器。网络重连退避不参与，
+// next_probe_at 限制重复启动；真实执行仍持会话锁和 repair claim。
+func (e *WarpHealthExecution) BeginWarpStartup(ctx context.Context, id int64, material string, now time.Time, guard WarpHealthRepairGuard) (WarpHealthClaim, error) {
+	if e == nil || e.key != warpExecutionKey(id) {
+		return WarpHealthClaim{}, ErrWarpHealthBlocked
+	}
+	var claim WarpHealthClaim
+	err := e.withLifecycle(ctx, func(tx *sql.Tx) error {
+		if err := CheckWarpHealthAutoRecoveryEligibleTx(ctx, tx, id); err != nil {
+			return err
+		}
+		state, err := healthEligibleTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if state.Material != material || state.Claim.Token != "" || (state.NextProbeAt != nil && now.Before(*state.NextProbeAt)) {
+			return ErrWarpHealthBlocked
+		}
+		claim, err = BeginWarpHealthManualTx(ctx, tx, id, guard)
+		return err
+	})
+	return claim, err
+}
+
 // PrepareWarpHealthManualProbe 只为管理端“立即检测”清除周期门槛。
 // 不抢占 pending、repair、unknown 或正在执行的 probe，也不改变 Desired/策略。
 func (d *DB) PrepareWarpHealthManualProbe(ctx context.Context, id int64) error {
@@ -226,7 +250,9 @@ func (d *DB) CompleteWarpHealthCreate(ctx context.Context, execution *WarpHealth
 				return ErrProxyUnavailable
 			}
 			proxy.URL, proxy.Host, proxy.Port, proxy.Username, proxy.Password, proxy.Protocol = connection.URL, connection.Host, connection.Port, connection.Username, connection.Password, "socks5"
-			status, nextState, failure = ProxyStatusHealthy, "succeeded", ""
+			if failure == "" {
+				status, nextState = ProxyStatusHealthy, "succeeded"
+			}
 		}
 		urlValue, err := encryptProxySecret(proxy.URL)
 		if err != nil {

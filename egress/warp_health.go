@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -233,6 +234,59 @@ func (m *WarpManager) HealthMaterial(id string) (WarpProfile, string, error) {
 	return p, hex.EncodeToString(digest.Sum(nil)), nil
 }
 
+func (m *WarpManager) Running(id string) bool {
+	return m.process(id) != nil
+}
+
+// ConfiguredConnection 仅供管理端持久化完整档案；不代表出口已通过准入。
+func (m *WarpManager) ConfiguredConnection(id string) (WarpConnection, error) {
+	if _, _, err := m.HealthMaterial(id); err != nil {
+		return WarpConnection{}, err
+	}
+	lock := m.profileLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	path, err := m.path(id)
+	if err != nil {
+		return WarpConnection{}, err
+	}
+	p, err := readProfile(path)
+	if err != nil {
+		return WarpConnection{}, err
+	}
+	var auth warpAuth
+	if err = readAuth(path, &auth); err != nil {
+		return WarpConnection{}, err
+	}
+	return WarpConnection{Host: "127.0.0.1", Port: p.Port, Username: auth.Username, Password: auth.Password}, nil
+}
+
+// EnsureRunning 由持久启动 claim 调用；已存活的运行器只复测，绝不重复注册。
+func (m *WarpManager) EnsureRunning(ctx context.Context, id, material string) (WarpProfile, error) {
+	p, got, err := m.HealthMaterial(id)
+	if err != nil || material == "" || got != material || !p.Desired {
+		return p, errors.New("WARP 意图或材料已变化，拒绝启动")
+	}
+	unlock, err := m.beginProfile(id)
+	if err != nil {
+		return p, err
+	}
+	path, _ := m.path(id)
+	current, err := readProfile(path)
+	if err != nil || current.Revision != p.Revision || !current.Desired {
+		unlock()
+		return current, ErrWarpStaleProbe
+	}
+	if m.process(id) != nil {
+		unlock()
+		return m.Probe(ctx, id)
+	}
+	defer unlock()
+	ctx, cancel := m.operationContext(ctx)
+	defer cancel()
+	return m.startLocked(ctx, path, current)
+}
+
 // Reconnect 只能由已经提交的持久 repair claim 调用，绝不走 Create/register/generate。
 func (m *WarpManager) Reconnect(ctx context.Context, id, material string) (WarpProfile, error) {
 	p, got, err := m.HealthMaterial(id)
@@ -281,6 +335,28 @@ func probeWarpEgress(ctx context.Context, c WarpConnection) (string, error) {
 	return probeWarpTrace(ctx, c, "https://cloudflare.com/cdn-cgi/trace", nil)
 }
 
+// Only locally constructed classifications are persisted; never connection URLs or raw errors.
+type warpProbeError string
+
+func (e warpProbeError) Error() string { return string(e) }
+
+func warpProbeFailure(ctx context.Context, err error, running bool) string {
+	if !running {
+		return "wireproxy 进程已退出"
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return "WARP 出口检测已取消"
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "WARP 出口检测超时"
+	}
+	var classified warpProbeError
+	if errors.As(err, &classified) {
+		return classified.Error()
+	}
+	return "WARP 联网检测失败"
+}
+
 // 测试可注入本地 TLS 信任根；正式路径始终校验证书，经带认证的 SOCKS，不回退直连。
 func probeWarpTrace(ctx context.Context, c WarpConnection, target string, trust *tls.Config) (string, error) {
 	dest, err := url.Parse(target)
@@ -297,27 +373,42 @@ func probeWarpTrace(ctx context.Context, c WarpConnection, target string, trust 
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", errors.New("WARP 出口检测连接失败")
+		var cert *tls.CertificateVerificationError
+		var authority x509.UnknownAuthorityError
+		var network net.Error
+		switch {
+		case errors.Is(err, context.Canceled):
+			return "", warpProbeError("WARP 出口检测已取消")
+		case errors.As(err, &cert), errors.As(err, &authority):
+			return "", warpProbeError("WARP 出口检测证书校验失败")
+		case errors.As(err, &network) && network.Timeout():
+			return "", warpProbeError("WARP 出口检测连接超时")
+		default:
+			return "", warpProbeError("WARP 出口检测代理连接或认证失败")
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return "", errors.New("WARP 出口检测响应异常")
+		return "", warpProbeError(fmt.Sprintf("WARP 出口检测 HTTP 状态异常（%d）", resp.StatusCode))
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4097))
 	if err != nil || len(body) > 4096 {
-		return "", errors.New("WARP 出口检测读取失败")
+		return "", warpProbeError("WARP 出口检测读取失败或响应过大")
 	}
 	values := map[string]string{}
 	for _, line := range strings.Split(string(body), "\n") {
 		if k, v, ok := strings.Cut(strings.TrimSpace(line), "="); ok {
 			if _, dup := values[k]; dup {
-				return "", errors.New("WARP 检测字段重复")
+				return "", warpProbeError("WARP 检测字段重复")
 			}
 			values[k] = v
 		}
 	}
-	if !ValidWarpPublicIP(values["ip"]) || (values["warp"] != "on" && values["warp"] != "plus") {
-		return "", errors.New("WARP 出口未验证公网 IP 和启用状态")
+	if !ValidWarpPublicIP(values["ip"]) {
+		return "", warpProbeError("WARP 出口未返回有效公网 IP")
+	}
+	if values["warp"] != "on" && values["warp"] != "plus" {
+		return "", warpProbeError("WARP 出口未确认启用状态")
 	}
 	return net.ParseIP(values["ip"]).String(), nil
 }

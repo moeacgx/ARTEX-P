@@ -1084,9 +1084,11 @@ func (s *Server) Handler() http.Handler {
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
+	s.registerMCPAccessRoutes(mux)
 	api := cors(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
+	root.Handle("/mcp", s.mcpAccessHandler())
 	root.Handle("/", s.webuiHandler())
 	return root
 }

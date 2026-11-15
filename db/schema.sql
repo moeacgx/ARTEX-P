@@ -1470,3 +1470,30 @@ CREATE TABLE IF NOT EXISTS local_agent_audit (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ
 );
+-- 对外 MCP 密钥及调用元数据。请求/响应正文不进入审计表。
+CREATE TABLE IF NOT EXISTS mcp_access_keys (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    prefix TEXT NOT NULL,
+    scopes TEXT[] NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    last_used_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS mcp_access_calls (
+    id BIGSERIAL PRIMARY KEY,
+    key_id BIGINT NOT NULL REFERENCES mcp_access_keys(id),
+    tool TEXT NOT NULL,
+    request_id TEXT,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'running',
+    status_code INTEGER NOT NULL DEFAULT 0,
+    duration_ms BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(key_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS mcp_access_calls_time ON mcp_access_calls(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS mcp_access_calls_key_time ON mcp_access_calls(key_id, created_at DESC);

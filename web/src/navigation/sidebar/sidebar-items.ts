@@ -87,6 +87,7 @@ export const sidebarItems: NavGroup[] = [
       { id: "agents", title: "Agent", url: "/system/agents", icon: Bot },
       { id: "local-agents", title: "本地 Agent 接入", url: "/system/local-agents", icon: Laptop },
       { id: "mcp", title: "MCP", url: "/system/mcp", icon: Plug },
+      { id: "mcp-access", title: "MCP 接入", url: "/system/mcp-access", icon: Network },
       { id: "proxies", title: "代理中心", url: "/system/proxies", icon: Network },
       { id: "skills", title: "Skill", url: "/system/skills", icon: Sparkles },
       { id: "tools", title: "工具", url: "/system/tools", icon: Wrench },

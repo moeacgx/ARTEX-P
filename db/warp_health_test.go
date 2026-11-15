@@ -71,6 +71,43 @@ func TestWarpHealthMigrationDoesNotInferDesiredFromHealthy(t *testing.T) {
 	}
 }
 
+func TestWarpStartupClaimIgnoresNetworkBackoffButPreservesBarriers(t *testing.T) {
+	d := warpHealthDB(t)
+	id := healthProxy(t, d)
+	healthIntent(t, d, id)
+	if _, err := d.Exec(`UPDATE warp_proxy_health SET next_recovery_at=now()+interval '1 day' WHERE proxy_id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	x, err := d.TryWarpHealthExecution(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Close()
+	claim, err := x.BeginWarpStartup(t.Context(), id, "complete-material", time.Now(), nil)
+	if err != nil {
+		t.Fatalf("旧网络退避阻止正常启动: %v", err)
+	}
+	if _, err = x.BeginWarpStartup(t.Context(), id, "complete-material", time.Now(), nil); !errors.Is(err, ErrWarpHealthBlocked) {
+		t.Fatalf("重叠启动: %v", err)
+	}
+	if _, err = x.CompleteWarpHealthRepair(t.Context(), claim, "", false, time.Now(), DefaultWarpHealthPolicy()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = x.BeginWarpStartup(t.Context(), id, "complete-material", time.Now(), nil); !errors.Is(err, ErrWarpHealthBlocked) {
+		t.Fatalf("缺少启动失败短退避: %v", err)
+	}
+	if _, err = d.Exec(`UPDATE warp_proxy_health SET next_probe_at=NULL WHERE proxy_id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = x.BeginWarpStartup(t.Context(), id, "changed", time.Now(), nil); !errors.Is(err, ErrWarpHealthBlocked) {
+		t.Fatalf("接受旧材料: %v", err)
+	}
+	guard := func(context.Context, *sql.Tx, int64) error { return ErrProxyInUse }
+	if _, err = x.BeginWarpStartup(t.Context(), id, "complete-material", time.Now(), guard); !errors.Is(err, ErrProxyInUse) {
+		t.Fatalf("绕过活动守卫: %v", err)
+	}
+}
+
 func TestWarpHealthClaimAdmissionAndRevision(t *testing.T) {
 	d := warpHealthDB(t)
 	d.SetMaxOpenConns(1)

@@ -23,6 +23,11 @@ type WarpHealthRuntime interface {
 
 var _ WarpHealthRuntime = (*egress.WarpManager)(nil)
 
+type warpProcessRuntime interface {
+	Running(string) bool
+	EnsureRunning(context.Context, string, string) (egress.WarpProfile, error)
+}
+
 // 即使数据库连接中断，当前宿主内仍以真实函数退出作为判据。
 var warpHealthExecutions sync.Map
 
@@ -264,6 +269,49 @@ func (c *WarpHealthController) runOnce(ctx context.Context, id int64, immediate,
 			return err
 		}
 	}
+	if runtime, ok := c.runtime.(warpProcessRuntime); ok && allowRecovery && !immediate && !runtime.Running(warpProfileID(id)) {
+		c.mu.Lock()
+		guard, allowed := c.guard, c.allowed
+		c.mu.Unlock()
+		if allowed != nil {
+			ok, err := allowed(ctx, id)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return nil
+			}
+		}
+		state, readErr := execution.WarpHealth(ctx, id)
+		if readErr != nil {
+			return readErr
+		}
+		claim, startErr := execution.BeginWarpStartup(ctx, id, state.Material, time.Now(), guard)
+		if errors.Is(startErr, db.ErrWarpHealthBlocked) || errors.Is(startErr, db.ErrProxyInUse) {
+			return nil
+		}
+		if startErr != nil {
+			return startErr
+		}
+		warpHealthExecutions.Store(claim.Token, true)
+		defer warpHealthExecutions.Delete(claim.Token)
+		defer func() {
+			cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = execution.MarkWarpHealthUnknown(cleanup, claim)
+		}()
+		p, startErr, canceled := c.execute(ctx, execution, claim, func(ctx context.Context) (egress.WarpProfile, error) {
+			return runtime.EnsureRunning(ctx, warpProfileID(id), state.Material)
+		})
+		if canceled {
+			return context.Canceled
+		}
+		if errors.Is(startErr, egress.ErrWarpExitUnknown) {
+			return execution.MarkWarpHealthUnknown(ctx, claim)
+		}
+		_, err = execution.CompleteWarpHealthRepair(ctx, claim, p.EgressIP, startErr == nil && p.Desired && p.Phase == "ready" && egress.ValidWarpPublicIP(p.EgressIP), time.Now(), c.policy)
+		return err
+	}
 	claim, err := execution.BeginWarpHealthProbe(ctx, id, time.Now())
 	if errors.Is(err, db.ErrWarpHealthBlocked) {
 		if immediate {
@@ -308,6 +356,9 @@ func (c *WarpHealthController) runOnce(ctx context.Context, id int64, immediate,
 	_ = execution.Close()
 	execution = nil
 	if !allowRecovery || success || state.Failures < c.policy.FailureThreshold {
+		return nil
+	}
+	if runtime, ok := c.runtime.(warpProcessRuntime); ok && runtime.Running(warpProfileID(id)) {
 		return nil
 	}
 	c.mu.Lock()

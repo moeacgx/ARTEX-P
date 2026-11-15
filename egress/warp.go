@@ -458,11 +458,10 @@ func (m *WarpManager) startLocked(ctx context.Context, path string, p WarpProfil
 	}
 	p = current
 	if probeErr != nil || ctx.Err() != nil || !ValidWarpPublicIP(ip) || !m.runningLocked(p.ID) {
-		if stopErr := m.stopProcessLocked(p.ID); stopErr != nil {
-			return p, stopErr
-		}
+		// 出口探测与进程存活独立；保留运行器供后续探测恢复。
 		p.Phase = "failed"
-		p.LastError = "WARP 联网检测失败"
+		p.EgressIP = ""
+		p.LastError = warpProbeFailure(ctx, probeErr, m.runningLocked(p.ID))
 		_ = m.save(path, p)
 		return p, errors.New(p.LastError)
 	}
@@ -610,7 +609,7 @@ func (m *WarpManager) Probe(ctx context.Context, id string) (WarpProfile, error)
 		return m.liveProfileLocked(current), ErrWarpStaleProbe
 	}
 	if probeErr != nil || ctx.Err() != nil || !ValidWarpPublicIP(ip) || !m.runningLocked(id) {
-		current.Phase, current.EgressIP, current.LastError = "failed", "", "WARP 联网检测失败"
+		current.Phase, current.EgressIP, current.LastError = "failed", "", warpProbeFailure(ctx, probeErr, m.runningLocked(id))
 	} else {
 		current.Phase, current.EgressIP, current.LastError = "ready", ip, ""
 	}

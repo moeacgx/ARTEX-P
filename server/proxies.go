@@ -177,24 +177,23 @@ func (s *Server) createWarpProxy(w http.ResponseWriter, r *http.Request, p *db.P
 		once.Do(func() { close(marked) })
 	})
 	var connection *db.Proxy
+	materialProfile, material, materialErr := egress.WarpProfile{}, "", error(nil)
 	if err == nil {
 		_, err = rt.warp.Create(r.Context(), warpProfileID(created.ID), created.Name, req.AcceptTerms)
-		if err == nil {
-			c, connectionErr := rt.warp.Connection(warpProfileID(created.ID))
-			err = connectionErr
-			if err == nil {
+		materialProfile, material, materialErr = rt.warp.HealthMaterial(warpProfileID(created.ID))
+		if materialErr == nil {
+			c, connectionErr := rt.warp.ConfiguredConnection(warpProfileID(created.ID))
+			if connectionErr == nil {
 				connection = &db.Proxy{Host: c.Host, Port: c.Port, Username: c.Username, Password: c.Password}
 				connection.URL = (&url.URL{Scheme: "socks5", Host: net.JoinHostPort(c.Host, strconv.Itoa(c.Port)), User: url.UserPassword(c.Username, c.Password)}).String()
+			} else {
+				materialErr = connectionErr
 			}
 		}
 	}
 	failure := ""
 	if err != nil {
 		failure = safeProxyRuntimeError(err)
-	}
-	materialProfile, material, materialErr := egress.WarpProfile{}, "", error(nil)
-	if err == nil {
-		materialProfile, material, materialErr = rt.warp.HealthMaterial(warpProfileID(created.ID))
 	}
 	stopped := stopMark()
 	if !stopped {
@@ -215,8 +214,9 @@ func (s *Server) createWarpProxy(w http.ResponseWriter, r *http.Request, p *db.P
 			err = materialErr
 		}
 	}
-	if err != nil || materialErr != nil {
+	if materialErr != nil {
 		materialProfile.Desired = false
+		material = ""
 	}
 	completed, completeErr := s.m.pg.CompleteWarpHealthCreate(r.Context(), execution, claim, key, intent.ExecutionToken, connection, failure, db.WarpHealthIntent{Desired: materialProfile.Desired, Material: material, ProfileRevision: materialProfile.Revision})
 	if completeErr != nil {
@@ -292,8 +292,10 @@ func (s *Server) deleteProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.Kind == db.ProxyKindWarp {
 		if err = s.deleteWarpProxy(r.Context(), id); err != nil {
-			if errors.Is(err, db.ErrProxyInUse) || errors.Is(err, db.ErrWarpHealthBlocked) {
-				writeErr(w, 409, "WARP 仍有活动或健康屏障未释放")
+			if errors.Is(err, db.ErrProxyInUse) {
+				writeErr(w, 409, "代理仍被引用，请刷新引用并迁移后删除")
+			} else if errors.Is(err, db.ErrWarpHealthBlocked) {
+				writeErr(w, 409, "WARP 正在执行健康操作、真实活动未结束或退出未确认，请刷新后核对")
 			} else {
 				writeErr(w, 500, err.Error())
 			}
@@ -460,6 +462,8 @@ func proxyFromRequest(req proxyRequest) *db.Proxy {
 
 // RegisterProxyActionRoutes 供共享路由装配调用；响应统一使用前端代理 DTO。
 func (s *Server) RegisterProxyActionRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/proxies/{id}/references", s.proxyMigrationPreview)
+	mux.HandleFunc("POST /api/proxies/{id}/migrate-delete", s.migrateAndDeleteProxy)
 	mux.HandleFunc("POST /api/proxies/batch", s.batchCreateProxies)
 	mux.HandleFunc("GET /api/proxies/warp-health-policy", s.globalWarpHealthPolicy)
 	mux.HandleFunc("PUT /api/proxies/warp-health-policy", s.globalWarpHealthPolicy)

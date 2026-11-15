@@ -188,7 +188,8 @@ func TestWarpToolProcess(t *testing.T) {
 			logCall("probe")
 			warp := "on"
 			_, failProbe := os.Stat(filepath.Join(filepath.Dir(args[1]), "synthetic-bad-probe"))
-			if mode == "probe-fail" || failProbe == nil {
+			_, recovered := os.Stat(filepath.Join(filepath.Dir(args[1]), "synthetic-recovered"))
+			if mode == "probe-fail" && recovered != nil || failProbe == nil {
 				warp = "off"
 			}
 			body := "ip=8.8.8.8\nwarp=" + warp + "\n"
@@ -244,6 +245,59 @@ func warpFixtureSubprocess(t *testing.T) bool {
 		t.Fatalf("合成工具隔离进程失败: %v", err)
 	}
 	return true
+}
+
+func TestProxyPGWarpCreateProbeFailureRecoversSameProcess(t *testing.T) {
+	if warpFixtureSubprocess(t) {
+		return
+	}
+	t.Setenv("ARTEX_PG_DSN", os.Getenv("ARTEX_WARP_CHILD_DSN"))
+	s, mux := proxyIntegration(t)
+	t.Setenv("ARTEX_WARP_CALL_LOG", filepath.Join(t.TempDir(), "calls.log"))
+	t.Setenv("ARTEX_WARP_FIXTURE_MODE", "probe-fail")
+	code, out, raw := warpCreateHTTP(t, mux, uuid.NewString(), `{"name":"failed-probe-recovery","kind":"warp","accept_terms":true}`, false)
+	if code != 502 {
+		t.Fatalf("expected failed create: %d %s", code, raw)
+	}
+	id := proxyResponseID(t, out["proxy"].(map[string]any), "id")
+	rt, err := s.m.proxyRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = rt.warp.Stop(context.Background(), warpProfileID(id))
+		_ = s.m.pg.DeleteProxy(id)
+	})
+	state, err := s.m.pg.WarpHealth(t.Context(), id)
+	if err != nil || !state.Desired || state.Material == "" {
+		t.Fatalf("运行意图被丢弃: %+v %v", state, err)
+	}
+	p, err := s.m.pg.GetProxy(id)
+	if err != nil || p.Host == "" || p.Port == 0 || p.Password == "" || p.Status != db.ProxyStatusFailed {
+		t.Fatalf("未保存失败状态及认证连接: %v", err)
+	}
+	dir := filepath.Join(os.Getenv("ARTEX_WARP_DIR"), warpProfileID(id))
+	before, err := os.ReadFile(filepath.Join(dir, "process.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, "synthetic-recovered"), []byte("on"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = rt.health.ProbeOnlyNow(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	state, err = s.m.pg.WarpHealth(t.Context(), id)
+	if err != nil || state.State != "ready" || state.EgressIP == "" {
+		t.Fatalf("未自动复测恢复: %+v %v", state, err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "process.json"))
+	if err != nil || string(before) != string(after) {
+		t.Fatal("恢复更换了进程")
+	}
+	if _, err = rt.warp.Connection(warpProfileID(id)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestProxyPGWarpOneClick(t *testing.T) {

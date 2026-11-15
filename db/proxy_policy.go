@@ -52,6 +52,8 @@ type ProxyPolicy struct {
 	ExitVerifiedAt          *time.Time
 	SwitchToken             string
 	GroupRevisions          map[int64]int64
+	// 仅迁移意图持久化此约束，普通人工策略不受影响。
+	MigrationTargetFingerprint string `json:",omitempty"`
 }
 type ProxyPolicyPatch struct {
 	Mode                    TaskProxyMode
@@ -440,6 +442,18 @@ func policyActivitiesIdleTx(tx *sql.Tx, p ProxyPolicy) error {
 	return nil
 }
 func (x *ProxyPolicyExecutor) Begin(expected int64, patch ProxyPolicyPatch) (ProxyPolicy, string, error) {
+	return x.begin(expected, patch, 0)
+}
+
+// BeginMigration 在主体执行器的生命周期事务内检查来源与健康目标。
+func (x *ProxyPolicyExecutor) BeginMigration(expected, from, target int64) (ProxyPolicy, string, error) {
+	if from <= 0 || target <= 0 {
+		return ProxyPolicy{}, "", ErrProxyUnavailable
+	}
+	return x.begin(expected, ProxyPolicyPatch{Mode: TaskProxyModeFixed, ProxyID: &target}, from)
+}
+
+func (x *ProxyPolicyExecutor) begin(expected int64, patch ProxyPolicyPatch, migrationFrom int64) (ProxyPolicy, string, error) {
 	var old ProxyPolicy
 	var token string
 	err := x.x.d.withProxySwitchLifecycle(x.x.conn, func(tx *sql.Tx) error {
@@ -460,11 +474,25 @@ func (x *ProxyPolicyExecutor) Begin(expected int64, patch ProxyPolicyPatch) (Pro
 		if e = policyIdleTx(tx, old); e != nil {
 			return e
 		}
+		fingerprint := ""
+		if migrationFrom != 0 {
+			if old.State.ID == nil || *old.State.ID != migrationFrom || patch.ProxyID == nil {
+				return ErrProxyRevisionConflict
+			}
+			if e = migrationTargetTx(context.Background(), tx, migrationFrom, *patch.ProxyID); e != nil {
+				return e
+			}
+			fingerprint, e = proxyMigrationFingerprintTx(tx, *patch.ProxyID)
+			if e != nil {
+				return e
+			}
+		}
 		target, e := prepareProxyPolicyTx(tx, old, patch)
 		if e != nil {
 			return e
 		}
 		target.State.Revision = expected + 1
+		target.MigrationTargetFingerprint = fingerprint
 		// 预选不能提前改已提交授权，目标的完整版本只作为持久意图保存。
 		if e = setPolicyGroupsTx(tx, target.ID, target.AllowedGroupIDs); e != nil {
 			return e
@@ -515,6 +543,21 @@ func (x *ProxyPolicyExecutor) Complete(expected int64, token string) (ProxyPolic
 		}
 		if p.ID != old.ID || p.Subject != old.Subject {
 			return ErrProxySwitchRecovery
+		}
+		if p.MigrationTargetFingerprint != "" {
+			if old.State.ID == nil || p.State.ID == nil {
+				return ErrProxySwitchRecovery
+			}
+			if e = migrationTargetTx(context.Background(), tx, *old.State.ID, *p.State.ID); e != nil {
+				return e
+			}
+			fingerprint, e := proxyMigrationFingerprintTx(tx, *p.State.ID)
+			if e != nil {
+				return e
+			}
+			if fingerprint != p.MigrationTargetFingerprint {
+				return ErrProxyRevisionConflict
+			}
 		}
 		if e = setPolicyGroupsTx(tx, p.ID, p.AllowedGroupIDs); e != nil {
 			return e

@@ -353,6 +353,13 @@ export const api = {
   proxy: (id: string) => get<ProxyRecord>(`/proxies/${encodeURIComponent(id)}`),
   updateProxy: (id: string, input: ProxyWriteInput) => put<ProxyRecord>(`/proxies/${encodeURIComponent(id)}`, input),
   deleteProxy: (id: string) => del<{ deleted: string }>(`/proxies/${encodeURIComponent(id)}`),
+  proxyReferences: (id: string) =>
+    get<import("./proxy-migration").ProxyMigrationPreview>(`/proxies/${encodeURIComponent(id)}/references`),
+  migrateDeleteProxy: (id: string, target: string, token: string) =>
+    post<import("./proxy-migration").ProxyMigrationResult>(`/proxies/${encodeURIComponent(id)}/migrate-delete`, {
+      target_proxy_id: target,
+      preview_token: token,
+    }),
   testProxy: (id: string) => post<ProxyRecord>(`/proxies/${encodeURIComponent(id)}/test`),
   setGlobalProxy: (proxyId: string | null) =>
     put<{ global_proxy_id: string | null }>("/proxies/global", { proxy_id: proxyId }),

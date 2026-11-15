@@ -59,6 +59,7 @@ import {
   warpAllowedActions,
   warpReady,
 } from "@/lib/proxy-center";
+import { migrationResults, type ProxyMigrationPreview } from "@/lib/proxy-migration";
 import type { ProxyKind, ProxyRecord } from "@/lib/types";
 import { WarpCreateIntent, type WarpCreateStage, type WarpIntent } from "@/lib/warp-create-intent";
 import { warpCreateFailure } from "@/lib/warp-create-result";
@@ -114,6 +115,30 @@ export function ProxyCenter() {
   const [loadError, setLoadError] = React.useState("");
   const [busy, setBusy] = React.useState("");
   const [deleting, setDeleting] = React.useState<ProxyRecord | null>(null);
+  const [deletePreview, setDeletePreview] = React.useState<ProxyMigrationPreview | null>(null);
+  const [deleteError, setDeleteError] = React.useState("");
+  const [deleteTarget, setDeleteTarget] = React.useState("");
+  const [deleteResults, setDeleteResults] = React.useState<string[]>([]);
+  React.useEffect(() => {
+    let active = true;
+    setDeletePreview(null);
+    setDeleteError("");
+    setDeleteTarget("");
+    setDeleteResults([]);
+    if (deleting) {
+      api
+        .proxyReferences(deleting.id)
+        .then((value) => {
+          if (active) setDeletePreview(value);
+        })
+        .catch((error) => {
+          if (active) setDeleteError(errorText(error));
+        });
+    }
+    return () => {
+      active = false;
+    };
+  }, [deleting]);
   const [releasing, setReleasing] = React.useState<string | null>(null);
   const [releaseReadback, setReleaseReadback] = React.useState<string[]>([]);
   const releaseSubmitted = React.useRef(new Set<string>());
@@ -481,13 +506,20 @@ export function ProxyCenter() {
     mutationLock.current = true;
     setBusy(`delete:${item.id}`);
     try {
-      await api.deleteProxy(item.id);
+      if (!deletePreview) throw new Error("请先读取引用预览");
+      if (deletePreview.subjects.length + deletePreview.configs.length > 0) {
+        const result = await api.migrateDeleteProxy(item.id, deleteTarget, deletePreview.token);
+        if (!result.deleted) throw new Error("迁移尚未完成，旧代理已保留");
+      } else await api.deleteProxy(item.id);
       mutationLock.current = false;
       if (editing?.id === item.id) reset();
       setDeleting(null);
       toast.success(`代理 #${item.id} 已删除`);
       await refreshAfterMutation();
     } catch (error) {
+      setDeleteError(errorText(error));
+      setDeletePreview(null);
+      setDeleteResults(migrationResults(error instanceof APIError ? error.payload : null));
       toast.error(`删除失败：${errorText(error)}`);
     } finally {
       mutationLock.current = false;
@@ -1091,20 +1123,91 @@ export function ProxyCenter() {
               {deleting?.kind === "warp"
                 ? "删除会自动断开 WARP 出口并清理本地注册档案。"
                 : "删除后此代理将从代理中心移除。"}
-              正在创建、被任务或渠道引用、设为全局默认的代理无法删除，请先解除引用。
+              有引用时可迁移到健康替代代理后删除。任务和对话将固定到所选代理；原暂停状态保持不变。
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {!deletePreview && !deleteError && <p className="text-sm">正在读取引用…</p>}
+          {deleteError && (
+            <p role="alert" className="text-destructive text-sm">
+              {deleteError}
+            </p>
+          )}
+          {deleteResults.length > 0 && (
+            <ul className="max-h-48 space-y-1 overflow-auto text-sm">
+              {deleteResults.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+          )}
+          {deletePreview && (
+            <div className="space-y-3 text-sm">
+              <ul className="max-h-48 space-y-1 overflow-auto">
+                {[...deletePreview.subjects, ...deletePreview.configs].map((ref) => (
+                  <li key={`${ref.kind}:${ref.id}`}>
+                    {ref.kind} #{ref.id} · {ref.name}
+                  </li>
+                ))}
+              </ul>
+              {deletePreview.blockers.map((message) => (
+                <p key={message} className="text-destructive">
+                  {message}
+                </p>
+              ))}
+              {deletePreview.subjects.length + deletePreview.configs.length > 0 && (
+                <div className="space-y-2">
+                  <Label htmlFor="proxy-delete-target">替代代理</Label>
+                  <select
+                    id="proxy-delete-target"
+                    className="w-full rounded border bg-background p-2"
+                    value={deleteTarget}
+                    onChange={(event) => setDeleteTarget(event.target.value)}
+                    disabled={!!busy}
+                  >
+                    <option value="">选择已检测健康的代理</option>
+                    {items
+                      .filter(
+                        (item) =>
+                          item.id !== deleting?.id &&
+                          item.kind !== "resin" &&
+                          item.status === "healthy" &&
+                          selectable(item),
+                      )
+                      .map((item) => (
+                        <option key={item.id} value={item.id}>
+                          #{item.id} {item.name}
+                        </option>
+                      ))}
+                  </select>
+                  <p className="text-muted-foreground">
+                    请先暂停运行中的引用任务并等待真实操作退出。部分失败会保留旧代理及成功的迁移，刷新后可继续。
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
           <AlertDialogFooter>
+            <Button
+              variant="outline"
+              disabled={!!busy}
+              onClick={() => setDeleting((item) => (item ? { ...item } : null))}
+            >
+              刷新引用
+            </Button>
             <AlertDialogCancel disabled={!!busy}>取消</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
-              disabled={!!busy}
+              disabled={
+                !!busy ||
+                !deletePreview ||
+                deletePreview.blockers.length > 0 ||
+                (deletePreview.subjects.length + deletePreview.configs.length > 0 && !deleteTarget)
+              }
               onClick={(event) => {
                 event.preventDefault();
                 if (deleting) void remove(deleting);
               }}
             >
-              {busy.startsWith("delete:") ? "删除中…" : "确认删除"}
+              {busy.startsWith("delete:") ? "处理中…" : "确认迁移 / 删除"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

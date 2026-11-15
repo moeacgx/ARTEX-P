@@ -269,11 +269,25 @@ func TestWarpHealthAuthenticatedTLSRequiresPublicIPAndWarp(t *testing.T) {
 	if ip, err := probeWarpTrace(t.Context(), bad, server.URL+"/trace", trust); err == nil || ip != "" || strings.Contains(err.Error(), bad.Password) {
 		t.Fatalf("认证失败未封闭/脱敏: %q %v", ip, err)
 	}
-	if _, err := probeWarpTrace(t.Context(), connection, server.URL+"/trace", nil); err == nil {
-		t.Fatal("未校验证书")
+	if _, err := probeWarpTrace(t.Context(), connection, server.URL+"/trace", nil); err == nil || !strings.Contains(err.Error(), "证书") {
+		t.Fatalf("未校验或未分类证书错误: %v", err)
 	}
 	if _, err := probeWarpTrace(t.Context(), connection, server.URL+"/redirect", trust); err == nil {
 		t.Fatal("接受重定向")
+	}
+}
+
+func TestWarpProbeFailureSummaryRedactsUnknownErrors(t *testing.T) {
+	if got := warpProbeFailure(context.Background(), errors.New("socks5://user:private-secret@host"), true); strings.Contains(got, "private-secret") {
+		t.Fatal("原始连接错误泄露")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := warpProbeFailure(ctx, nil, true); !strings.Contains(got, "取消") {
+		t.Fatal(got)
+	}
+	if got := warpProbeFailure(context.Background(), nil, false); !strings.Contains(got, "退出") {
+		t.Fatal(got)
 	}
 }
 
@@ -353,6 +367,52 @@ func realHealthManager(t *testing.T) (*WarpManager, *atomic.Value) {
 		}
 	})
 	return m, body
+}
+
+func TestWarpStartProbeFailureKeepsProcessForRecovery(t *testing.T) {
+	m, body := realHealthManager(t)
+	body.Store("ip=8.8.8.8\nwarp=off\n")
+	p, err := m.Start(t.Context(), "real")
+	if err == nil || p.Phase != "failed" || p.EgressIP != "" {
+		t.Fatalf("失败出口不得准入: %+v %v", p, err)
+	}
+	proc := m.process("real")
+	if proc == nil {
+		t.Fatal("首次出口探测失败不应终止存活的 WireProxy")
+	}
+	if _, err = m.Connection("real"); err == nil {
+		t.Fatal("失败出口不得返回可用连接")
+	}
+	connection, err := m.ConfiguredConnection("real")
+	if err != nil || connection.Port == 0 || connection.Password == "" {
+		t.Fatalf("完整材料应可持久化认证连接: %v", err)
+	}
+	body.Store("ip=8.8.8.8\nwarp=on\n")
+	p, err = m.Probe(t.Context(), "real")
+	if err != nil || p.Phase != "ready" || m.process("real") != proc {
+		t.Fatalf("应由同一进程恢复出口: %+v %v", p, err)
+	}
+}
+
+func TestWarpEnsureRunningPreservesLiveProcessAndStoppedIntent(t *testing.T) {
+	m, _ := realHealthManager(t)
+	_, material, err := m.HealthMaterial("real")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.EnsureRunning(t.Context(), "real", material); err != nil {
+		t.Fatal(err)
+	}
+	proc := m.process("real")
+	if _, err = m.EnsureRunning(t.Context(), "real", material); err != nil || m.process("real") != proc {
+		t.Fatalf("重复保活更换进程: %v", err)
+	}
+	if _, err = m.Stop(t.Context(), "real"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.EnsureRunning(t.Context(), "real", material); err == nil || m.process("real") != nil {
+		t.Fatal("保活复活了明确停止的档案")
+	}
 }
 
 func TestWarpHealthRealReconnectReusesMaterialAndWaitsProcess(t *testing.T) {

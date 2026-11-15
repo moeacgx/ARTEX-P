@@ -5,6 +5,7 @@
 
 import type { ChatMention } from "@/lib/chat-mentions";
 import { type LLMProxyRequest, llmProxyWire } from "@/lib/llm-proxy";
+import type { MCPAccessCalls, MCPAccessKey, MCPAccessOverview } from "@/lib/mcp-access";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
 import { downloadSkillArchive } from "@/lib/skill-download";
@@ -280,6 +281,12 @@ export const api = {
   approveLocalAgent: (id: number, scopes: LocalAgentScope[]) =>
     post<{ ok: boolean }>(`/local-agent/devices/${id}/approve`, { scopes }),
   revokeLocalAgent: (id: number) => post<{ ok: boolean }>(`/local-agent/devices/${id}/revoke`),
+
+  mcpAccessOverview: () => get<MCPAccessOverview>("/mcp-access"),
+  mcpAccessCreateKey: (name: string, scopes: string[], days: number) =>
+    post<{ key: MCPAccessKey; token: string }>("/mcp-access/keys", { name, scopes, days }),
+  mcpAccessRevokeKey: (id: number) => post<{ ok: boolean }>(`/mcp-access/keys/${id}/revoke`),
+  mcpAccessCalls: (query: URLSearchParams) => get<MCPAccessCalls>(`/mcp-access/calls?${query}`),
 
   // ---- tasks ----
   tasks: () =>
@@ -976,9 +983,13 @@ export const api = {
       `/chat/mentions?${new URLSearchParams({ kind, q: query, cursor })}`,
       { signal },
     ),
-  chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number,
-    followup?: { intent_id: number; mode: "question" | "execute" }) =>
-    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg, followup }),
+  chat: (
+    message: string,
+    task?: string,
+    attachments?: ChatAttachment[],
+    seg?: number,
+    followup?: { intent_id: number; mode: "question" | "execute" },
+  ) => post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg, followup }),
   chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
   // 方式1 文件上传:落到会话/任务工作目录 uploads/，返回可供 agent Read 的相对路径。
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {

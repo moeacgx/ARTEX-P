@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/config"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver ("pgx")
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 //go:embed schema.sql
@@ -27,6 +29,30 @@ const schemaMigrationLockKey int64 = 7337741001
 // max_connections=100，同时远高于应用自身的嵌套取连接深度（启动期的 schema
 // advisory lock 会在持有一条连接的同时让 seedBuiltins 另取连接），不会自锁。
 const maxOpenConns = 32
+
+// PostgreSQL 的 context cancel 默认会立即打断底层 socket。业务查询经常使用
+// 短超时做探测，恢复后仍复用到被标记为坏连接的会话，表现为“连接被远端强制
+// 关闭”。这里让 pgx 先向服务端发送 cancel request，并给会话留出短暂清理时间；
+// 只有服务端没有及时响应时才用 deadline 兜底。
+const (
+	postgresCancelRequestDelay  = 100 * time.Millisecond
+	postgresCancelDeadlineDelay = 3 * time.Second
+)
+
+func openPostgresDB(dsn string) (*sql.DB, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BuildContextWatcherHandler = func(conn *pgconn.PgConn) ctxwatch.Handler {
+		return &pgconn.CancelRequestContextWatcherHandler{
+			Conn:               conn,
+			CancelRequestDelay: postgresCancelRequestDelay,
+			DeadlineDelay:      postgresCancelDeadlineDelay,
+		}
+	}
+	return stdlib.OpenDB(*cfg), nil
+}
 
 var schemaDeadlockRetryDelays = [...]time.Duration{
 	100 * time.Millisecond,
@@ -117,7 +143,7 @@ func ensureDatabase(dsn string) error {
 	// connect to the postgres maintenance database instead
 	adminDSN := *u
 	adminDSN.Path = "/postgres"
-	admin, err := sql.Open("pgx", adminDSN.String())
+	admin, err := openPostgresDB(adminDSN.String())
 	if err != nil {
 		return nil // best-effort; let Open surface the real error
 	}
@@ -140,7 +166,7 @@ func Open(dsn string) (*DB, error) {
 	if err := ensureDatabase(dsn); err != nil {
 		return nil, err
 	}
-	sqlDB, err := sql.Open("pgx", dsn)
+	sqlDB, err := openPostgresDB(dsn)
 	if err != nil {
 		return nil, err
 	}

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,7 +45,7 @@ var taskOperationLeases = struct {
 var taskOperationLockPools sync.Map // *sql.DB -> *sql.DB
 
 func (d *DB) initTaskOperationLockPool(dsn string) error {
-	pool, err := sql.Open("pgx", dsn)
+	pool, err := openPostgresDB(dsn)
 	if err != nil {
 		return err
 	}
@@ -348,17 +349,17 @@ func (d *DB) AcquireTaskOperation(id int64) (TaskProxyState, error) {
 
 func (d *DB) AcquireTaskOperationContext(ctx context.Context, id int64) (TaskProxyState, error) {
 	var s TaskProxyState
-	lease, freshLease, err := d.acquireTaskOperationSessionContext(ctx, id)
+	lease, _, err := d.acquireTaskOperationSessionContext(ctx, id)
 	if err != nil {
 		return s, err
 	}
 	lease.txMu.Lock()
 	err = d.withProxySwitchLifecycle(lease.conn, func(tx *sql.Tx) error {
 		var err error
-		if freshLease {
-			if err = repairStaleTaskOperationActivityTx(tx, id); err != nil {
-				return err
-			}
+		// 每次准入都检查一次。复用同一会话也不能把上一次异常退出留下的
+		// operation_owners 永久保留下来，否则暂停/删除会持续报活动占用。
+		if err = repairStaleTaskOperationActivityTx(tx, id); err != nil {
+			return err
 		}
 		policy, err := proxyPolicyTx(tx, ProxySubject{Kind: "task", ID: id})
 		if err != nil {
@@ -441,7 +442,14 @@ func isTaskOperationConnectionError(err error) bool {
 	return strings.Contains(msg, "connection is already closed") ||
 		strings.Contains(msg, "bad connection") ||
 		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "connection reset")
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "forcibly closed") ||
+		strings.Contains(msg, "wsarecv") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "server closed the connection") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection timed out") ||
+		strings.Contains(msg, "i/o timeout")
 }
 
 // repairStaleTaskOperationActivityTx removes only owners whose dedicated
@@ -528,7 +536,11 @@ WHERE p.task_id=$1`, taskID)
 	if err != nil {
 		return err
 	}
-	if len(stalePIDs) == 0 {
+	nextActiveCount := int64(0)
+	for _, count := range owners {
+		nextActiveCount += count
+	}
+	if len(stalePIDs) == 0 && activeCount == nextActiveCount {
 		return nil
 	}
 
@@ -552,15 +564,11 @@ WHERE p.task_id=$1`, taskID)
 		return err
 	}
 
-	activeCount = 0
-	for _, count := range owners {
-		activeCount += count
-	}
 	ownersRaw, err = json.Marshal(owners)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(`UPDATE task_operation_activity SET active_count=$2,operation_owners=$3 WHERE task_id=$1`, taskID, activeCount, ownersRaw)
+	_, err = tx.Exec(`UPDATE task_operation_activity SET active_count=$2,operation_owners=$3 WHERE task_id=$1`, taskID, nextActiveCount, ownersRaw)
 	return err
 }
 
@@ -646,6 +654,42 @@ WHERE w.activity_token::text=a.token AND a.policy_id=p.id AND p.task_id=$1`, x.i
 		_, err := tx.Exec(`UPDATE task_operation_activity SET active_count=0,operation_owners='{}'::jsonb WHERE task_id=$1 AND switch_token=''`, x.id)
 		return err
 	})
+}
+
+// RepairStaleTaskOperations runs once at startup before task runtimes are
+// restored. It only removes owners whose dedicated advisory-lock backend is
+// gone; live sessions from another ARTEX instance remain protected.
+func (d *DB) RepairStaleTaskOperations() error {
+	rows, err := d.Query(`SELECT task_id FROM task_operation_activity
+UNION
+SELECT p.task_id FROM proxy_subject_activity a
+JOIN proxy_subject_policies p ON p.id=a.policy_id
+WHERE p.task_id IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	var taskIDs []int64
+	for rows.Next() {
+		var taskID int64
+		if err = rows.Scan(&taskID); err != nil {
+			rows.Close()
+			return err
+		}
+		taskIDs = append(taskIDs, taskID)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, taskID := range taskIDs {
+		if err = d.withProxyLifecycle(func(tx *sql.Tx) error {
+			return repairStaleTaskOperationActivityTx(tx, taskID)
+		}); err != nil {
+			return fmt.Errorf("repair task %d stale operations: %w", taskID, err)
+		}
+	}
+	return nil
 }
 
 // BeginTaskProxySwitch 先检查 CAS，再采样默认，目标和独占意图同事务持久化。

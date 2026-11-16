@@ -269,6 +269,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	} else {
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
+	if s.m.pg != nil {
+		if err := s.m.pg.RepairStaleTaskOperations(); err != nil {
+			log.Printf("[engine] repair stale task operations: %v", err)
+		}
+	}
 	s.restoreTaskRuntimes()
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
@@ -304,7 +309,9 @@ func (s *Server) restoreTaskRuntimes() {
 	// FIFO. Paused loops remain idle; queued tasks are admitted below as slots allow.
 	for _, t := range m.List() {
 		lifecycle := t.lifecycleSnapshot()
-		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
+		// 只有已经真正进入执行态的任务才恢复循环。created 任务尚未完成
+		// 准入，重启时启动它会把用户草稿误当成活动任务。
+		if lifecycle.Status == "running" && !lifecycle.Queued {
 			s.engine.Run(s.ctx, t)
 			if !lifecycle.Paused {
 				// 恢复已有任务也要重读持久图，不能因尚有 open/running 意图跳过 Planner。

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type taskOperationLeaseKey struct {
@@ -44,11 +45,32 @@ var taskOperationLeases = struct {
 // 连接串只由 Open 的实际参数登记，禁止从后来变化的环境变量推断目标库。
 var taskOperationLockPools sync.Map // *sql.DB -> *sql.DB
 
+const taskProxyLifecycleTimeout = 15 * time.Second
+
+type taskProxyLifecycleCommitError struct {
+	err error
+}
+
+func (e *taskProxyLifecycleCommitError) Error() string {
+	return e.err.Error()
+}
+
+func (e *taskProxyLifecycleCommitError) Unwrap() error {
+	return e.err
+}
+
+func isTaskProxyLifecycleCommitError(err error) bool {
+	var commitErr *taskProxyLifecycleCommitError
+	return errors.As(err, &commitErr)
+}
+
 func (d *DB) initTaskOperationLockPool(dsn string) error {
-	pool, err := openPostgresDB(dsn)
+	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		return err
 	}
+	cfg.RuntimeParams["statement_timeout"] = "15000"
+	pool := openPostgresDBConfig(*cfg)
 	pool.SetMaxOpenConns(8)
 	pool.SetMaxIdleConns(1)
 	pool.SetConnMaxIdleTime(time.Minute)
@@ -208,38 +230,82 @@ type TaskProxySwitchExecutor struct {
 }
 
 func (d *DB) AcquireTaskProxySwitchExecutor(ctx context.Context, id int64) (*TaskProxySwitchExecutor, error) {
+	conn, err := d.acquireTaskProxySwitchLockConn(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &TaskProxySwitchExecutor{d: d, conn: conn, id: id, key: taskProxySessionKey(id)}, nil
+}
+
+func (d *DB) acquireTaskProxySwitchLockConn(ctx context.Context, id int64) (*sql.Conn, error) {
 	conn, err := d.taskOperationLockConn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	key := taskProxySessionKey(id)
 	var locked bool
-	if err = conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&locked); err != nil || !locked {
-		conn.Close()
+	lockCtx, cancel := context.WithTimeout(ctx, taskProxyLifecycleTimeout)
+	defer cancel()
+	if err = conn.QueryRowContext(lockCtx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&locked); err != nil || !locked {
+		discardTaskOperationConn(conn)
 		if err != nil {
 			return nil, err
 		}
 		return nil, ErrProxyInUse
 	}
-	return &TaskProxySwitchExecutor{d: d, conn: conn, id: id, key: key}, nil
+	return conn, nil
+}
+
+func discardTaskOperationConn(conn *sql.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	_ = conn.Close()
+}
+
+func (x *TaskProxySwitchExecutor) reconnect(ctx context.Context) error {
+	discardTaskOperationConn(x.conn)
+	conn, err := x.d.acquireTaskProxySwitchLockConn(ctx, x.id)
+	if err != nil {
+		return err
+	}
+	x.conn = conn
+	return nil
 }
 
 func (x *TaskProxySwitchExecutor) Close() {
+	if x == nil || x.conn == nil {
+		return
+	}
 	// 解除失败时丢弃连接，不能把仍持会话锁的连接还回池。
 	var unlocked bool
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := x.conn.QueryRowContext(ctx, `SELECT pg_advisory_unlock($1)`, x.key).Scan(&unlocked); err != nil || !unlocked {
-		_ = x.conn.Raw(func(any) error { return driver.ErrBadConn })
+		discardTaskOperationConn(x.conn)
+		x.conn = nil
+		return
 	}
 	_ = x.conn.Close()
+	x.conn = nil
 }
 
 func (d *DB) withProxySwitchLifecycle(conn *sql.Conn, fn func(*sql.Tx) error) error {
+	return d.withProxySwitchLifecycleContext(context.Background(), conn, fn)
+}
+
+func (d *DB) withProxySwitchLifecycleContext(ctx context.Context, conn *sql.Conn, fn func(*sql.Tx) error) error {
 	if conn == nil {
 		return d.withProxyLifecycle(fn)
 	}
-	tx, err := conn.BeginTx(context.Background(), nil)
+	txContext, cancel := context.WithTimeout(ctx, taskProxyLifecycleTimeout)
+	defer cancel()
+	if err := setPostgresConnDeadline(conn, time.Now().Add(taskProxyLifecycleTimeout)); err != nil {
+		return err
+	}
+	defer setPostgresConnDeadline(conn, time.Time{}) //nolint:errcheck
+	tx, err := conn.BeginTx(txContext, nil)
 	if err != nil {
 		return err
 	}
@@ -250,7 +316,10 @@ func (d *DB) withProxySwitchLifecycle(conn *sql.Conn, fn func(*sql.Tx) error) er
 	if err = fn(tx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return &taskProxyLifecycleCommitError{err: err}
+	}
+	return nil
 }
 
 func (x *TaskProxySwitchExecutor) Begin(expected int64, mode TaskProxyMode, id *int64) (TaskProxyState, string, error) {
@@ -348,13 +417,35 @@ func (d *DB) AcquireTaskOperation(id int64) (TaskProxyState, error) {
 }
 
 func (d *DB) AcquireTaskOperationContext(ctx context.Context, id int64) (TaskProxyState, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		state, retry, err := d.acquireTaskOperationOnce(ctx, id)
+		if err == nil {
+			return state, nil
+		}
+		lastErr = err
+		if !retry || ctx.Err() != nil || isTaskProxyLifecycleCommitError(err) {
+			return state, err
+		}
+		timer := time.NewTimer(postgresConnectRetryDelays[attempt])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return state, lastErr
+		case <-timer.C:
+		}
+	}
+	return TaskProxyState{}, lastErr
+}
+
+func (d *DB) acquireTaskOperationOnce(ctx context.Context, id int64) (TaskProxyState, bool, error) {
 	var s TaskProxyState
 	lease, _, err := d.acquireTaskOperationSessionContext(ctx, id)
 	if err != nil {
-		return s, err
+		return s, isTaskOperationConnectionError(err), err
 	}
 	lease.txMu.Lock()
-	err = d.withProxySwitchLifecycle(lease.conn, func(tx *sql.Tx) error {
+	err = d.withProxySwitchLifecycleContext(ctx, lease.conn, func(tx *sql.Tx) error {
 		var err error
 		// 每次准入都检查一次。复用同一会话也不能把上一次异常退出留下的
 		// operation_owners 永久保留下来，否则暂停/删除会持续报活动占用。
@@ -417,7 +508,8 @@ operation_owners=jsonb_set(task_operation_activity.operation_owners,ARRAY[pg_bac
 	})
 	lease.txMu.Unlock()
 	if err != nil {
-		if isTaskOperationConnectionError(err) {
+		connectionError := isTaskOperationConnectionError(err)
+		if connectionError {
 			taskOperationLeases.Lock()
 			if current := taskOperationLeases.sessions[d.DB]; current == lease.session {
 				d.dropTaskOperationSessionLocked(current)
@@ -427,8 +519,9 @@ operation_owners=jsonb_set(task_operation_activity.operation_owners,ARRAY[pg_bac
 		} else {
 			_ = d.releaseTaskOperationSession(id)
 		}
+		return s, connectionError && !isTaskProxyLifecycleCommitError(err), err
 	}
-	return s, err
+	return s, false, nil
 }
 
 func isTaskOperationConnectionError(err error) bool {
@@ -436,6 +529,9 @@ func isTaskOperationConnectionError(err error) bool {
 		return false
 	}
 	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
+		return true
+	}
+	if isPostgresConnectionFailure(err) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
@@ -636,24 +732,50 @@ operation_owners=CASE WHEN $2=1 THEN operation_owners-pg_backend_pid()::text ELS
 }
 
 func (x *TaskProxySwitchExecutor) ClearStaleTaskOperations() error {
-	return x.d.withProxySwitchLifecycle(x.conn, func(tx *sql.Tx) error {
-		// 与主体活动在同一事务内释放原 token，避免留下永久阻塞 WARP 恢复的孤立引用。
-		if err := warpHealthLock(context.Background(), tx); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM warp_proxy_health_activity w USING proxy_subject_activity a,proxy_subject_policies p
+	clear := func(ctx context.Context) error {
+		return x.d.withProxySwitchLifecycleContext(ctx, x.conn, func(tx *sql.Tx) error {
+			// 与主体活动在同一事务内释放原 token，避免留下永久阻塞 WARP 恢复的孤立引用。
+			if err := warpHealthLock(ctx, tx); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM warp_proxy_health_activity w USING proxy_subject_activity a,proxy_subject_policies p
 WHERE w.activity_token::text=a.token AND a.policy_id=p.id AND p.task_id=$1`, x.id); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM task_proxy_activity WHERE task_id=$1`, x.id); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM proxy_subject_activity WHERE policy_id=(SELECT id FROM proxy_subject_policies WHERE task_id=$1)`, x.id); err != nil {
+				return err
+			}
+			_, err := tx.Exec(`UPDATE task_operation_activity SET active_count=0,operation_owners='{}'::jsonb WHERE task_id=$1 AND switch_token=''`, x.id)
+			return err
+		})
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), taskProxyLifecycleTimeout+5*time.Second)
+		err := clear(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isTaskOperationConnectionError(err) {
 			return err
 		}
-		if _, err := tx.Exec(`DELETE FROM task_proxy_activity WHERE task_id=$1`, x.id); err != nil {
-			return err
+		reconnectCtx, reconnectCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err = x.reconnect(reconnectCtx)
+		reconnectCancel()
+		if err != nil {
+			return errors.Join(lastErr, err)
 		}
-		if _, err := tx.Exec(`DELETE FROM proxy_subject_activity WHERE policy_id=(SELECT id FROM proxy_subject_policies WHERE task_id=$1)`, x.id); err != nil {
-			return err
+		select {
+		case <-time.After(postgresConnectRetryDelays[attempt]):
 		}
-		_, err := tx.Exec(`UPDATE task_operation_activity SET active_count=0,operation_owners='{}'::jsonb WHERE task_id=$1 AND switch_token=''`, x.id)
-		return err
-	})
+	}
+	return lastErr
 }
 
 // RepairStaleTaskOperations runs once at startup before task runtimes are

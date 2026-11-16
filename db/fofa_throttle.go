@@ -13,7 +13,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/stdlib"
 )
 
 var ErrFOFAThrottle = errors.New("FOFA 节流状态不可用，未放行请求")
@@ -39,11 +38,11 @@ func (d *DB) fofaThrottleConn(ctx context.Context) (*sql.Conn, error) {
 	}
 	var config *pgx.ConnConfig
 	err = source.Raw(func(raw any) error {
-		conn, ok := raw.(*stdlib.Conn)
+		cfg, ok := postgresConfigFromRaw(raw)
 		if !ok {
 			return ErrFOFAThrottle
 		}
-		config = conn.Conn().Config().Copy()
+		config = cfg
 		return nil
 	})
 	_ = source.Close()
@@ -51,7 +50,7 @@ func (d *DB) fofaThrottleConn(ctx context.Context) (*sql.Conn, error) {
 		d.fofaPoolMu.Unlock()
 		return nil, err
 	}
-	pool := stdlib.OpenDB(*config)
+	pool := openPostgresDBConfig(*config)
 	pool.SetMaxOpenConns(4)
 	pool.SetMaxIdleConns(2)
 	pool.SetConnMaxIdleTime(time.Minute)

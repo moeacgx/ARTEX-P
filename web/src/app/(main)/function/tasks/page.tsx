@@ -310,6 +310,9 @@ function compareTasks(left: Task, right: Task, field: TaskSortField, direction: 
 export default function TasksPage() {
   const [activeTab, setActiveTab] = React.useState("current");
   const [tasks, setTasks] = React.useState<Task[]>([]);
+  const [tasksLoaded, setTasksLoaded] = React.useState(false);
+  const [tasksLoading, setTasksLoading] = React.useState(true);
+  const [tasksError, setTasksError] = React.useState("");
   const [categories, setCategories] = React.useState<TaskCategory[]>([]);
   const [categoriesLoaded, setCategoriesLoaded] = React.useState(false);
   const [query, setQuery] = React.useState("");
@@ -457,19 +460,30 @@ export default function TasksPage() {
   // POLL_MS but usually comes back unchanged, and setTasks on an identical payload would
   // re-render the whole page for nothing. Bail out when it matches.
   const lastRef = React.useRef<string>("");
+  const loadingRef = React.useRef(false);
 
   const load = React.useCallback(() => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    setTasksLoading(true);
     api
       .tasks()
       .then((r) => {
         const next = r.tasks.map((t) => (t.id === r.active ? { ...t, active: true } : t));
         const sig = JSON.stringify(next);
-        if (sig === lastRef.current) return;
-        lastRef.current = sig;
-        setTasks(next);
+        if (sig !== lastRef.current) {
+          lastRef.current = sig;
+          setTasks(next);
+        }
+        setTasksLoaded(true);
+        setTasksError("");
       })
-      .catch(() => {
-        // Polling is best-effort; the next interval retries automatically.
+      .catch((error: unknown) => {
+        setTasksError(error instanceof Error && error.message ? error.message : "任务列表暂时无法加载");
+      })
+      .finally(() => {
+        loadingRef.current = false;
+        setTasksLoading(false);
       });
   }, []);
 
@@ -917,7 +931,32 @@ export default function TasksPage() {
               />
             </div>
 
-            {tasks.length === 0 ? (
+            {tasksError && tasks.length > 0 && (
+              <div className="mx-4 mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-300/70 bg-amber-50 px-4 py-3 text-sm text-amber-900 lg:mx-6 dark:border-amber-800/60 dark:bg-amber-950/30 dark:text-amber-200">
+                <span role="status">刷新失败：{tasksError}。当前保留上次成功加载的任务。</span>
+                <Button size="sm" variant="outline" disabled={tasksLoading} onClick={load}>
+                  {tasksLoading && <Loader2Icon data-icon="inline-start" className="animate-spin" />}
+                  重新加载
+                </Button>
+              </div>
+            )}
+
+            {tasks.length === 0 && tasksError ? (
+              <div className="mx-4 flex flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-amber-400/70 px-4 py-16 text-sm lg:mx-6">
+                <span className="text-muted-foreground" role="alert">
+                  任务列表加载失败：{tasksError}
+                </span>
+                <Button size="sm" variant="outline" disabled={tasksLoading} onClick={load}>
+                  {tasksLoading && <Loader2Icon data-icon="inline-start" className="animate-spin" />}
+                  重新加载
+                </Button>
+              </div>
+            ) : tasks.length === 0 && (tasksLoading || !tasksLoaded) ? (
+              <div className="text-muted-foreground mx-4 flex items-center justify-center gap-2 rounded-lg border border-dashed py-20 text-sm lg:mx-6">
+                <Loader2Icon className="size-4 animate-spin" />
+                正在加载任务
+              </div>
+            ) : tasks.length === 0 ? (
               <div className="text-muted-foreground mx-4 flex items-center justify-center rounded-lg border border-dashed py-20 text-sm lg:mx-6">
                 暂无任务，点击右上角「新建任务」开始。
               </div>

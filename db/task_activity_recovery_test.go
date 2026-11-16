@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -83,6 +84,7 @@ func TestTaskOperationLeaseReconnectsAndClearsDeadOwner(t *testing.T) {
 func seedDeadTaskOperationOwner(t *testing.T, d *DB, task *Task) string {
 	t.Helper()
 	const deadPID int64 = 2147483647
+	deadPIDText := strconv.FormatInt(deadPID, 10)
 	var policyID int64
 	if err := d.QueryRow(`SELECT id FROM proxy_subject_policies WHERE task_id=$1`, task.ID).Scan(&policyID); err != nil {
 		t.Fatal(err)
@@ -91,7 +93,7 @@ func seedDeadTaskOperationOwner(t *testing.T, d *DB, task *Task) string {
 VALUES($1,1,jsonb_build_object($2::text,1))
 ON CONFLICT(task_id) DO UPDATE SET
 active_count=task_operation_activity.active_count+1,
-operation_owners=task_operation_activity.operation_owners || jsonb_build_object($2::text,1)`, task.ID, deadPID); err != nil {
+ operation_owners=task_operation_activity.operation_owners || jsonb_build_object($2::text,1)`, task.ID, deadPIDText); err != nil {
 		t.Fatal(err)
 	}
 	token := uuid.NewString()

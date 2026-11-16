@@ -135,8 +135,102 @@ FROM task_operation_activity WHERE task_id=$1`, task.ID, staleToken).Scan(&owner
 	}
 }
 
+func TestTaskOperationUnknownReferencesRequireManualRecovery(t *testing.T) {
+	for _, scenario := range []struct {
+		name string
+		live bool
+		dead bool
+	}{
+		{name: "unknown_only"},
+		{name: "live_and_unknown", live: true},
+		{name: "dead_and_unknown", dead: true},
+		{name: "live_dead_and_unknown", live: true, dead: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			d, _, task := plannerRunTestDBs(t)
+			if _, err := d.GetProxyPolicy(ProxySubject{Kind: "task", ID: task.ID}); err != nil {
+				t.Fatal(err)
+			}
+			var liveToken string
+			if scenario.live {
+				state, err := d.AcquireTaskOperation(task.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				liveToken = state.OperationToken
+				t.Cleanup(func() {
+					if liveToken != "" {
+						_ = d.ReleaseTaskOperationToken(task.ID, liveToken)
+					}
+				})
+			}
+			if scenario.dead {
+				seedDeadTaskOperationOwner(t, d, task)
+			}
+			if _, err := d.Exec(`INSERT INTO task_operation_activity(task_id,active_count) VALUES($1,1)
+ON CONFLICT(task_id) DO UPDATE SET active_count=task_operation_activity.active_count+1`, task.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.RepairStaleTaskOperations(); err != nil {
+				t.Fatal(err)
+			}
+			var active, owned, deadActivities int
+			if err := d.QueryRow(`SELECT active_count,
+COALESCE((SELECT sum(value::bigint) FROM jsonb_each_text(operation_owners)),0),
+(SELECT count(*) FROM proxy_subject_activity a JOIN proxy_subject_policies p ON p.id=a.policy_id WHERE p.task_id=$1 AND a.backend_pid=2147483647)
+FROM task_operation_activity WHERE task_id=$1`, task.ID).Scan(&active, &owned, &deadActivities); err != nil {
+				t.Fatal(err)
+			}
+			wantActive, wantOwned := 1, 0
+			if scenario.live {
+				wantActive, wantOwned = 2, 1
+			}
+			if active != wantActive || owned != wantOwned || deadActivities != 0 {
+				t.Fatalf("未知引用或存活引用被清除：active=%d owned=%d dead=%d", active, owned, deadActivities)
+			}
+			if state, err := d.AcquireTaskOperation(task.ID); !errors.Is(err, ErrProxySwitchRecovery) {
+				if err == nil {
+					_ = d.ReleaseTaskOperationToken(task.ID, state.OperationToken)
+				}
+				t.Fatalf("未知引用未阻止准入：%v", err)
+			}
+			if scenario.live {
+				if executor, err := d.AcquireTaskProxySwitchExecutor(t.Context(), task.ID); !errors.Is(err, ErrProxyInUse) {
+					if executor != nil {
+						executor.Close()
+					}
+					t.Fatalf("真实操作退出前取得恢复权限：%v", err)
+				}
+				if err := d.ReleaseTaskOperationToken(task.ID, liveToken); err != nil {
+					t.Fatal(err)
+				}
+				liveToken = ""
+			}
+			executor, err := d.AcquireTaskProxySwitchExecutor(t.Context(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = executor.ClearStaleTaskOperations()
+			executor.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			state, err := d.AcquireTaskOperation(task.ID)
+			if err != nil {
+				t.Fatalf("人工恢复后不能准入：%v", err)
+			}
+			if err := d.ReleaseTaskOperationToken(task.ID, state.OperationToken); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestRepairStaleTaskOperationsAtStartup(t *testing.T) {
 	d, _, task := plannerRunTestDBs(t)
+	if _, err := d.GetProxyPolicy(ProxySubject{Kind: "task", ID: task.ID}); err != nil {
+		t.Fatal(err)
+	}
 	seedDeadTaskOperationOwner(t, d, task)
 	if err := d.RepairStaleTaskOperations(); err != nil {
 		t.Fatal(err)

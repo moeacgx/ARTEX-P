@@ -135,8 +135,9 @@ func setPostgresDriverConnDeadline(base driver.Conn, ctx context.Context) error 
 	}
 	deadline := time.Now().Add(postgresOperationTimeout)
 	if ctx != nil {
-		if bounded, ok := ctx.Deadline(); ok {
-			deadline = bounded
+		if _, ok := ctx.Deadline(); ok {
+			// 有期限的操作由 pgx 统一管理取消与 socket 宽限期，避免两套期限竞争。
+			deadline = time.Time{}
 		}
 	}
 	return conn.Conn().PgConn().Conn().SetDeadline(deadline)

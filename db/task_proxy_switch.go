@@ -592,13 +592,21 @@ WHERE l.locktype='advisory'
 		return err
 	}
 	stalePIDs := map[int64]bool{}
-	for rawPID := range owners {
+	staleOwnerCount := int64(0)
+	for rawPID, count := range owners {
+		if count <= 0 {
+			return ErrProxySwitchRecovery
+		}
 		var pid int64
 		pid, err = strconv.ParseInt(rawPID, 10, 64)
 		if err != nil {
 			return err
 		}
 		if !live[pid] {
+			if count > activeCount-staleOwnerCount {
+				return ErrProxySwitchRecovery
+			}
+			staleOwnerCount += count
 			stalePIDs[pid] = true
 			delete(owners, rawPID)
 		}
@@ -632,11 +640,9 @@ WHERE p.task_id=$1`, taskID)
 	if err != nil {
 		return err
 	}
-	nextActiveCount := int64(0)
-	for _, count := range owners {
-		nextActiveCount += count
-	}
-	if len(stalePIDs) == 0 && activeCount == nextActiveCount {
+	// 仅扣除已证实死亡的 owner；无法归属的差额必须留给准入门禁和人工恢复。
+	nextActiveCount := activeCount - staleOwnerCount
+	if len(stalePIDs) == 0 {
 		return nil
 	}
 

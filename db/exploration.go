@@ -502,6 +502,21 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.
 	return n == 1, err
 }
 
+// CompareAndSetIntentStateReason 与 CompareAndSetIntentState 一致，但在同一条 UPDATE 里
+// 写入终止原因（复用 blocked_reason 列，blocked 与 exhausted 均可使用）。reason 为空时清空该列，
+// 因此不会为没有原因的历史数据编造原因。
+func (s *ExplorationStore) CompareAndSetIntentStateReason(id int64, expected, state, reason string) (bool, error) {
+	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state=$1, blocked_reason=NULLIF($6,''), content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END
+WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.expID, expected, terminal, reason)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // IntentCleanup summarizes the blackboard records removed when a user cancels
 // one worker intent. Global assets and traffic are deliberately not part of this
 // operation; exploration anchors disappear only because their owning nodes do.

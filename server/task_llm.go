@@ -142,7 +142,7 @@ func (r *taskLLMRuntime) current(contexts ...context.Context) (taskLLMSelection,
 	}
 	if len(pt.LLMProfileIDs) > 0 {
 		if pt.ActiveLLMProfileID == nil {
-			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
+			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are unavailable (each was marked unavailable earlier by explicit quota evidence or a failed probe)")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
 		selection := db.LLMModelSelection{ProfileID: sel.profileID}

@@ -55,6 +55,7 @@ import { api, sseUrl } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
 import { isBtwCommand } from "@/lib/side-questions";
+import { intentStopReason } from "@/lib/status";
 import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
 import type {
   Activity,
@@ -180,7 +181,7 @@ function statusIcon(status: SessionStatus) {
       return <CircleSlashIcon className="size-3.5 text-amber-500" />;
     case "blocked": // 出错
       return <CircleXIcon className="size-3.5 text-red-500" />;
-    case "exhausted": // 步数耗尽(撞 max_turns)
+    case "exhausted": // 达到运行时间/步数上限或任务超时收尾（与费用预算无关）
       return <ZapOffIcon className="size-3.5 text-violet-500" />;
     case "deleted": // 用户假删除
       return <CircleSlashIcon className="size-3.5 text-muted-foreground" />;
@@ -334,6 +335,7 @@ function intentToSession(n: TaskNode): Session {
     intent_id: n.id,
     source_task_id: n.source_task_id,
     inherited: n.inherited,
+    blocked_reason: n.blocked_reason,
   };
 }
 
@@ -1850,6 +1852,30 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                         {dm.deleteReason}
                       </p>
                     )}
+                  </div>
+                </div>
+              );
+            })()}
+            {(() => {
+              if (active.role !== "worker" || active.inherited) return null;
+              const stop = intentStopReason(active.status, active.blocked_reason);
+              if (!stop) return null;
+              const isBlocked = active.status === "blocked";
+              return (
+                <div
+                  className={cn(
+                    "flex items-start gap-2 border-b px-4 py-2.5 text-xs",
+                    isBlocked ? "border-red-500/30 bg-red-500/5" : "border-violet-500/30 bg-violet-500/5",
+                  )}
+                >
+                  {isBlocked ? (
+                    <CircleXIcon className="mt-0.5 size-3.5 shrink-0 text-red-500" />
+                  ) : (
+                    <ZapOffIcon className="mt-0.5 size-3.5 shrink-0 text-violet-500" />
+                  )}
+                  <div className="min-w-0">
+                    <span className="font-medium">{stop.title}</span>
+                    <p className="mt-1 break-words text-muted-foreground">{stop.detail}</p>
                   </div>
                 </div>
               );

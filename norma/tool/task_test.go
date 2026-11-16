@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -52,7 +53,11 @@ func TestManagerSpawnCompleteNotifies(t *testing.T) {
 	m := newTestManager(t)
 	// Output ("42") deliberately differs from the command text so we can assert the
 	// notification carries the path, not the output.
-	task, err := m.Spawn(SpawnSpec{Command: `expr 6 \* 7`})
+	command := `expr 6 \* 7`
+	if runtime.GOOS == "windows" {
+		command = `Write-Output (6 * 7)`
+	}
+	task, err := m.Spawn(SpawnSpec{Command: command})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -125,33 +130,28 @@ func TestBashForegroundInline(t *testing.T) {
 	}
 }
 
-// A long-running command that exceeds its timeout is moved to the background.
-func TestBashAutoBackgroundOnTimeout(t *testing.T) {
+// A foreground command that exceeds its timeout is terminated rather than
+// silently moved to the background.
+func TestBashForegroundTimeoutKillsTask(t *testing.T) {
 	m := newTestManager(t)
 	tc := &ToolContext{Tasks: m}
+	command := "while true; do echo tick; sleep 0.1; done"
+	if runtime.GOOS == "windows" {
+		command = "while ($true) { Write-Output tick; Start-Sleep -Milliseconds 100 }"
+	}
 	res := runTC(t, NewBash(), tc, map[string]any{
-		"command":    "while true; do echo tick; sleep 0.1; done",
+		"command":    command,
 		"timeout_ms": 300,
 	})
-	if res.IsError || !strings.Contains(res.Flatten(), "background") {
-		t.Fatalf("expected auto-background: %q (err=%v)", res.Flatten(), res.IsError)
+	if !res.IsError || !strings.Contains(res.Flatten(), "timed out") {
+		t.Fatalf("expected timeout error: %q (err=%v)", res.Flatten(), res.IsError)
 	}
-	tasks := m.List()
-	if len(tasks) != 1 || tasks[0].Status != TaskRunning {
-		t.Fatalf("expected 1 running task, got %+v", tasks)
-	}
-	// Stop it.
-	if r := runTC(t, NewTaskStop(), tc, map[string]any{"task_id": tasks[0].ID}); r.IsError {
-		t.Fatalf("TaskStop: %q", r.Flatten())
-	}
-	info := waitTerminal(t, m, tasks[0].ID)
-	if info.Status != TaskKilled {
-		t.Fatalf("expected killed, got %s", info.Status)
+	if tasks := m.List(); len(tasks) != 0 {
+		t.Fatalf("timed-out foreground command should be forgotten, got %+v", tasks)
 	}
 }
 
-// sleep is on the auto-background denylist: a timed-out sleep is killed, not
-// backgrounded, and surfaces a timeout error.
+// A timed-out sleep is killed instead of being moved to the background.
 func TestBashSleepTimesOutNotBackgrounded(t *testing.T) {
 	m := newTestManager(t)
 	tc := &ToolContext{Tasks: m}

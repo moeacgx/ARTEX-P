@@ -116,8 +116,9 @@ type Engine struct {
 	// Every long-lived task goroutine (planner, workers and deadline coordinator)
 	// runs under one task-scoped context. Successful deletion cancels that context,
 	// waits for all goroutines, then releases every task-level Engine reference.
-	runtimeMu sync.Mutex
-	runtimes  map[string]*taskRuntime
+	runtimeMu    sync.Mutex
+	runtimes     map[string]*taskRuntime
+	workerPoolMu sync.Mutex // serializes initial pool creation and live resizing
 
 	// per-task execution context: each planner.Plan / worker.Execute runs under it,
 	// so pausing can CANCEL an in-flight run (not just skip the next one). Recreated
@@ -167,6 +168,13 @@ type taskRuntime struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// Worker loops can be added or retired without restarting the planner.
+	// workerMu protects the maps; wg.Add is performed while deleteMu is held by
+	// the caller so StopTask cannot race WaitGroup.Add with Wait.
+	workerMu      sync.Mutex
+	workerCancels map[string]context.CancelFunc
+	workerSeq     int
 }
 
 type workExecution struct {
@@ -238,18 +246,86 @@ func (e *Engine) registerTaskRoutines(parent context.Context, taskID string, cou
 	rt := e.runtimes[taskID]
 	if rt == nil {
 		ctx, cancel := context.WithCancel(parent)
-		rt = &taskRuntime{ctx: ctx, cancel: cancel}
+		rt = &taskRuntime{ctx: ctx, cancel: cancel, workerCancels: map[string]context.CancelFunc{}}
 		e.runtimes[taskID] = rt
+	}
+	if rt.workerCancels == nil {
+		rt.workerCancels = map[string]context.CancelFunc{}
 	}
 	rt.wg.Add(count)
 	return rt
 }
 
 func runTaskRoutine(rt *taskRuntime, fn func(context.Context)) {
+	runTaskRoutineWithContext(rt, rt.ctx, fn)
+}
+
+func runTaskRoutineWithContext(rt *taskRuntime, ctx context.Context, fn func(context.Context)) {
 	go func() {
 		defer rt.wg.Done()
-		fn(rt.ctx)
+		fn(ctx)
 	}()
+}
+
+// startWorkerLocked adds one worker loop. The caller must hold deleteMu for
+// reading (Run or ScaleWorkers does this) and rt.workerMu.
+func (e *Engine) startWorkerLocked(rt *taskRuntime, t *Task) string {
+	rt.workerSeq++
+	name := fmt.Sprintf("work#%d", rt.workerSeq)
+	workerCtx, cancel := context.WithCancel(rt.ctx)
+	if rt.workerCancels == nil {
+		rt.workerCancels = map[string]context.CancelFunc{}
+	}
+	rt.workerCancels[name] = cancel
+
+	rt.wg.Add(1)
+	runTaskRoutineWithContext(rt, workerCtx, func(loopCtx context.Context) {
+		e.workerLoop(loopCtx, t, name)
+	})
+	return name
+}
+
+// ScaleWorkers changes the live worker pool for a task. It is called after the
+// settings API persists a new global worker count. A task that has not started
+// yet is ignored and will read the new value in Engine.Run.
+func (e *Engine) ScaleWorkers(t *Task, desired int) {
+	if e == nil || t == nil || desired <= 0 {
+		return
+	}
+	e.deleteMu.RLock()
+	defer e.deleteMu.RUnlock()
+	if e.shuttingDown || e.IsDeleting(t.ID) {
+		return
+	}
+	e.workerPoolMu.Lock()
+	defer e.workerPoolMu.Unlock()
+	if _, ok := e.started.Load(t.ID); !ok {
+		return
+	}
+	e.runtimeMu.Lock()
+	rt := e.runtimes[t.ID]
+	e.runtimeMu.Unlock()
+	if rt == nil {
+		return
+	}
+	rt.workerMu.Lock()
+	defer rt.workerMu.Unlock()
+	current := len(rt.workerCancels)
+	if desired > current {
+		for i := current; i < desired; i++ {
+			e.startWorkerLocked(rt, t)
+		}
+	} else if desired < current {
+		retire := current - desired
+		for name, cancel := range rt.workerCancels {
+			if retire == 0 {
+				break
+			}
+			delete(rt.workerCancels, name)
+			cancel()
+			retire--
+		}
+	}
 }
 
 // StopTask permanently stops every long-lived goroutine and removes all Engine
@@ -780,32 +856,40 @@ func (e *Engine) ReadyFor(t *Task) bool {
 // but no-op until an LLM is configured (so a task created while idle picks up
 // automatically once LLM is set from the UI).
 func (e *Engine) Run(ctx context.Context, t *Task) {
-	workers := e.m.Workers()
 	e.deleteMu.RLock()
 	if e.shuttingDown || e.IsDeleting(t.ID) {
 		e.deleteMu.RUnlock()
 		return
 	}
-	if _, loaded := e.started.LoadOrStore(t.ID, true); loaded {
+	e.workerPoolMu.Lock()
+	if _, loaded := e.started.Load(t.ID); loaded {
+		e.workerPoolMu.Unlock()
 		e.deleteMu.RUnlock()
 		t.Notify() // already running — just nudge a planning round
 		return
 	}
-	rt := e.registerTaskRoutines(ctx, t.ID, 1+workers)
+	// Read the setting only after entering the pool initialization section. A
+	// settings update that lands while we wait is either observed here or applied
+	// by ScaleWorkers after we publish the initial pool.
+	workers := e.m.Workers()
+	rt := e.registerTaskRoutines(ctx, t.ID, 1)
 	e.proxyReleaseWG.Add(1)
-	e.deleteMu.RUnlock()
+	e.started.Store(t.ID, true)
+	e.touch(t.ID)
+	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
+	rt.workerMu.Lock()
+	for i := 0; i < workers; i++ {
+		e.startWorkerLocked(rt, t)
+	}
+	rt.workerMu.Unlock()
 	go func() {
 		defer e.proxyReleaseWG.Done()
 		<-rt.ctx.Done()
 		rt.wg.Wait()
 		e.requestProxyRelease(t.ID, true)
 	}()
-	e.touch(t.ID)
-	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
-	for i := 0; i < workers; i++ {
-		name := fmt.Sprintf("work#%d", i+1)
-		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, name) })
-	}
+	e.workerPoolMu.Unlock()
+	e.deleteMu.RUnlock()
 	e.startDeadlineCoordinator(ctx, t) // 任务级超时定时器(仅 timeout>0;去重)
 	// 仅在「完全没有活动意图(open+running)」时才 kick 首轮规划。带种子意图的任务:种子已
 	// 是 open,或已被上面刚起的 worker 抢先 claim 成 running——两种都算「有活干」,一律跳过

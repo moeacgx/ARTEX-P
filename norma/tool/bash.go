@@ -24,10 +24,6 @@ var catastrophicBash = []*regexp.Regexp{
 	regexp.MustCompile(`\bdd\b[^\n]*\bof=/dev/(sd|nvme|hd)`),                                       // overwrite a disk
 }
 
-// disallowedAutoBackground lists commands that must never be silently moved to
-// the background on timeout.
-var disallowedAutoBackground = []string{"sleep"}
-
 // NewBash builds the Bash tool: run a shell command with a timeout, optionally in
 // the background.
 func NewBash() CoreTool {
@@ -40,7 +36,7 @@ func NewBash() CoreTool {
 	if !BackgroundTasksDisabled() {
 		props["run_in_background"] = map[string]any{
 			"type":        "boolean",
-			"description": "Run in the background and return immediately; read its output later with TaskOutput or Read, and you are notified when it completes. A foreground command that exceeds its timeout is also moved to the background automatically.",
+			"description": "Run in the background and return immediately; read its output later with TaskOutput or Read, and you are notified when it completes. Foreground commands are terminated when their timeout expires.",
 		}
 		desc += " Set run_in_background to return immediately and read the output later."
 	}
@@ -100,7 +96,8 @@ func runBash(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 }
 
 // runBashManaged runs the command through the task manager, supporting explicit
-// background launch and timeout auto-backgrounding.
+// background launch. Foreground timeouts always terminate the complete process
+// tree.
 func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeout time.Duration, explicitBG bool) (Result, error) {
 	spec := SpawnSpec{Command: command, Kind: KindBash, WorkingDir: tc.WorkingDir, Description: short(command), Env: tc.Env}
 
@@ -137,15 +134,12 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 		return Text(Capture(tc, output)), nil
 	}
 
-	// Timed out while still running.
-	if autoBackgroundAllowed(command) {
-		tc.Tasks.Background(t.ID)
-		return Text(fmt.Sprintf(
-			"Command still running after %s; moved to background as %s. Output file: %s\nUse TaskOutput{task_id:%q} to read its output; you are notified when it completes.",
-			timeout, t.ID, t.OutputPath, t.ID)), nil
-	}
+	// Timed out while still running. Never leave an implicit background process
+	// behind: scans and other network-heavy commands would otherwise continue at
+	// full concurrency after the caller has already moved on.
 	out, _ := tc.Tasks.Output(t.ID, 0)
 	tc.Tasks.Kill(t.ID)
+	<-t.done
 	tc.Tasks.Forget(t.ID)
 	return Errorf(Capture(tc, out) + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
 }
@@ -187,23 +181,4 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 		out = "(command produced no output)"
 	}
 	return Text(out), nil
-}
-
-// autoBackgroundAllowed reports whether a timed-out command may be moved to the
-// background instead of being killed.
-func autoBackgroundAllowed(command string) bool {
-	fields := strings.Fields(command)
-	if len(fields) == 0 {
-		return false
-	}
-	base := fields[0]
-	if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
-		base = base[i+1:]
-	}
-	for _, d := range disallowedAutoBackground {
-		if base == d {
-			return false
-		}
-	}
-	return true
 }

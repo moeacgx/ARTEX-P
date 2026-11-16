@@ -5,17 +5,23 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/config"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver ("pgx")
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 //go:embed schema.sql
@@ -27,6 +33,373 @@ const schemaMigrationLockKey int64 = 7337741001
 // max_connections=100，同时远高于应用自身的嵌套取连接深度（启动期的 schema
 // advisory lock 会在持有一条连接的同时让 seedBuiltins 另取连接），不会自锁。
 const maxOpenConns = 32
+
+// PostgreSQL 的 context cancel 默认会立即打断底层 socket。业务查询经常使用
+// 短超时做探测，恢复后仍复用到被标记为坏连接的会话，表现为“连接被远端强制
+// 关闭”。这里让 pgx 先向服务端发送 cancel request，并给会话留出短暂清理时间；
+// 只有服务端没有及时响应时才用 deadline 兜底。
+const (
+	postgresCancelRequestDelay  = 100 * time.Millisecond
+	postgresCancelDeadlineDelay = 3 * time.Second
+	// Windows loopback occasionally drops a SYN. A failed handshake usually
+	// shows up as a 1s or 3s TCP timeout; retrying on a fresh socket recovers
+	// immediately. Keep each attempt short so one lost SYN cannot consume the
+	// caller's whole deadline.
+	postgresConnectTimeout   = 1500 * time.Millisecond
+	postgresStartupTimeout   = 45 * time.Second
+	postgresOperationTimeout = 30 * time.Second
+	postgresResetTimeout     = time.Second
+
+	postgresReuseProbeIdle = 500 * time.Millisecond
+)
+
+var postgresConnectRetryDelays = [...]time.Duration{
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	400 * time.Millisecond,
+	800 * time.Millisecond,
+	time.Second,
+	1500 * time.Millisecond,
+	2 * time.Second,
+}
+
+type retryingPostgresConnector struct {
+	base driver.Connector
+}
+
+func (c retryingPostgresConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	for attempt := 0; ; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, postgresConnectTimeout)
+		conn, err := c.base.Connect(attemptCtx)
+		cancel()
+		if err == nil {
+			if pingErr := pingPostgresConn(ctx, conn); pingErr != nil {
+				_ = conn.Close()
+				err = pingErr
+			} else {
+				retryConn := &retryingPostgresConn{base: conn}
+				retryConn.markUsed()
+				return retryConn, nil
+			}
+		}
+		if ctx.Err() != nil || !isRetryablePostgresConnectError(err) || attempt >= len(postgresConnectRetryDelays) {
+			return nil, err
+		}
+		timer := time.NewTimer(postgresConnectRetryDelays[attempt])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, err
+		case <-timer.C:
+		}
+	}
+}
+
+func pingPostgresConn(ctx context.Context, conn driver.Conn) error {
+	pinger, ok := conn.(driver.Pinger)
+	if !ok {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, postgresConnectTimeout)
+	defer cancel()
+	return pinger.Ping(probeCtx)
+}
+
+func (c retryingPostgresConnector) Driver() driver.Driver {
+	return c.base.Driver()
+}
+
+// retryingPostgresConn marks lost sockets as bad connections before
+// database/sql sees the raw driver error. The standard pgx driver already does
+// this for failures known to happen before a request is sent; Windows loopback
+// resets can also surface while a read-only query is preloading its first row.
+// Returning ErrBadConn lets database/sql discard the poisoned session and retry
+// the query on a fresh connection.
+type retryingPostgresConn struct {
+	base     driver.Conn
+	lastUsed atomic.Int64
+}
+
+func (c *retryingPostgresConn) markUsed() {
+	c.lastUsed.Store(time.Now().UnixNano())
+}
+
+func (c *retryingPostgresConn) idleFor() time.Duration {
+	last := c.lastUsed.Load()
+	if last == 0 {
+		return postgresReuseProbeIdle
+	}
+	return time.Since(time.Unix(0, last))
+}
+
+func setPostgresDriverConnDeadline(base driver.Conn, ctx context.Context) error {
+	conn, ok := base.(*stdlib.Conn)
+	if !ok {
+		return nil
+	}
+	deadline := time.Now().Add(postgresOperationTimeout)
+	if ctx != nil {
+		if bounded, ok := ctx.Deadline(); ok {
+			deadline = bounded
+		}
+	}
+	return conn.Conn().PgConn().Conn().SetDeadline(deadline)
+}
+
+func (c *retryingPostgresConn) Prepare(query string) (driver.Stmt, error) {
+	return c.PrepareContext(context.Background(), query)
+}
+
+func (c *retryingPostgresConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	c.markUsed()
+	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
+		return nil, postgresDriverError(ctx, err)
+	}
+	base, ok := c.base.(driver.ConnPrepareContext)
+	if !ok {
+		stmt, err := c.base.Prepare(query)
+		return stmt, postgresDriverError(ctx, err)
+	}
+	stmt, err := base.PrepareContext(ctx, query)
+	return stmt, postgresDriverError(ctx, err)
+}
+
+func (c *retryingPostgresConn) Close() error {
+	return c.base.Close()
+}
+
+func (c *retryingPostgresConn) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+func (c *retryingPostgresConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	c.markUsed()
+	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
+		return nil, postgresDriverError(ctx, err)
+	}
+	base, ok := c.base.(driver.ConnBeginTx)
+	if !ok {
+		if opts != (driver.TxOptions{}) {
+			return nil, errors.New("postgres driver does not support transaction options")
+		}
+		tx, err := c.base.Begin()
+		return tx, postgresDriverError(ctx, err)
+	}
+	tx, err := base.BeginTx(ctx, opts)
+	return tx, postgresDriverError(ctx, err)
+}
+
+func (c *retryingPostgresConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	c.markUsed()
+	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
+		return nil, postgresDriverError(ctx, err)
+	}
+	base, ok := c.base.(driver.ExecerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	// Exec may mutate data after the request reaches PostgreSQL. Keep the pgx
+	// driver's own SafeToRetry classification and never replay an ambiguous
+	// write here.
+	return base.ExecContext(ctx, query, args)
+}
+
+func (c *retryingPostgresConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	c.markUsed()
+	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
+		return nil, postgresDriverError(ctx, err)
+	}
+	base, ok := c.base.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	rows, err := base.QueryContext(ctx, query, args)
+	return rows, postgresDriverError(ctx, err)
+}
+
+func (c *retryingPostgresConn) Ping(ctx context.Context) error {
+	c.markUsed()
+	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
+		return postgresDriverError(ctx, err)
+	}
+	base, ok := c.base.(driver.Pinger)
+	if !ok {
+		return nil
+	}
+	return postgresDriverError(ctx, base.Ping(ctx))
+}
+
+func (c *retryingPostgresConn) ResetSession(ctx context.Context) error {
+	resetCtx, cancel := context.WithTimeout(ctx, postgresResetTimeout)
+	defer cancel()
+	if base, ok := c.base.(driver.SessionResetter); ok {
+		if err := setPostgresDriverConnDeadline(c.base, resetCtx); err != nil {
+			return postgresSessionDriverError(ctx, resetCtx, err)
+		}
+		if err := base.ResetSession(resetCtx); err != nil {
+			return postgresSessionDriverError(ctx, resetCtx, err)
+		}
+	}
+	if c.idleFor() < postgresReuseProbeIdle {
+		c.markUsed()
+		return nil
+	}
+	if err := setPostgresDriverConnDeadline(c.base, resetCtx); err != nil {
+		return postgresSessionDriverError(ctx, resetCtx, err)
+	}
+	if pinger, ok := c.base.(driver.Pinger); ok {
+		if err := pinger.Ping(resetCtx); err != nil {
+			return postgresSessionDriverError(ctx, resetCtx, err)
+		}
+	}
+	c.markUsed()
+	return nil
+}
+
+func (c *retryingPostgresConn) IsValid() bool {
+	if base, ok := c.base.(driver.Validator); ok && !base.IsValid() {
+		return false
+	}
+	if conn, ok := c.base.(*stdlib.Conn); ok {
+		return !conn.Conn().IsClosed()
+	}
+	return true
+}
+
+func (c *retryingPostgresConn) CheckNamedValue(value *driver.NamedValue) error {
+	base, ok := c.base.(driver.NamedValueChecker)
+	if !ok {
+		return driver.ErrSkip
+	}
+	return base.CheckNamedValue(value)
+}
+
+func postgresDriverError(ctx context.Context, err error) error {
+	if err != nil && ctx.Err() == nil && isPostgresConnectionFailure(err) {
+		return driver.ErrBadConn
+	}
+	return err
+}
+
+func postgresSessionDriverError(parentCtx, resetCtx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if parentCtx.Err() != nil {
+		return err
+	}
+	if resetCtx.Err() != nil || isPostgresConnectionFailure(err) {
+		return driver.ErrBadConn
+	}
+	return err
+}
+
+func isRetryablePostgresConnectError(err error) bool {
+	return isPostgresConnectionFailure(err)
+}
+
+func isPostgresConnectionFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, sql.ErrConnDone) ||
+		errors.Is(err, pgconn.ErrConnClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if pgconn.SafeToRetry(err) || pgconn.Timeout(err) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"dial error",
+		"connection attempt failed",
+		"actively refused",
+		"connection refused",
+		"forcibly closed",
+		"wsarecv",
+		"wsasend",
+		"unexpected eof",
+		"connection reset",
+		"broken pipe",
+		"server closed the connection",
+		"failed to receive message",
+		"conn closed",
+		"bad connection",
+		"connection is already closed",
+		"closed network connection",
+		"i/o timeout",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func openPostgresDB(dsn string) (*sql.DB, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return openPostgresDBConfig(*cfg), nil
+}
+
+func openPostgresDBConfig(cfg pgx.ConnConfig) *sql.DB {
+	cfg.ConnectTimeout = postgresConnectTimeout
+	cfg.BuildContextWatcherHandler = func(conn *pgconn.PgConn) ctxwatch.Handler {
+		return &pgconn.CancelRequestContextWatcherHandler{
+			Conn:               conn,
+			CancelRequestDelay: postgresCancelRequestDelay,
+			DeadlineDelay:      postgresCancelDeadlineDelay,
+		}
+	}
+	return sql.OpenDB(retryingPostgresConnector{base: stdlib.GetConnector(cfg)})
+}
+
+func postgresConfigFromRaw(raw any) (*pgx.ConnConfig, bool) {
+	conn, ok := postgresStdlibConnFromRaw(raw)
+	if !ok {
+		return nil, false
+	}
+	return conn.Conn().Config().Copy(), true
+}
+
+func postgresStdlibConnFromRaw(raw any) (*stdlib.Conn, bool) {
+	for {
+		switch conn := raw.(type) {
+		case *retryingPostgresConn:
+			raw = conn.base
+		case *stdlib.Conn:
+			return conn, true
+		default:
+			return nil, false
+		}
+	}
+}
+
+func setPostgresConnDeadline(conn *sql.Conn, deadline time.Time) error {
+	if conn == nil {
+		return sql.ErrConnDone
+	}
+	return conn.Raw(func(raw any) error {
+		pgConn, ok := postgresStdlibConnFromRaw(raw)
+		if !ok {
+			return errors.New("unexpected PostgreSQL driver connection")
+		}
+		return pgConn.Conn().PgConn().Conn().SetDeadline(deadline)
+	})
+}
 
 var schemaDeadlockRetryDelays = [...]time.Duration{
 	100 * time.Millisecond,
@@ -66,11 +439,17 @@ func withSchemaMigrationLock(ctx context.Context, sqlDB *sql.DB, action func(*sq
 		return err
 	}
 	defer conn.Close()
+	if err = setPostgresConnDeadline(conn, time.Now().Add(postgresStartupTimeout)); err != nil {
+		return err
+	}
+	defer setPostgresConnDeadline(conn, time.Time{}) //nolint:errcheck
 	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, schemaMigrationLockKey); err != nil {
 		return fmt.Errorf("advisory lock: %w", err)
 	}
 	defer func() {
-		if _, unlockErr := conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, schemaMigrationLockKey); unlockErr != nil && err == nil {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, unlockErr := conn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock($1)`, schemaMigrationLockKey); unlockErr != nil && err == nil {
 			err = fmt.Errorf("advisory unlock: %w", unlockErr)
 		}
 	}()
@@ -117,30 +496,51 @@ func ensureDatabase(dsn string) error {
 	// connect to the postgres maintenance database instead
 	adminDSN := *u
 	adminDSN.Path = "/postgres"
-	admin, err := sql.Open("pgx", adminDSN.String())
+	admin, err := openPostgresDB(adminDSN.String())
 	if err != nil {
 		return nil // best-effort; let Open surface the real error
 	}
 	defer admin.Close()
-	if err := admin.Ping(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), postgresStartupTimeout)
+	defer cancel()
+	if err := admin.PingContext(ctx); err != nil {
 		return nil
 	}
 	var exists bool
-	_ = admin.QueryRow(`SELECT true FROM pg_database WHERE datname=$1`, dbName).Scan(&exists)
+	_ = admin.QueryRowContext(ctx, `SELECT true FROM pg_database WHERE datname=$1`, dbName).Scan(&exists)
 	if !exists {
-		if _, err := admin.Exec(`CREATE DATABASE "` + dbName + `"`); err != nil {
+		if _, err := admin.ExecContext(ctx, `CREATE DATABASE "`+dbName+`"`); err != nil {
 			return fmt.Errorf("create database %q: %w", dbName, err)
 		}
 	}
 	return nil
 }
 
-// Open connects, applies the schema (idempotent), and seeds builtin rows.
+// Open retries the complete, idempotent initialization against a fresh pool
+// when the local PostgreSQL socket is reset during startup. Schema, migrations,
+// and seed operations are safe to replay; authentication and SQL errors are not
+// retried because isPostgresConnectionFailure rejects server-side errors.
 func Open(dsn string) (*DB, error) {
+	var lastErr error
+	for attempt := 0; attempt <= len(postgresConnectRetryDelays); attempt++ {
+		d, err := openPostgresStore(dsn)
+		if err == nil {
+			return d, nil
+		}
+		lastErr = err
+		if !isPostgresConnectionFailure(err) || attempt >= len(postgresConnectRetryDelays) {
+			return nil, err
+		}
+		time.Sleep(postgresConnectRetryDelays[attempt])
+	}
+	return nil, lastErr
+}
+
+func openPostgresStore(dsn string) (*DB, error) {
 	if err := ensureDatabase(dsn); err != nil {
 		return nil, err
 	}
-	sqlDB, err := sql.Open("pgx", dsn)
+	sqlDB, err := openPostgresDB(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +554,9 @@ func Open(dsn string) (*DB, error) {
 	sqlDB.SetMaxIdleConns(maxOpenConns)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
-	if err := sqlDB.Ping(); err != nil {
+	startupCtx, cancel := context.WithTimeout(context.Background(), postgresStartupTimeout)
+	defer cancel()
+	if err := sqlDB.PingContext(startupCtx); err != nil {
 		sqlDB.Close()
 		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), err)
 	}
@@ -162,23 +564,23 @@ func Open(dsn string) (*DB, error) {
 	// pgx runs multi-statement Exec via the simple protocol when there are no args.
 	// Keep the dedicated lock connection checked out until both DDL and seeding
 	// finish so concurrent application instances cannot initialize out of order.
-	err = withSchemaMigrationLock(context.Background(), sqlDB, func(conn *sql.Conn) error {
-		if err := applySchemaWithRetry(context.Background(), conn, time.Sleep); err != nil {
+	err = withSchemaMigrationLock(startupCtx, sqlDB, func(conn *sql.Conn) error {
+		if err := applySchemaWithRetry(startupCtx, conn, time.Sleep); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
-		if err := d.MigrateLLMModels(context.Background()); err != nil {
+		if err := d.MigrateLLMModels(startupCtx); err != nil {
 			return fmt.Errorf("migrate LLM models: %w", err)
 		}
-		if err := d.MigrateLLMProfileProxies(context.Background()); err != nil {
+		if err := d.MigrateLLMProfileProxies(startupCtx); err != nil {
 			return fmt.Errorf("migrate LLM profile proxies: %w", err)
 		}
-		if err := d.MigrateWarpCreateRequests(context.Background()); err != nil {
+		if err := d.MigrateWarpCreateRequests(startupCtx); err != nil {
 			return fmt.Errorf("migrate WARP create requests: %w", err)
 		}
 		if err := d.EnsureProxyActivitySchema(); err != nil {
 			return fmt.Errorf("migrate task proxy switch: %w", err)
 		}
-		if err := d.MigrateProxyCreateIntents(context.Background()); err != nil {
+		if err := d.MigrateProxyCreateIntents(startupCtx); err != nil {
 			return fmt.Errorf("migrate proxy create intents: %w", err)
 		}
 		if err := d.seedBuiltins(); err != nil {

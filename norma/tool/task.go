@@ -74,6 +74,7 @@ type Task struct {
 	notified     bool // completion already enqueued into pending
 	oversize     bool // terminated by the size watchdog
 	cmd          *exec.Cmd
+	tree         *processTree
 	done         chan struct{} // closed by watch when the process exits
 }
 
@@ -237,9 +238,23 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	}
 	cmd.Stdout = f
 	cmd.Stderr = f
-	setDetached(cmd)
+	tree, err := prepareProcessTree(cmd)
+	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(outPath)
+		return nil, err
+	}
 
 	if err := cmd.Start(); err != nil {
+		tree.close()
+		_ = f.Close()
+		_ = os.Remove(outPath)
+		return nil, err
+	}
+	if err := tree.attach(cmd.Process); err != nil {
+		tree.kill()
+		_ = cmd.Wait()
+		tree.close()
 		_ = f.Close()
 		_ = os.Remove(outPath)
 		return nil, err
@@ -254,6 +269,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 		StartTime:   time.Now(),
 		OutputPath:  outPath,
 		cmd:         cmd,
+		tree:        tree,
 		done:        make(chan struct{}),
 	}
 	m.mu.Lock()
@@ -271,6 +287,13 @@ func (m *Manager) watch(t *Task, f *os.File) {
 	go func() { defer close(sizeDone); m.watchSize(t, stop) }()
 
 	err := t.cmd.Wait()
+	if t.tree != nil {
+		// A shell can exit while a child it launched keeps running. Closing the
+		// Job Object terminates every remaining descendant before the task is
+		// reported complete.
+		t.tree.kill()
+		t.tree.close()
+	}
 	close(stop)
 	<-sizeDone
 	_ = f.Close()
@@ -325,8 +348,11 @@ func (m *Manager) terminate(t *Task, status TaskStatus, oversize bool) {
 	t.Status = status
 	t.oversize = oversize
 	proc := t.cmd.Process
+	tree := t.tree
 	m.mu.Unlock()
-	if proc != nil {
+	if tree != nil {
+		tree.kill()
+	} else if proc != nil {
 		treeKill(proc)
 	}
 }

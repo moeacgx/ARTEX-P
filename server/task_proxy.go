@@ -259,6 +259,9 @@ func (m *Manager) TaskToolProxy(ctx context.Context, t *Task) (addr, ca string, 
 	}
 	if s.ID != 0 {
 		addr = snapshotProxyURL(s, t.ID)
+		// 谐趣出口在真正被工具使用前尝试补齐当前公网 IP 白名单。失败不阻断
+		// 代理选择，显式状态/刷新工具负责给出完整诊断。
+		m.maybeAutoRefreshXiequWhitelist(ctx, s)
 	}
 	rt.mu.Lock()
 	closed := rt.closed
@@ -413,6 +416,7 @@ func (m *Manager) ResolveLLMProxy(ctx context.Context, t *Task, channelProxy str
 	if s.ID == 0 {
 		return "", nil
 	}
+	m.maybeAutoRefreshXiequWhitelist(ctx, s)
 	if s.Kind == db.ProxyKindResin {
 		rt, err := m.proxyRuntime()
 		if err != nil {

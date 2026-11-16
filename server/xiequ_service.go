@@ -67,6 +67,8 @@ func (m *Manager) refreshXiequWhitelist(ctx context.Context, force bool) (xiequR
 	if err != nil {
 		return result, err
 	}
+	// 在途网络请求始终使用本次快照；配置切换只允许新身份保存后续状态。
+	state = state.ForConfig(config)
 	if !force && state.LastAttemptAt != nil {
 		interval := time.Duration(config.RefreshIntervalSeconds) * time.Second
 		if interval > 0 && time.Since(*state.LastAttemptAt) < interval {

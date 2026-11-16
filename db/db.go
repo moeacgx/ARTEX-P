@@ -109,15 +109,11 @@ func (c retryingPostgresConnector) Driver() driver.Driver {
 	return c.base.Driver()
 }
 
-// retryingPostgresConn marks lost sockets as bad connections before
-// database/sql sees the raw driver error. The standard pgx driver already does
-// this for failures known to happen before a request is sent; Windows loopback
-// resets can also surface while a read-only query is preloading its first row.
-// Returning ErrBadConn lets database/sql discard the poisoned session and retry
-// the query on a fresh connection.
+// 连接探测可安全重试；已发出的语句保留 pgx 的 SafeToRetry 判断，故障会话单独淘汰。
 type retryingPostgresConn struct {
 	base     driver.Conn
 	lastUsed atomic.Int64
+	invalid  atomic.Bool
 }
 
 func (c *retryingPostgresConn) markUsed() {
@@ -201,7 +197,11 @@ func (c *retryingPostgresConn) ExecContext(ctx context.Context, query string, ar
 	// Exec may mutate data after the request reaches PostgreSQL. Keep the pgx
 	// driver's own SafeToRetry classification and never replay an ambiguous
 	// write here.
-	return base.ExecContext(ctx, query, args)
+	result, err := base.ExecContext(ctx, query, args)
+	if isPostgresConnectionFailure(err) {
+		c.invalid.Store(true)
+	}
+	return result, err
 }
 
 func (c *retryingPostgresConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -214,7 +214,11 @@ func (c *retryingPostgresConn) QueryContext(ctx context.Context, query string, a
 		return nil, driver.ErrSkip
 	}
 	rows, err := base.QueryContext(ctx, query, args)
-	return rows, postgresDriverError(ctx, err)
+	// Query 也可能提交 INSERT RETURNING；仅淘汰连接，不扩大 pgx 的安全重试边界。
+	if isPostgresConnectionFailure(err) {
+		c.invalid.Store(true)
+	}
+	return rows, err
 }
 
 func (c *retryingPostgresConn) Ping(ctx context.Context) error {
@@ -257,6 +261,9 @@ func (c *retryingPostgresConn) ResetSession(ctx context.Context) error {
 }
 
 func (c *retryingPostgresConn) IsValid() bool {
+	if c.invalid.Load() {
+		return false
+	}
 	if base, ok := c.base.(driver.Validator); ok && !base.IsValid() {
 		return false
 	}

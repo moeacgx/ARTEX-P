@@ -415,6 +415,12 @@ func (e *Engine) Resume(t *Task) {
 // execContextFor returns a live per-task context derived from parent, recreating
 // it if a prior pause cancelled it.
 func (e *Engine) execContextFor(parent context.Context, taskID string) context.Context {
+	e.runtimeMu.Lock()
+	if runtime := e.runtimes[taskID]; runtime != nil {
+		// 共享执行随任务停止；退休 Worker 只停止领取后续意图，当前操作继续排空。
+		parent = runtime.ctx
+	}
+	e.runtimeMu.Unlock()
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
 	if e.IsPaused(taskID) {

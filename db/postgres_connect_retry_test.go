@@ -143,13 +143,23 @@ func TestRetryingPostgresConnectorDoesNotRetryDeterministicFailure(t *testing.T)
 	}
 }
 
-func TestRetryingPostgresConnMarksQueryConnectionLossBad(t *testing.T) {
+func TestRetryingPostgresConnDiscardsQueryConnectionLossWithoutRetry(t *testing.T) {
 	conn := &retryingPostgresConn{base: retryTestConn{
 		queryErr: errors.New("read tcp 127.0.0.1:5432: wsarecv: forcibly closed"),
 	}}
 
-	if _, err := conn.QueryContext(t.Context(), "SELECT 1", nil); !errors.Is(err, driver.ErrBadConn) {
-		t.Fatalf("query error=%v, want driver.ErrBadConn", err)
+	if _, err := conn.QueryContext(t.Context(), "SELECT 1", nil); err == nil || errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("query error=%v, want original connection failure", err)
+	}
+	if conn.IsValid() {
+		t.Fatal("连接故障后不得继续复用会话")
+	}
+}
+
+func TestRetryingPostgresConnPreservesDriverSafeRetry(t *testing.T) {
+	conn := &retryingPostgresConn{base: retryTestConn{queryErr: driver.ErrBadConn}}
+	if _, err := conn.QueryContext(t.Context(), "SELECT 1", nil); err != driver.ErrBadConn {
+		t.Fatalf("安全重试信号被修改: %v", err)
 	}
 }
 

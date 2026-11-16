@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -30,6 +31,7 @@ const (
 
 var (
 	ErrXiequConfig          = errors.New("谐趣白名单配置无效")
+	ErrXiequConfigChanged   = errors.New("谐趣白名单配置已变更，拒绝旧刷新状态")
 	ErrXiequUID             = fmt.Errorf("%w：请填写有效的 UID", ErrXiequConfig)
 	ErrXiequUKEY            = fmt.Errorf("%w：请填写有效的 UKEY", ErrXiequConfig)
 	ErrXiequBaseURL         = fmt.Errorf("%w：接口地址无效", ErrXiequConfig)
@@ -41,6 +43,7 @@ var (
 // XiequConfig's UID and UKEY are server-side values and must not be serialized
 // into generic API responses. The settings handler builds an explicit DTO.
 type XiequConfig struct {
+	Revision               string   `json:"-"`
 	Enabled                bool     `json:"enabled"`
 	UID                    string   `json:"-"`
 	UKEY                   string   `json:"-"`
@@ -61,6 +64,7 @@ type XiequConfigPatch struct {
 }
 
 type xiequStoredConfig struct {
+	Revision               string   `json:"revision,omitempty"`
 	Enabled                bool     `json:"enabled"`
 	UID                    string   `json:"uid"`
 	UKEYCipher             string   `json:"ukey_cipher"`
@@ -73,6 +77,7 @@ type xiequStoredConfig struct {
 // ManagedIPs contains only records this installation added. It is the deletion
 // allow-list used when the account reaches its whitelist quota.
 type XiequWhitelistState struct {
+	Scope          string     `json:"scope,omitempty"`
 	ManagedIPs     []string   `json:"managed_ips,omitempty"`
 	LastIP         string     `json:"last_ip,omitempty"`
 	LastStatus     string     `json:"last_status,omitempty"`
@@ -146,6 +151,7 @@ func openXiequConfig(raw string) (XiequConfig, error) {
 		return XiequConfig{}, err
 	}
 	c := XiequConfig{
+		Revision:               stored.Revision,
 		Enabled:                stored.Enabled,
 		UID:                    stored.UID,
 		BaseURL:                stored.BaseURL,
@@ -337,19 +343,76 @@ func (d *DB) XiequWhitelistState() (XiequWhitelistState, error) {
 	if err := json.Unmarshal([]byte(raw), &state); err != nil {
 		return XiequWhitelistState{}, errors.New("谐趣白名单状态无法读取")
 	}
-	return normalizeXiequState(state), nil
+	config, err := d.XiequConfig()
+	if err != nil {
+		return XiequWhitelistState{}, err
+	}
+	return normalizeXiequState(state).ForConfig(config), nil
 }
 
 func (d *DB) SetXiequWhitelistState(ctx context.Context, state XiequWhitelistState) error {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var raw string
+	if err := tx.QueryRowContext(ctx, "SELECT value FROM settings WHERE key=$1 FOR UPDATE", settingXiequ).Scan(&raw); err != nil {
+		return err
+	}
+	config, err := openXiequConfig(raw)
+	if err != nil {
+		return err
+	}
+	if state.Scope == "" || state.Scope != config.WhitelistScope() {
+		return ErrXiequConfigChanged
+	}
 	state = normalizeXiequState(state)
 	b, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	_, err = d.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO settings(key,value) VALUES($1,$2)
 ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`, settingXiequWhitelistState, string(b))
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (c XiequConfig) accountIdentity() string {
+	endpoint, err := url.Parse(strings.TrimSpace(c.BaseURL))
+	if err == nil {
+		endpoint.Scheme = strings.ToLower(endpoint.Scheme)
+		endpoint.Host = strings.ToLower(endpoint.Host)
+		if (endpoint.Scheme == "http" && endpoint.Port() == "80") || (endpoint.Scheme == "https" && endpoint.Port() == "443") {
+			endpoint.Host = endpoint.Hostname()
+			if strings.Contains(endpoint.Host, ":") {
+				endpoint.Host = "[" + endpoint.Host + "]"
+			}
+		}
+		if endpoint.Path == "" {
+			endpoint.Path = "/"
+		}
+	}
+	address := strings.TrimSpace(c.BaseURL)
+	if err == nil {
+		address = endpoint.String()
+	}
+	digest := sha256.Sum256([]byte(strings.TrimSpace(c.UID) + "\n" + address))
+	return hex.EncodeToString(digest[:])
+}
+
+func (c XiequConfig) WhitelistScope() string {
+	return c.accountIdentity() + ":" + c.Revision
+}
+
+func (s XiequWhitelistState) ForConfig(c XiequConfig) XiequWhitelistState {
+	if s.Scope != c.WhitelistScope() {
+		return XiequWhitelistState{Scope: c.WhitelistScope()}
+	}
+	return s
 }
 
 // SetXiequConfig merges a patch into one locked settings row so changing the
@@ -391,6 +454,7 @@ func (d *DB) SetXiequConfig(ctx context.Context, patch XiequConfigPatch) (XiequC
 		}
 		c = defaultXiequConfig()
 	}
+	previous := c
 	if patch.Enabled != nil {
 		c.Enabled = *patch.Enabled
 	}
@@ -448,11 +512,20 @@ func (d *DB) SetXiequConfig(ctx context.Context, patch XiequConfigPatch) (XiequC
 	if c.Enabled && (c.UID == "" || c.UKEY == "") {
 		return XiequConfig{}, ErrXiequConfig
 	}
+	identityChanged := previous.accountIdentity() != c.accountIdentity() || previous.UKEY != c.UKEY || c.Revision == ""
+	if identityChanged {
+		generation := make([]byte, 16)
+		if _, err := rand.Read(generation); err != nil {
+			return XiequConfig{}, err
+		}
+		c.Revision = hex.EncodeToString(generation)
+	}
 	cipher, err := sealXiequUKEY(c.UKEY)
 	if err != nil {
 		return XiequConfig{}, err
 	}
 	b, err := json.Marshal(xiequStoredConfig{
+		Revision:               c.Revision,
 		Enabled:                c.Enabled,
 		UID:                    c.UID,
 		UKEYCipher:             cipher,
@@ -466,6 +539,15 @@ func (d *DB) SetXiequConfig(ctx context.Context, patch XiequConfigPatch) (XiequC
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE settings SET value=$2,updated_at=now() WHERE key=$1`, settingXiequ, string(b)); err != nil {
 		return XiequConfig{}, err
+	}
+	if identityChanged {
+		state, err := json.Marshal(XiequWhitelistState{Scope: c.WhitelistScope()})
+		if err != nil {
+			return XiequConfig{}, err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()", settingXiequWhitelistState, string(state)); err != nil {
+			return XiequConfig{}, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return XiequConfig{}, err

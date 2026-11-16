@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/config"
@@ -47,7 +48,9 @@ const (
 	postgresConnectTimeout   = 1500 * time.Millisecond
 	postgresStartupTimeout   = 45 * time.Second
 	postgresOperationTimeout = 30 * time.Second
-	postgresResetTimeout     = 3 * time.Second
+	postgresResetTimeout     = time.Second
+
+	postgresReuseProbeIdle = 500 * time.Millisecond
 )
 
 var postgresConnectRetryDelays = [...]time.Duration{
@@ -70,7 +73,14 @@ func (c retryingPostgresConnector) Connect(ctx context.Context) (driver.Conn, er
 		conn, err := c.base.Connect(attemptCtx)
 		cancel()
 		if err == nil {
-			return &retryingPostgresConn{base: conn}, nil
+			if pingErr := pingPostgresConn(ctx, conn); pingErr != nil {
+				_ = conn.Close()
+				err = pingErr
+			} else {
+				retryConn := &retryingPostgresConn{base: conn}
+				retryConn.markUsed()
+				return retryConn, nil
+			}
 		}
 		if ctx.Err() != nil || !isRetryablePostgresConnectError(err) || attempt >= len(postgresConnectRetryDelays) {
 			return nil, err
@@ -85,6 +95,16 @@ func (c retryingPostgresConnector) Connect(ctx context.Context) (driver.Conn, er
 	}
 }
 
+func pingPostgresConn(ctx context.Context, conn driver.Conn) error {
+	pinger, ok := conn.(driver.Pinger)
+	if !ok {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, postgresConnectTimeout)
+	defer cancel()
+	return pinger.Ping(probeCtx)
+}
+
 func (c retryingPostgresConnector) Driver() driver.Driver {
 	return c.base.Driver()
 }
@@ -96,7 +116,20 @@ func (c retryingPostgresConnector) Driver() driver.Driver {
 // Returning ErrBadConn lets database/sql discard the poisoned session and retry
 // the query on a fresh connection.
 type retryingPostgresConn struct {
-	base driver.Conn
+	base     driver.Conn
+	lastUsed atomic.Int64
+}
+
+func (c *retryingPostgresConn) markUsed() {
+	c.lastUsed.Store(time.Now().UnixNano())
+}
+
+func (c *retryingPostgresConn) idleFor() time.Duration {
+	last := c.lastUsed.Load()
+	if last == 0 {
+		return postgresReuseProbeIdle
+	}
+	return time.Since(time.Unix(0, last))
 }
 
 func setPostgresDriverConnDeadline(base driver.Conn, ctx context.Context) error {
@@ -118,6 +151,7 @@ func (c *retryingPostgresConn) Prepare(query string) (driver.Stmt, error) {
 }
 
 func (c *retryingPostgresConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	c.markUsed()
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
 		return nil, postgresDriverError(ctx, err)
 	}
@@ -139,6 +173,7 @@ func (c *retryingPostgresConn) Begin() (driver.Tx, error) {
 }
 
 func (c *retryingPostgresConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	c.markUsed()
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
 		return nil, postgresDriverError(ctx, err)
 	}
@@ -155,6 +190,7 @@ func (c *retryingPostgresConn) BeginTx(ctx context.Context, opts driver.TxOption
 }
 
 func (c *retryingPostgresConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	c.markUsed()
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
 		return nil, postgresDriverError(ctx, err)
 	}
@@ -169,6 +205,7 @@ func (c *retryingPostgresConn) ExecContext(ctx context.Context, query string, ar
 }
 
 func (c *retryingPostgresConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	c.markUsed()
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
 		return nil, postgresDriverError(ctx, err)
 	}
@@ -181,6 +218,7 @@ func (c *retryingPostgresConn) QueryContext(ctx context.Context, query string, a
 }
 
 func (c *retryingPostgresConn) Ping(ctx context.Context) error {
+	c.markUsed()
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
 		return postgresDriverError(ctx, err)
 	}
@@ -192,16 +230,30 @@ func (c *retryingPostgresConn) Ping(ctx context.Context) error {
 }
 
 func (c *retryingPostgresConn) ResetSession(ctx context.Context) error {
-	base, ok := c.base.(driver.SessionResetter)
-	if !ok {
-		return nil
-	}
 	resetCtx, cancel := context.WithTimeout(ctx, postgresResetTimeout)
 	defer cancel()
-	if err := setPostgresDriverConnDeadline(c.base, resetCtx); err != nil {
-		return postgresDriverError(resetCtx, err)
+	if base, ok := c.base.(driver.SessionResetter); ok {
+		if err := setPostgresDriverConnDeadline(c.base, resetCtx); err != nil {
+			return postgresSessionDriverError(ctx, resetCtx, err)
+		}
+		if err := base.ResetSession(resetCtx); err != nil {
+			return postgresSessionDriverError(ctx, resetCtx, err)
+		}
 	}
-	return postgresDriverError(resetCtx, base.ResetSession(resetCtx))
+	if c.idleFor() < postgresReuseProbeIdle {
+		c.markUsed()
+		return nil
+	}
+	if err := setPostgresDriverConnDeadline(c.base, resetCtx); err != nil {
+		return postgresSessionDriverError(ctx, resetCtx, err)
+	}
+	if pinger, ok := c.base.(driver.Pinger); ok {
+		if err := pinger.Ping(resetCtx); err != nil {
+			return postgresSessionDriverError(ctx, resetCtx, err)
+		}
+	}
+	c.markUsed()
+	return nil
 }
 
 func (c *retryingPostgresConn) IsValid() bool {
@@ -224,6 +276,19 @@ func (c *retryingPostgresConn) CheckNamedValue(value *driver.NamedValue) error {
 
 func postgresDriverError(ctx context.Context, err error) error {
 	if err != nil && ctx.Err() == nil && isPostgresConnectionFailure(err) {
+		return driver.ErrBadConn
+	}
+	return err
+}
+
+func postgresSessionDriverError(parentCtx, resetCtx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if parentCtx.Err() != nil {
+		return err
+	}
+	if resetCtx.Err() != nil || isPostgresConnectionFailure(err) {
 		return driver.ErrBadConn
 	}
 	return err

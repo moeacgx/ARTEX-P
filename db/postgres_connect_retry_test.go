@@ -13,6 +13,7 @@ import (
 
 type retryTestConnector struct {
 	errs     []error
+	conns    []driver.Conn
 	attempts int
 }
 
@@ -20,6 +21,9 @@ func (c *retryTestConnector) Connect(context.Context) (driver.Conn, error) {
 	c.attempts++
 	if c.attempts <= len(c.errs) {
 		return nil, c.errs[c.attempts-1]
+	}
+	if c.attempts <= len(c.conns) && c.conns[c.attempts-1] != nil {
+		return c.conns[c.attempts-1], nil
 	}
 	return retryTestConn{}, nil
 }
@@ -76,6 +80,20 @@ func (invalidConn) IsValid() bool {
 	return false
 }
 
+type pingFailingConn struct {
+	retryTestConn
+	closed bool
+}
+
+func (c *pingFailingConn) Close() error {
+	c.closed = true
+	return nil
+}
+
+func (*pingFailingConn) Ping(context.Context) error {
+	return errors.New("read tcp 127.0.0.1:5432: wsarecv: forcibly closed")
+}
+
 func TestRetryingPostgresConnectorRetriesTransientFailures(t *testing.T) {
 	base := &retryTestConnector{errs: []error{
 		errors.New("dial tcp 127.0.0.1:5432: i/o timeout"),
@@ -90,6 +108,24 @@ func TestRetryingPostgresConnectorRetriesTransientFailures(t *testing.T) {
 	_ = conn.Close()
 	if base.attempts != 3 {
 		t.Fatalf("attempts=%d, want 3", base.attempts)
+	}
+}
+
+func TestRetryingPostgresConnectorDiscardsFailedProbe(t *testing.T) {
+	failed := &pingFailingConn{}
+	base := &retryTestConnector{conns: []driver.Conn{failed, retryTestConn{}}}
+	connector := retryingPostgresConnector{base: base}
+
+	conn, err := connector.Connect(t.Context())
+	if err != nil {
+		t.Fatalf("connect after failed probe: %v", err)
+	}
+	_ = conn.Close()
+	if base.attempts != 2 {
+		t.Fatalf("attempts=%d, want 2", base.attempts)
+	}
+	if !failed.closed {
+		t.Fatal("failed probe connection was not closed")
 	}
 }
 
@@ -163,6 +199,16 @@ func TestRetryingPostgresConnResetSessionHonorsShorterContext(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("reset took %s, want bound by caller context", elapsed)
+	}
+}
+
+func TestRetryingPostgresConnProbesIdleConnectionOnReuse(t *testing.T) {
+	failed := &pingFailingConn{}
+	conn := &retryingPostgresConn{base: failed}
+	conn.lastUsed.Store(time.Now().Add(-time.Second).UnixNano())
+
+	if err := conn.ResetSession(t.Context()); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("reset error=%v, want driver.ErrBadConn", err)
 	}
 }
 

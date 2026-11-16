@@ -40,10 +40,14 @@ const maxOpenConns = 32
 const (
 	postgresCancelRequestDelay  = 100 * time.Millisecond
 	postgresCancelDeadlineDelay = 3 * time.Second
-	postgresConnectTimeout      = 3 * time.Second
-	postgresStartupTimeout      = 45 * time.Second
-	postgresOperationTimeout    = 30 * time.Second
-	postgresResetTimeout        = 3 * time.Second
+	// Windows loopback occasionally drops a SYN. A failed handshake usually
+	// shows up as a 1s or 3s TCP timeout; retrying on a fresh socket recovers
+	// immediately. Keep each attempt short so one lost SYN cannot consume the
+	// caller's whole deadline.
+	postgresConnectTimeout   = 1500 * time.Millisecond
+	postgresStartupTimeout   = 45 * time.Second
+	postgresOperationTimeout = 30 * time.Second
+	postgresResetTimeout     = 3 * time.Second
 )
 
 var postgresConnectRetryDelays = [...]time.Duration{
@@ -115,7 +119,7 @@ func (c *retryingPostgresConn) Prepare(query string) (driver.Stmt, error) {
 
 func (c *retryingPostgresConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
-		return nil, err
+		return nil, postgresDriverError(ctx, err)
 	}
 	base, ok := c.base.(driver.ConnPrepareContext)
 	if !ok {
@@ -136,7 +140,7 @@ func (c *retryingPostgresConn) Begin() (driver.Tx, error) {
 
 func (c *retryingPostgresConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
-		return nil, err
+		return nil, postgresDriverError(ctx, err)
 	}
 	base, ok := c.base.(driver.ConnBeginTx)
 	if !ok {
@@ -152,7 +156,7 @@ func (c *retryingPostgresConn) BeginTx(ctx context.Context, opts driver.TxOption
 
 func (c *retryingPostgresConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
-		return nil, err
+		return nil, postgresDriverError(ctx, err)
 	}
 	base, ok := c.base.(driver.ExecerContext)
 	if !ok {
@@ -166,7 +170,7 @@ func (c *retryingPostgresConn) ExecContext(ctx context.Context, query string, ar
 
 func (c *retryingPostgresConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
-		return nil, err
+		return nil, postgresDriverError(ctx, err)
 	}
 	base, ok := c.base.(driver.QueryerContext)
 	if !ok {
@@ -178,7 +182,7 @@ func (c *retryingPostgresConn) QueryContext(ctx context.Context, query string, a
 
 func (c *retryingPostgresConn) Ping(ctx context.Context) error {
 	if err := setPostgresDriverConnDeadline(c.base, ctx); err != nil {
-		return err
+		return postgresDriverError(ctx, err)
 	}
 	base, ok := c.base.(driver.Pinger)
 	if !ok {
@@ -195,14 +199,19 @@ func (c *retryingPostgresConn) ResetSession(ctx context.Context) error {
 	resetCtx, cancel := context.WithTimeout(ctx, postgresResetTimeout)
 	defer cancel()
 	if err := setPostgresDriverConnDeadline(c.base, resetCtx); err != nil {
-		return err
+		return postgresDriverError(resetCtx, err)
 	}
 	return postgresDriverError(resetCtx, base.ResetSession(resetCtx))
 }
 
 func (c *retryingPostgresConn) IsValid() bool {
-	base, ok := c.base.(driver.Validator)
-	return !ok || base.IsValid()
+	if base, ok := c.base.(driver.Validator); ok && !base.IsValid() {
+		return false
+	}
+	if conn, ok := c.base.(*stdlib.Conn); ok {
+		return !conn.Conn().IsClosed()
+	}
+	return true
 }
 
 func (c *retryingPostgresConn) CheckNamedValue(value *driver.NamedValue) error {
@@ -263,6 +272,7 @@ func isPostgresConnectionFailure(err error) bool {
 		"conn closed",
 		"bad connection",
 		"connection is already closed",
+		"closed network connection",
 		"i/o timeout",
 	} {
 		if strings.Contains(msg, marker) {

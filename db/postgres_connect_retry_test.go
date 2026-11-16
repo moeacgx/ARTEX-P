@@ -68,6 +68,14 @@ func (c resetBlockingConn) ResetSession(ctx context.Context) error {
 	return ctx.Err()
 }
 
+type invalidConn struct {
+	retryTestConn
+}
+
+func (invalidConn) IsValid() bool {
+	return false
+}
+
 func TestRetryingPostgresConnectorRetriesTransientFailures(t *testing.T) {
 	base := &retryTestConnector{errs: []error{
 		errors.New("dial tcp 127.0.0.1:5432: i/o timeout"),
@@ -124,6 +132,22 @@ func TestRetryingPostgresConnDoesNotReplayAmbiguousExec(t *testing.T) {
 
 	if _, err := conn.ExecContext(t.Context(), "UPDATE tasks SET paused=true", nil); !errors.Is(err, networkErr) || errors.Is(err, driver.ErrBadConn) {
 		t.Fatalf("exec error=%v, want original network error", err)
+	}
+}
+
+func TestRetryingPostgresConnInvalidatesClosedDriverConnection(t *testing.T) {
+	conn := &retryingPostgresConn{base: invalidConn{}}
+
+	if conn.IsValid() {
+		t.Fatal("closed driver connection reported as valid")
+	}
+}
+
+func TestPostgresDriverErrorMarksClosedSocketBad(t *testing.T) {
+	err := postgresDriverError(t.Context(), errors.New("set tcp 127.0.0.1:5432: use of closed network connection"))
+
+	if !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("deadline error=%v, want driver.ErrBadConn", err)
 	}
 }
 

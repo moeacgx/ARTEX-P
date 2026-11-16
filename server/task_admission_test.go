@@ -290,8 +290,9 @@ func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
 		t.Fatalf("revived task did not leave FIFO ready to execute: state=%+v enginePaused=%v settling=%v",
 			runningState, s.engine.IsPaused(task.ID), s.engine.isSettling(task.ID))
 	}
-	if execCtx := s.engine.execContextFor(context.Background(), task.ID); execCtx.Err() != nil {
-		t.Fatalf("revived task did not receive a live execution context: %v", context.Cause(execCtx))
+	// 测试根上下文已取消；恢复任务不能绕过 runtime 父上下文重新启动执行。
+	if execCtx := s.engine.execContextFor(context.Background(), task.ID); context.Cause(execCtx) != context.Canceled {
+		t.Fatalf("恢复后的执行上下文未继承 runtime 取消: %v", context.Cause(execCtx))
 	}
 	if _, ok := s.engine.coordStarted.Load(task.ID); !ok {
 		t.Fatal("revived timeout task did not start a fresh deadline coordinator")

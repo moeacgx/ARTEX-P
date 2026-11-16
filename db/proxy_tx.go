@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // 所有代理生命周期变更和任务出口快照都获取同一个事务锁，避免先查后写竞态。
@@ -280,8 +281,22 @@ func (d *DB) MigrateLegacyProxy() error {
 	})
 }
 
+const postgresLifecycleTimeout = 20 * time.Second
+
 func (d *DB) withProxyLifecycle(fn func(*sql.Tx) error) error {
-	tx, err := d.BeginTx(context.Background(), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), postgresLifecycleTimeout)
+	defer cancel()
+	conn, err := d.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err = setPostgresConnDeadline(conn, time.Now().Add(postgresLifecycleTimeout)); err != nil {
+		return err
+	}
+	defer setPostgresConnDeadline(conn, time.Time{}) //nolint:errcheck
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}

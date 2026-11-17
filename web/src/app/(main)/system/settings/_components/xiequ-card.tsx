@@ -183,7 +183,8 @@ export function XiequCard() {
         </CardTitle>
         <CardDescription>
           使用谐趣代理前，自动把本机当前公网 IPv4 加入谐趣白名单。管理接口和公网 IP 探测都强制直连，不经过待授权的代理；
-          添加后会重新读取白名单确认。账户最多 5 个白名单，本工具只回收自己添加过的旧 IP。
+          添加后会重新读取白名单确认。账户最多 5
+          个白名单，本工具不会自动删除任何白名单条目；满额时请到谐趣供应商后台人工管理。
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
@@ -352,7 +353,9 @@ export function XiequCard() {
               {lastRefresh && (
                 <p className={lastRefresh.ok ? "text-emerald-600" : "text-destructive"}>
                   本次刷新：{lastRefresh.message}
-                  {lastRefresh.removed?.length ? `；已回收 ${lastRefresh.removed.join("、")}` : ""}
+                  {lastRefresh.reason === "quota_full"
+                    ? "；白名单已满，请到谐趣供应商后台人工处理，本工具不会自动删除条目"
+                    : ""}
                 </p>
               )}
               <p className="text-muted-foreground">{config.quota_hint}</p>

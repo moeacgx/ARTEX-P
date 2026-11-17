@@ -70,3 +70,37 @@ for (const [label, managed] of [
     await assert.rejects(xiequAPI.config(), /状态响应无效/);
   });
 }
+
+const refreshBody = (value = {}) => ({
+  ok: false,
+  reason: "quota_full",
+  message: "白名单已满，请到供应商后台人工处理",
+  whitelist_count: 5,
+  added: false,
+  removed: [],
+  managed_ips: [],
+  checked_at: "2026-11-18T00:00:00Z",
+  ...value,
+});
+
+test("refresh quota_full is returned as a failure with nothing removed", async () => {
+  globalThis.fetch = async () => Response.json(refreshBody());
+  const result = await xiequAPI.refresh();
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "quota_full");
+  assert.equal(result.added, false);
+  assert.deepEqual(result.removed, []);
+});
+
+test("refresh response validation stays strict", async () => {
+  for (const bad of [
+    { ok: "false" },
+    { reason: 1 },
+    { added: "no" },
+    { checked_at: "not-a-time" },
+    { whitelist_count: "5" },
+  ]) {
+    globalThis.fetch = async () => Response.json(refreshBody(bad));
+    await assert.rejects(xiequAPI.refresh(), /刷新响应无效/);
+  }
+});

@@ -49,6 +49,26 @@ export type XiequRefreshResult = {
   warning?: string;
 };
 
+// The Xiequ management API receives UID/UKEY as query parameters, so only HTTPS is accepted.
+// An empty value lets the server apply its default endpoint.
+export const XIEQU_DEFAULT_BASE_URL = "https://op.xiequ.cn/IpWhiteList.aspx";
+
+export function xiequBaseURLError(value: string): string {
+  const text = value.trim();
+  if (!text) return "";
+  let parsed: URL;
+  try {
+    parsed = new URL(text);
+  } catch {
+    return "管理接口地址无效";
+  }
+  if (parsed.protocol !== "https:") return "管理接口地址必须使用 HTTPS，不允许降级为 HTTP";
+  if (!parsed.hostname || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    return "管理接口地址不能包含账号、查询参数或片段";
+  }
+  return "";
+}
+
 function stringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }

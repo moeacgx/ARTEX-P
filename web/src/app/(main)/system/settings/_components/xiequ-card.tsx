@@ -12,7 +12,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { type XiequConfig, type XiequRefreshResult, type XiequSettingsPatch, xiequAPI } from "@/lib/xiequ-api";
+import {
+  XIEQU_DEFAULT_BASE_URL,
+  type XiequConfig,
+  type XiequRefreshResult,
+  type XiequSettingsPatch,
+  xiequAPI,
+  xiequBaseURLError,
+} from "@/lib/xiequ-api";
 
 function splitDomains(value: string): string[] {
   return value
@@ -48,6 +55,18 @@ export function XiequCard() {
   const [action, setAction] = React.useState<"load" | "save" | "refresh" | "clear" | null>("load");
   const [lastRefresh, setLastRefresh] = React.useState<XiequRefreshResult | null>(null);
   const locked = React.useRef(false);
+
+  // Draft fields differ from the saved config. Manual refresh always runs against the saved
+  // settings, so it only updates service status and never overwrites these drafts.
+  const dirty =
+    config !== null &&
+    (enabled !== config.enabled ||
+      uid !== config.uid ||
+      ukey !== "" ||
+      baseURL !== config.base_url ||
+      memo !== config.memo ||
+      interval !== String(config.refresh_interval_seconds) ||
+      domains !== config.proxy_domains.join("\n"));
 
   const applyConfig = React.useCallback((value: XiequConfig) => {
     setConfig(value);
@@ -87,6 +106,8 @@ export function XiequCard() {
     try {
       const parsedInterval = parseInterval(interval);
       const parsedDomains = splitDomains(domains);
+      const urlError = xiequBaseURLError(baseURL);
+      if (urlError) throw new Error(urlError);
       if (enabled && !config.ukey_set && !ukey.trim()) {
         throw new Error("请先输入 UKEY，再启用谐趣白名单自动刷新");
       }
@@ -118,7 +139,12 @@ export function XiequCard() {
       setLastRefresh(result);
       if (result.ok) toast.success(result.message);
       else toast.error(result.message);
-      applyConfig(await xiequAPI.config());
+      try {
+        // Only the saved config/status is replaced; unsaved draft fields stay as typed.
+        setConfig(await xiequAPI.config());
+      } catch (error) {
+        toast.error(`刷新已执行，但状态重新读取失败：${(error as Error).message}`);
+      }
     } catch (error) {
       toast.error(`刷新失败：${(error as Error).message}`);
     } finally {
@@ -273,8 +299,14 @@ export function XiequCard() {
                 onChange={(event) => setBaseURL(event.target.value)}
               />
               <p className="text-muted-foreground text-xs">
-                默认 `http://op.xiequ.cn/IpWhiteList.aspx`；管理接口始终直连。
+                默认 `{XIEQU_DEFAULT_BASE_URL}`；仅允许 HTTPS（UID/UKEY 随请求发送，不允许降级为
+                HTTP），管理接口始终直连。 留空保存时使用服务端默认地址。
               </p>
+              {xiequBaseURLError(baseURL) && (
+                <p role="alert" className="text-destructive text-xs">
+                  {xiequBaseURLError(baseURL)}
+                </p>
+              )}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -298,7 +330,17 @@ export function XiequCard() {
               >
                 {action === "clear" ? "清除中…" : "清除 UKEY 并关闭"}
               </Button>
+              {dirty && (
+                <Button type="button" variant="ghost" onClick={() => void load()} disabled={busy}>
+                  放弃修改并重新读取
+                </Button>
+              )}
             </div>
+            {dirty && (
+              <p role="status" className="text-amber-600 text-xs dark:text-amber-400">
+                有未保存的修改。“立即刷新白名单”使用已保存的设置，不会提交或清除当前输入；需要生效请先保存。
+              </p>
+            )}
 
             <div className="flex flex-col gap-2 border-t pt-4 text-xs leading-relaxed">
               <p>

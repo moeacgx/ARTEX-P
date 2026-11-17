@@ -15,13 +15,12 @@ import (
 )
 
 func TestXiequRefreshAccountSwitchProtectsManualQuotaAndNewState(t *testing.T) {
-	s, _ := proxyIntegration(t)
-	m := s.m
+	m := xiequIsolatedManager(t)
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(release) })
 	var deletes atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uid, action := r.URL.Query().Get("uid"), r.URL.Query().Get("act")
 		if uid == "old-account" && action == "getjson" {
 			select {
@@ -45,6 +44,11 @@ func TestXiequRefreshAccountSwitchProtectsManualQuotaAndNewState(t *testing.T) {
 		_, _ = w.Write([]byte("quota full"))
 	}))
 	defer func() { once.Do(func() { close(release) }); upstream.Close() }()
+	previousClient := newXiequClient
+	newXiequClient = func(base, uid, key string) *xiequ.Client {
+		return xiequ.NewWithHTTPClient(base, uid, key, upstream.Client())
+	}
+	defer func() { newXiequClient = previousClient }()
 	previous := discoverXiequPublicIP
 	discoverXiequPublicIP = func(context.Context, *xiequ.Client) (string, error) { return "203.0.113.99", nil }
 	defer func() { discoverXiequPublicIP = previous }()

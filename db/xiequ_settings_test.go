@@ -82,3 +82,11 @@ func TestXiequWhitelistStateNormalizesManagedIPs(t *testing.T) {
 		t.Fatalf("白名单状态未去重排序: %#v", state.ManagedIPs)
 	}
 }
+
+func TestXiequStorageRejectsPlaintextEndpoint(t *testing.T) {
+	d, _ := fofaSettingsTestDB(t)
+	uid, key, enabled, base := "synthetic-uid", "synthetic-key", true, "http://127.0.0.1:1/IpWhiteList.aspx"
+	if _, err := d.SetXiequConfig(t.Context(), XiequConfigPatch{UID: &uid, UKEY: &key, Enabled: &enabled, BaseURL: &base}); err == nil {
+		t.Fatal("存储接受携密钥的HTTP配置")
+	}
+}

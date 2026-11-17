@@ -219,8 +219,8 @@ func (c *Client) get(ctx context.Context, act string, extra map[string]string) (
 		return nil, errors.New("谐趣白名单配置不完整")
 	}
 	u, err := url.Parse(c.BaseURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, errors.New("谐趣白名单接口地址无效")
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return nil, errors.New("谐趣白名单接口必须使用证书验证有效的 HTTPS 地址")
 	}
 	q := u.Query()
 	q.Set("uid", c.UID)
@@ -241,7 +241,18 @@ func (c *Client) get(ctx context.Context, act string, extra map[string]string) (
 	if client == nil {
 		client = DirectHTTPClient()
 	}
-	resp, err := client.Do(req)
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	tr, ok := transport.(*http.Transport)
+	if !ok || tr.DialTLS != nil || tr.DialTLSContext != nil || (tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify) {
+		return nil, errors.New("谐趣白名单传输必须验证 TLS 证书")
+	}
+	// 不修改调用者客户端，也不允许其重定向策略把凭据转发到其他地址。
+	safeClient := *client
+	safeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := safeClient.Do(req)
 	if err != nil {
 		return nil, errors.New("谐趣白名单接口连接失败")
 	}

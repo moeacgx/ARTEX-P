@@ -10,7 +10,7 @@ import (
 
 func TestClientListAddDeleteAndParameters(t *testing.T) {
 	var calls []string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.URL.Query().Get("act")+":"+r.URL.Query().Get("ip")+":"+r.URL.Query().Get("meno"))
 		if r.URL.Query().Get("uid") != "uid-1" || r.URL.Query().Get("ukey") != "key-1" {
 			t.Errorf("鉴权参数未传递")
@@ -41,7 +41,7 @@ func TestClientListAddDeleteAndParameters(t *testing.T) {
 }
 
 func TestClientListAcceptsRootArrayAndDocumentedMemoAlias(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`[{"ip":"203.0.113.10","meno":"manual"},{"IP":"203.0.113.11","MEMO":"legacy"}]`))
 	}))
 	defer upstream.Close()
@@ -57,7 +57,7 @@ func TestClientListAcceptsRootArrayAndDocumentedMemoAlias(t *testing.T) {
 }
 
 func TestClientRejectsAllAndDoesNotFollowRedirects(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("act") == "del" {
 			t.Error("删除 all 不应发出请求")
 		}
@@ -65,9 +65,7 @@ func TestClientRejectsAllAndDoesNotFollowRedirects(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	client := NewWithHTTPClient(upstream.URL, "uid-1", "key-1", &http.Client{
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	})
+	client := NewWithHTTPClient(upstream.URL, "uid-1", "key-1", upstream.Client())
 	if err := client.Delete(context.Background(), "all"); err == nil {
 		t.Fatal("Delete(all) 应被拒绝")
 	}

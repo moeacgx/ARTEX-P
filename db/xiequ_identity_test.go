@@ -68,3 +68,50 @@ func TestXiequIdentityNormalizationAndLegacyState(t *testing.T) {
 		t.Fatal("不同服务地址共享了身份")
 	}
 }
+
+func TestXiequPendingStateIdentityAndConcurrentCAS(t *testing.T) {
+	for _, change := range []string{"uid", "base_url", "ukey", "aba"} {
+		t.Run(change, func(t *testing.T) {
+			d, _ := fofaSettingsTestDB(t)
+			uid, key := "synthetic-account", "synthetic-key"
+			config, err := d.SetXiequConfig(t.Context(), XiequConfigPatch{UID: &uid, UKEY: &key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := XiequWhitelistState{Scope: config.WhitelistScope(), PendingAdd: &XiequPendingAdd{IP: "203.0.113.99", Memo: "ARTEX [artex:synthetic-token]"}}
+			if err := d.SetXiequWhitelistState(t.Context(), state); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.SetXiequWhitelistState(t.Context(), state); !errors.Is(err, ErrXiequStateChanged) {
+				t.Fatalf("旧状态CAS未拒绝: %v", err)
+			}
+			stale, err := d.XiequWhitelistState()
+			if err != nil {
+				t.Fatal(err)
+			}
+			next, base, newkey := "next-account", "https://other.example.test/api", "changed-synthetic-key"
+			patch := XiequConfigPatch{UID: &next}
+			if change == "base_url" {
+				patch = XiequConfigPatch{BaseURL: &base}
+			}
+			if change == "ukey" {
+				patch = XiequConfigPatch{UKEY: &newkey}
+			}
+			if _, err := d.SetXiequConfig(t.Context(), patch); err != nil {
+				t.Fatal(err)
+			}
+			if change == "aba" {
+				if _, err := d.SetXiequConfig(t.Context(), XiequConfigPatch{UID: &uid}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := d.SetXiequWhitelistState(t.Context(), stale); !errors.Is(err, ErrXiequConfigChanged) {
+				t.Fatalf("旧pending可回写新身份: %v", err)
+			}
+			got, err := d.XiequWhitelistState()
+			if err != nil || got.PendingAdd != nil || len(got.ManagedIPs) != 0 {
+				t.Fatalf("新身份继承旧provenance: %+v %v", got, err)
+			}
+		})
+	}
+}

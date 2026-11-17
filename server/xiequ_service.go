@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -63,6 +66,18 @@ func (m *Manager) refreshXiequWhitelist(ctx context.Context, force bool) (xiequR
 		result.Message = "谐趣白名单自动刷新未启用或 UID/UKEY 未配置"
 		return result, nil
 	}
+	lockCtx, cancelLock := context.WithTimeout(ctx, 3*time.Second)
+	unlock, locked, err := m.pg.TryXiequRefreshLock(lockCtx, config.WhitelistScope())
+	cancelLock()
+	if err != nil {
+		return result, err
+	}
+	if !locked {
+		result.Reason = "busy"
+		result.Message = "已有一次谐趣白名单刷新正在执行，本次刷新已跳过"
+		return result, nil
+	}
+	defer unlock()
 	state, err := m.pg.XiequWhitelistState()
 	if err != nil {
 		return result, err
@@ -81,10 +96,28 @@ func (m *Manager) refreshXiequWhitelist(ctx context.Context, force bool) (xiequR
 
 	attemptAt := time.Now().UTC()
 	result.CheckedAt = attemptAt
+	state.LastAttemptAt = &attemptAt
+	// 网络取消前先落地冷却记录；失败则不发出任何上游请求。
+	if err := m.saveXiequRefreshState(ctx, &state); err != nil {
+		return result, err
+	}
 	client := newXiequClient(config.BaseURL, config.UID, config.UKEY)
 	entries, err := client.List(ctx)
 	if err != nil {
 		return m.finishXiequRefreshError(ctx, state, result, "list_failed", "读取谐趣白名单失败", err)
+	}
+	// 仅随机操作标记一致的远端记录能够恢复为本安装管理记录。
+	state.ManagedIPs = pruneXiequManagedIPs(state.ManagedIPs, entries)
+	if pending := state.PendingAdd; pending != nil {
+		for _, entry := range entries {
+			if entry.IP == pending.IP && entry.Memo == pending.Memo {
+				state.ManagedIPs = appendXiequManagedIP(state.ManagedIPs, pending.IP)
+			}
+		}
+		state.PendingAdd = nil
+		if err := m.saveXiequRefreshState(ctx, &state); err != nil {
+			return result, err
+		}
 	}
 	ip, err := discoverXiequPublicIP(ctx, client)
 	if err != nil {
@@ -107,7 +140,7 @@ func (m *Manager) refreshXiequWhitelist(ctx context.Context, force bool) (xiequR
 		result.Message = "当前公网 IPv4 已在谐趣白名单中，无需修改"
 		result.ManagedIPs = append([]string(nil), state.ManagedIPs...)
 		result.LastSuccessAt = state.LastSuccessAt
-		if err := m.pg.SetXiequWhitelistState(ctx, state); err != nil {
+		if err := m.saveXiequRefreshState(ctx, &state); err != nil {
 			result.Warning = "白名单已确认，但本地状态保存失败"
 		}
 		return result, nil
@@ -115,16 +148,24 @@ func (m *Manager) refreshXiequWhitelist(ctx context.Context, force bool) (xiequR
 
 	// First attempt. The add endpoint is not trusted on HTTP status alone; every
 	// outcome is verified by reading the list again.
-	addErr := client.Add(ctx, ip, config.Memo)
+	if err := m.prepareXiequAdd(ctx, &state, ip, config.Memo); err != nil {
+		return result, err
+	}
+	addErr := client.Add(ctx, ip, state.PendingAdd.Memo)
 	entriesAfterAdd, verifyErr := listXiequAfterAdd(ctx, client)
 	if verifyErr == nil {
 		result.WhitelistCount = len(entriesAfterAdd)
 		state.WhitelistCount = len(entriesAfterAdd)
 		state.ManagedIPs = pruneXiequManagedIPs(state.ManagedIPs, entriesAfterAdd)
-		if entryPresent(entriesAfterAdd, ip) {
+		if xiequPendingEntryPresent(state.PendingAdd, entriesAfterAdd) {
 			state.ManagedIPs = appendXiequManagedIP(state.ManagedIPs, ip)
+			state.PendingAdd = nil
 			return m.finishXiequRefreshSuccess(ctx, state, result, ip, true, "已添加当前公网 IPv4，并读取白名单确认生效")
 		}
+	}
+	// 添加结果未知时保留 pending，不继续回收或重试远端变更。
+	if verifyErr != nil {
+		return m.finishXiequRefreshError(ctx, state, result, "add_unconfirmed", "添加结果尚未确认，将在下次刷新核验", verifyErr)
 	}
 
 	// Only managed records may be reclaimed, and only when the five-record quota
@@ -148,15 +189,16 @@ func (m *Manager) refreshXiequWhitelist(ctx context.Context, force bool) (xiequR
 				deleteErr = listErr
 			}
 			if deleteErr == nil && len(currentEntries) < 5 {
-				addErr = client.Add(ctx, ip, config.Memo)
+				addErr = client.Add(ctx, ip, state.PendingAdd.Memo)
 				entriesAfterRetry, retryErr := listXiequAfterAdd(ctx, client)
 				if retryErr == nil {
 					currentEntries = entriesAfterRetry
 					result.WhitelistCount = len(entriesAfterRetry)
 					state.WhitelistCount = len(entriesAfterRetry)
 					state.ManagedIPs = pruneXiequManagedIPs(state.ManagedIPs, entriesAfterRetry)
-					if entryPresent(entriesAfterRetry, ip) {
+					if xiequPendingEntryPresent(state.PendingAdd, entriesAfterRetry) {
 						state.ManagedIPs = appendXiequManagedIP(state.ManagedIPs, ip)
+						state.PendingAdd = nil
 						return m.finishXiequRefreshSuccess(ctx, state, result, ip, true, "已回收本工具管理的旧白名单记录并添加当前公网 IPv4，读取白名单确认生效")
 					}
 				}
@@ -187,7 +229,7 @@ func (m *Manager) finishXiequRefreshSuccess(ctx context.Context, state db.XiequW
 	result.PublicIP = ip
 	result.ManagedIPs = append([]string(nil), state.ManagedIPs...)
 	result.LastSuccessAt = state.LastSuccessAt
-	if err := m.pg.SetXiequWhitelistState(ctx, state); err != nil {
+	if err := m.saveXiequRefreshState(ctx, &state); err != nil {
 		result.Warning = "白名单已确认，但本地状态保存失败"
 	}
 	return result, nil
@@ -209,10 +251,47 @@ func (m *Manager) finishXiequRefreshError(ctx context.Context, state db.XiequWhi
 	result.Message = message
 	result.ManagedIPs = append([]string(nil), state.ManagedIPs...)
 	result.LastSuccessAt = state.LastSuccessAt
-	if err := m.pg.SetXiequWhitelistState(ctx, state); err != nil {
+	if err := m.saveXiequRefreshState(ctx, &state); err != nil {
 		result.Warning = "本地状态保存失败"
 	}
 	return result, nil
+}
+
+func (m *Manager) saveXiequRefreshState(ctx context.Context, state *db.XiequWhitelistState) error {
+	// 取消网络请求不应丢失冷却或已发送操作的状态；写回仍须通过身份及状态 CAS。
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := m.pg.SetXiequWhitelistState(saveCtx, *state); err != nil {
+		return err
+	}
+	state.Revision++
+	return nil
+}
+
+func (m *Manager) prepareXiequAdd(ctx context.Context, state *db.XiequWhitelistState, ip, memo string) error {
+	token := make([]byte, 16)
+	if _, err := rand.Read(token); err != nil {
+		return err
+	}
+	marker := " [artex:" + hex.EncodeToString(token) + "]"
+	for len(memo)+len(marker) > 80 {
+		runes := []rune(memo)
+		memo = string(runes[:len(runes)-1])
+	}
+	state.PendingAdd = &db.XiequPendingAdd{IP: ip, Memo: strings.TrimSpace(memo) + marker}
+	return m.saveXiequRefreshState(ctx, state)
+}
+
+func xiequPendingEntryPresent(pending *db.XiequPendingAdd, entries []xiequ.Entry) bool {
+	if pending == nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IP == pending.IP && entry.Memo == pending.Memo {
+			return true
+		}
+	}
+	return false
 }
 
 func listXiequAfterAdd(ctx context.Context, client *xiequ.Client) ([]xiequ.Entry, error) {

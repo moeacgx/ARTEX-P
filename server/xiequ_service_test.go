@@ -34,7 +34,7 @@ func TestXiequQuotaRulesAreExplicit(t *testing.T) {
 
 func TestXiequQuotaCleanupOnlyDeletesManagedStaleIPs(t *testing.T) {
 	deleted := make([]string, 0, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("act") == "del" {
 			deleted = append(deleted, r.URL.Query().Get("ip"))
 		}

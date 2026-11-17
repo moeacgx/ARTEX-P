@@ -273,7 +273,8 @@ type Manager struct {
 	// their in-memory mirrors. lifecycleMu makes snapshots race-free, but without
 	// this outer write lock an older request could commit first and publish last.
 	taskStateMu   sync.Mutex
-	proxyEngine   *Engine // 启动时安装，协调所有任务出口使用者与回收
+	workersMu     sync.Mutex // 工作数持久化与所有活池调整按同一顺序完成
+	proxyEngine   *Engine    // 启动时安装，协调所有任务出口使用者与回收
 	proxyBarriers sync.Map
 	proxyTickets  sync.Map
 	// xiequWhitelistMu serializes management API reads/writes and public-IP
@@ -380,12 +381,22 @@ func (m *Manager) Workers() int {
 }
 
 // SetWorkers persists the concurrent work-agent count. Values <=0 are rejected.
-// The settings handler applies the new value to live pools after persisting it.
+// 持久化与全部活池调整在同一临界区，避免较旧设置最后覆盖内存。
 func (m *Manager) SetWorkers(n int) error {
 	if n <= 0 {
 		return fmt.Errorf("workers 必须 >0")
 	}
-	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
+	m.workersMu.Lock()
+	defer m.workersMu.Unlock()
+	if err := m.pg.SetSetting(settingWorkers, strconv.Itoa(n)); err != nil {
+		return err
+	}
+	if m.proxyEngine != nil {
+		for _, task := range m.List() {
+			m.proxyEngine.ScaleWorkers(task, n)
+		}
+	}
+	return nil
 }
 
 // Enrich returns the asset auto-completion engine (may be nil if init failed).

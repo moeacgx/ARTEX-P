@@ -107,10 +107,20 @@ func (d *DB) acquireTaskOperationSessionContext(ctx context.Context, id int64) (
 	k := taskOperationLeaseKey{database: d.DB, taskID: id}
 	for attempt := 0; attempt < 2; attempt++ {
 		taskOperationLeases.Lock()
+		if err := ctx.Err(); err != nil {
+			taskOperationLeases.Unlock()
+			return nil, false, err
+		}
 		session := taskOperationLeases.sessions[d.DB]
 		if session != nil {
-			pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			session.txMu.Lock()
+			if err := ctx.Err(); err != nil {
+				session.txMu.Unlock()
+				taskOperationLeases.Unlock()
+				return nil, false, err
+			}
+			// 健康探测属于整个共享会话；调用者取消不得打断其他活操作的锁。
+			pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err := session.conn.PingContext(pingCtx)
 			session.txMu.Unlock()
 			cancel()
@@ -122,6 +132,10 @@ func (d *DB) acquireTaskOperationSessionContext(ctx context.Context, id int64) (
 				taskOperationLeases.Unlock()
 				_ = session.conn.Close()
 				continue
+			}
+			if err := ctx.Err(); err != nil {
+				taskOperationLeases.Unlock()
+				return nil, false, err
 			}
 		}
 
@@ -141,13 +155,28 @@ func (d *DB) acquireTaskOperationSessionContext(ctx context.Context, id int64) (
 			session = &taskOperationSession{conn: conn, txMu: &sync.Mutex{}}
 		}
 
-		lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		session.txMu.Lock()
+		if err := ctx.Err(); err != nil {
+			session.txMu.Unlock()
+			taskOperationLeases.Unlock()
+			if session.tasks == 0 {
+				_ = session.conn.Close()
+			}
+			return nil, false, err
+		}
+		// 新锁也在共享会话上获取，锁后开始计时，不继承单个调用者的取消。
+		lockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var locked bool
 		err := session.conn.QueryRowContext(lockCtx, `SELECT pg_try_advisory_lock_shared($1)`, taskProxySessionKey(id)).Scan(&locked)
 		session.txMu.Unlock()
 		cancel()
 		if err != nil || !locked {
+			if err != nil && isTaskOperationConnectionError(err) {
+				d.dropTaskOperationSessionLocked(session)
+				taskOperationLeases.Unlock()
+				_ = session.conn.Close()
+				return nil, false, err
+			}
 			if session.tasks == 0 {
 				delete(taskOperationLeases.sessions, d.DB)
 			}
@@ -201,8 +230,7 @@ func (d *DB) releaseTaskOperationSession(id int64) error {
 	defer cancel()
 	if err := lease.conn.QueryRowContext(ctx, `SELECT pg_advisory_unlock_shared($1)`, taskProxySessionKey(id)).Scan(&unlocked); err != nil || !unlocked {
 		_ = lease.conn.Raw(func(any) error { return driver.ErrBadConn })
-		delete(taskOperationLeases.leases, k)
-		delete(taskOperationLeases.sessions, d.DB)
+		d.dropTaskOperationSessionLocked(lease.session)
 		_ = lease.conn.Close()
 		if err != nil {
 			return err
@@ -509,6 +537,11 @@ operation_owners=jsonb_set(task_operation_activity.operation_owners,ARRAY[pg_bac
 	lease.txMu.Unlock()
 	if err != nil {
 		connectionError := isTaskOperationConnectionError(err)
+		if isTaskProxyLifecycleCommitError(err) && s.OperationToken != "" {
+			// 准入尚未返回，业务不可能启动。本次 token 是唯一可安全回收的凭据；
+			// 使用独立连接核实提交结果，不能匿名释放或重放整个准入事务。
+			err = errors.Join(err, d.reclaimUnadmittedTaskOperation(id, s.OperationToken))
+		}
 		if connectionError {
 			taskOperationLeases.Lock()
 			if current := taskOperationLeases.sessions[d.DB]; current == lease.session {
@@ -522,6 +555,44 @@ operation_owners=jsonb_set(task_operation_activity.operation_owners,ARRAY[pg_bac
 		return s, connectionError && !isTaskProxyLifecycleCommitError(err), err
 	}
 	return s, false, nil
+}
+
+func (d *DB) reclaimUnadmittedTaskOperation(id int64, token string) error {
+	return d.withProxyLifecycle(func(tx *sql.Tx) error {
+		var pid string
+		err := tx.QueryRow(`SELECT a.backend_pid::text FROM proxy_subject_activity a
+JOIN proxy_subject_policies p ON p.id=a.policy_id
+WHERE a.token=$1 AND p.task_id=$2 AND a.kind='task'`, token, id).Scan(&pid)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		} // 未落盘或已按相同 token 回收。
+		if err != nil {
+			return err
+		}
+		// 只减少有精确 token 证明的一份引用；缺失/未知 owner 仍保守阻塞。
+		result, err := tx.Exec(`UPDATE task_operation_activity SET active_count=active_count-1,
+operation_owners=CASE WHEN (operation_owners->>$2)::bigint=1 THEN operation_owners-$2
+ELSE jsonb_set(operation_owners,ARRAY[$2],to_jsonb((operation_owners->>$2)::bigint-1)) END
+WHERE task_id=$1 AND active_count>0 AND COALESCE((operation_owners->>$2)::bigint,0)>0`, id, pid)
+		if err != nil {
+			return err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return ErrProxySwitchRecovery
+		}
+		if err := releaseTaskProxyActivityTx(tx, id); err != nil {
+			return err
+		}
+		if err := ReleaseWarpHealthActivityTx(context.Background(), tx, token); err != nil {
+			return err
+		}
+		_, err = tx.Exec(`DELETE FROM proxy_subject_activity WHERE token=$1`, token)
+		return err
+	})
 }
 
 func isTaskOperationConnectionError(err error) bool {

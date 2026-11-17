@@ -129,7 +129,7 @@ func (c *retryingPostgresConn) idleFor() time.Duration {
 }
 
 func setPostgresDriverConnDeadline(base driver.Conn, ctx context.Context) error {
-	conn, ok := base.(*stdlib.Conn)
+	conn, ok := postgresStdlibConnFromRaw(base)
 	if !ok {
 		return nil
 	}
@@ -155,10 +155,105 @@ func (c *retryingPostgresConn) PrepareContext(ctx context.Context, query string)
 	base, ok := c.base.(driver.ConnPrepareContext)
 	if !ok {
 		stmt, err := c.base.Prepare(query)
-		return stmt, postgresDriverError(ctx, err)
+		return c.wrapStmt(stmt, err, ctx)
 	}
 	stmt, err := base.PrepareContext(ctx, query)
-	return stmt, postgresDriverError(ctx, err)
+	return c.wrapStmt(stmt, err, ctx)
+}
+
+func (c *retryingPostgresConn) wrapStmt(stmt driver.Stmt, err error, ctx context.Context) (driver.Stmt, error) {
+	if err != nil {
+		return nil, postgresDriverError(ctx, err)
+	}
+	return &retryingPostgresStmt{base: stmt, conn: c}, nil
+}
+
+// 预编译语句与直接执行共用逐次期限和连接失效语义；写入后的错误不得改成可重放错误。
+type retryingPostgresStmt struct {
+	base driver.Stmt
+	conn *retryingPostgresConn
+}
+
+func (s *retryingPostgresStmt) Close() error  { return s.base.Close() }
+func (s *retryingPostgresStmt) NumInput() int { return s.base.NumInput() }
+
+func (s *retryingPostgresStmt) start(ctx context.Context) error {
+	s.conn.markUsed()
+	return postgresDriverError(ctx, setPostgresDriverConnDeadline(s.conn.base, ctx))
+}
+
+func (s *retryingPostgresStmt) finish(err error) {
+	if isPostgresConnectionFailure(err) {
+		s.conn.invalid.Store(true)
+	}
+}
+
+func (s *retryingPostgresStmt) Exec(args []driver.Value) (driver.Result, error) {
+	if err := s.start(context.Background()); err != nil {
+		return nil, err
+	}
+	result, err := s.base.Exec(args)
+	s.finish(err)
+	return result, err
+}
+
+func (s *retryingPostgresStmt) Query(args []driver.Value) (driver.Rows, error) {
+	if err := s.start(context.Background()); err != nil {
+		return nil, err
+	}
+	rows, err := s.base.Query(args)
+	s.finish(err)
+	return rows, err
+}
+
+func (s *retryingPostgresStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if err := s.start(ctx); err != nil {
+		return nil, err
+	}
+	if stmt, ok := s.base.(driver.StmtExecContext); ok {
+		result, err := stmt.ExecContext(ctx, args)
+		s.finish(err)
+		return result, err
+	}
+	values, err := postgresStmtValues(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.base.Exec(values)
+	s.finish(err)
+	return result, err
+}
+
+func (s *retryingPostgresStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if err := s.start(ctx); err != nil {
+		return nil, err
+	}
+	if stmt, ok := s.base.(driver.StmtQueryContext); ok {
+		rows, err := stmt.QueryContext(ctx, args)
+		s.finish(err)
+		return rows, err
+	}
+	values, err := postgresStmtValues(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.base.Query(values)
+	s.finish(err)
+	return rows, err
+}
+
+func postgresStmtValues(ctx context.Context, args []driver.NamedValue) ([]driver.Value, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	values := make([]driver.Value, len(args))
+	for i, arg := range args {
+		if arg.Name != "" {
+			return nil, errors.New("postgres statement does not support named parameters")
+		}
+		values[i] = arg.Value
+	}
+	return values, nil
 }
 
 func (c *retryingPostgresConn) Close() error {
@@ -383,12 +478,14 @@ func postgresConfigFromRaw(raw any) (*pgx.ConnConfig, bool) {
 	return conn.Conn().Config().Copy(), true
 }
 
-func postgresStdlibConnFromRaw(raw any) (*stdlib.Conn, bool) {
+type postgresDriverConn interface{ Conn() *pgx.Conn }
+
+func postgresStdlibConnFromRaw(raw any) (postgresDriverConn, bool) {
 	for {
 		switch conn := raw.(type) {
 		case *retryingPostgresConn:
 			raw = conn.base
-		case *stdlib.Conn:
+		case postgresDriverConn:
 			return conn, true
 		default:
 			return nil, false

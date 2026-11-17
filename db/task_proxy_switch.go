@@ -383,9 +383,17 @@ func (x *TaskProxySwitchExecutor) AbortToDirect(expected int64, token string) (T
 }
 
 func (x *TaskProxySwitchExecutor) AcquireIdleTaskProxyActivity() error {
+	if err := x.d.beginOperationAdmission(); err != nil {
+		return err
+	}
+	defer x.d.endOperationAdmission()
 	return x.d.withProxySwitchLifecycle(x.conn, func(tx *sql.Tx) error { return acquireTaskProxyActivityTx(tx, x.id, true) })
 }
 func (x *TaskProxySwitchExecutor) AcquireIdleTaskProxyActivityRevision(expected int64) error {
+	if err := x.d.beginOperationAdmission(); err != nil {
+		return err
+	}
+	defer x.d.endOperationAdmission()
 	return x.d.withProxySwitchLifecycle(x.conn, func(tx *sql.Tx) error {
 		state, e := taskProxyStateTx(tx, x.id)
 		if e != nil {
@@ -951,6 +959,12 @@ func (d *DB) BeginTaskProxySwitch(id, expected int64, mode TaskProxyMode, select
 }
 
 func (d *DB) beginTaskProxySwitch(conn *sql.Conn, id, expected int64, mode TaskProxyMode, selected *int64) (TaskProxyState, string, error) {
+	// 借出的执行器可比 DB 活得更久；真正新增切换必须重新准入，直到提交结果返回。
+	// Complete、Abort 与 Release 沿用旧连接收尾，不受这个新增操作门禁阻断。
+	if err := d.beginOperationAdmission(); err != nil {
+		return TaskProxyState{}, "", err
+	}
+	defer d.endOperationAdmission()
 	var old TaskProxyState
 	var token string
 	err := d.withProxySwitchLifecycle(conn, func(tx *sql.Tx) error {

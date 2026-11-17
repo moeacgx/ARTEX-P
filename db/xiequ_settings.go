@@ -35,6 +35,7 @@ var (
 	ErrXiequConfig          = errors.New("谐趣白名单配置无效")
 	ErrXiequConfigChanged   = errors.New("谐趣白名单配置已变更，拒绝旧刷新状态")
 	ErrXiequStateChanged    = errors.New("谐趣白名单状态已变更，拒绝并发刷新状态")
+	ErrXiequStateUnreadable = errors.New("谐趣白名单状态无法读取")
 	ErrXiequUID             = fmt.Errorf("%w：请填写有效的 UID", ErrXiequConfig)
 	ErrXiequUKEY            = fmt.Errorf("%w：请填写有效的 UKEY", ErrXiequConfig)
 	ErrXiequBaseURL         = fmt.Errorf("%w：接口地址无效", ErrXiequConfig)
@@ -77,26 +78,35 @@ type xiequStoredConfig struct {
 	ProxyDomains           []string `json:"proxy_domains"`
 }
 
-// ManagedIPs contains only records this installation added. It is the deletion
-// allow-list used when the account reaches its whitelist quota.
+// ManagedIPs 用于展示；自动删除必须另有 ManagedRecords 中的完整归属证据。
 type XiequWhitelistState struct {
-	Revision       uint64           `json:"state_revision,omitempty"`
-	Scope          string           `json:"scope,omitempty"`
-	ManagedIPs     []string         `json:"managed_ips,omitempty"`
-	PendingAdd     *XiequPendingAdd `json:"pending_add,omitempty"`
-	LastIP         string           `json:"last_ip,omitempty"`
-	LastStatus     string           `json:"last_status,omitempty"`
-	LastError      string           `json:"last_error,omitempty"`
-	WhitelistCount int              `json:"whitelist_count,omitempty"`
-	LastAttemptAt  *time.Time       `json:"last_attempt_at,omitempty"`
-	LastSuccessAt  *time.Time       `json:"last_success_at,omitempty"`
+	Revision       uint64               `json:"state_revision,omitempty"`
+	Scope          string               `json:"scope,omitempty"`
+	ManagedIPs     []string             `json:"managed_ips,omitempty"`
+	ManagedRecords []XiequManagedRecord `json:"managed_records,omitempty"`
+	PendingAdd     *XiequPendingAdd     `json:"pending_add,omitempty"`
+	LastIP         string               `json:"last_ip,omitempty"`
+	LastStatus     string               `json:"last_status,omitempty"`
+	LastError      string               `json:"last_error,omitempty"`
+	WhitelistCount int                  `json:"whitelist_count,omitempty"`
+	LastAttemptAt  *time.Time           `json:"last_attempt_at,omitempty"`
+	LastSuccessAt  *time.Time           `json:"last_success_at,omitempty"`
 }
 
 // XiequPendingAdd 仅记录当前安装、账号及配置代次发出的待确认添加。
 // Memo 包含随机操作标记，恢复时不能仅凭同一个 IP 认领手工记录。
 type XiequPendingAdd struct {
-	IP   string `json:"ip"`
-	Memo string `json:"memo"`
+	IP       string `json:"ip"`
+	Memo     string `json:"memo"`
+	Prepared bool   `json:"prepared,omitempty"`
+}
+
+// XiequManagedRecord 保留本安装在该配置代次确认的完整归属证据。
+// 旧版只有 IP 的记录不具有自动删除权限。
+type XiequManagedRecord struct {
+	IP    string `json:"ip"`
+	Memo  string `json:"memo"`
+	Scope string `json:"scope"`
 }
 
 func defaultXiequProxyDomains() []string {
@@ -340,9 +350,24 @@ func normalizeXiequState(state XiequWhitelistState) XiequWhitelistState {
 		if ip == nil || ip.To4() == nil || pending.Memo == "" || !validXiequMemo(pending.Memo) {
 			state.PendingAdd = nil
 		} else {
-			state.PendingAdd = &XiequPendingAdd{IP: ip.String(), Memo: pending.Memo}
+			state.PendingAdd = &XiequPendingAdd{IP: ip.String(), Memo: pending.Memo, Prepared: pending.Prepared}
 		}
 	}
+	records := make([]XiequManagedRecord, 0, len(state.ManagedRecords))
+	owned := map[string]bool{}
+	for _, record := range state.ManagedRecords {
+		ip := net.ParseIP(record.IP)
+		if ip == nil || ip.To4() == nil || record.Scope != state.Scope || record.Memo == "" || !validXiequMemo(record.Memo) || owned[ip.String()] {
+			continue
+		}
+		record.IP = ip.String()
+		owned[record.IP] = true
+		records = append(records, record)
+		if len(records) == maxXiequManagedStateIPs {
+			break
+		}
+	}
+	state.ManagedRecords = records
 	if ip := net.ParseIP(strings.TrimSpace(state.LastIP)); ip != nil && ip.To4() != nil {
 		state.LastIP = ip.String()
 	} else {
@@ -356,18 +381,31 @@ func normalizeXiequState(state XiequWhitelistState) XiequWhitelistState {
 
 func (d *DB) XiequWhitelistState() (XiequWhitelistState, error) {
 	raw, ok, err := d.GetSetting(settingXiequWhitelistState)
-	if err != nil || !ok {
+	if err != nil {
 		return XiequWhitelistState{}, err
 	}
 	var state XiequWhitelistState
-	if err := json.Unmarshal([]byte(raw), &state); err != nil {
-		return XiequWhitelistState{}, errors.New("谐趣白名单状态无法读取")
+	if ok {
+		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+			return XiequWhitelistState{}, ErrXiequStateUnreadable
+		}
 	}
 	config, err := d.XiequConfig()
 	if err != nil {
 		return XiequWhitelistState{}, err
 	}
-	return normalizeXiequState(state).ForConfig(config), nil
+	state = normalizeXiequState(state).ForConfig(config)
+	readCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	op, err := d.XiequOperation(readCtx, config)
+	if err != nil {
+		return XiequWhitelistState{}, err
+	}
+	if op != nil {
+		state.LastStatus = "operation_unknown"
+		state.LastError = "账号存在未确认完成的远端操作；已阻止后续变更，需可验证的完成证据"
+	}
+	return state, nil
 }
 
 func (d *DB) SetXiequWhitelistState(ctx context.Context, state XiequWhitelistState) error {
@@ -444,7 +482,8 @@ func (c XiequConfig) WhitelistScope() string {
 	return c.accountIdentity() + ":" + c.Revision
 }
 
-// TryXiequRefreshLock 在同一身份代次内串行化跨 Manager 的远端变更。
+// TryXiequRefreshLock 仅优化同一身份代次的刷新互斥，不能证明远端操作已退出。
+// 真正的远端变更准入必须另外取得持久账号操作屏障。
 // 会话锁使用独占连接，释放失败时丢弃连接，禁止把残留锁放回连接池。
 func (d *DB) TryXiequRefreshLock(ctx context.Context, scope string) (func(), bool, error) {
 	conn, err := d.Conn(ctx)
@@ -520,6 +559,10 @@ func (d *DB) SetXiequConfig(ctx context.Context, patch XiequConfigPatch) (XiequC
 		c = defaultXiequConfig()
 	}
 	previous := c
+	// 配置变更前把旧版已发送 pending 纳入账号屏障，不能靠换代次丢弃。
+	if err := preserveXiequLegacyPending(ctx, tx, previous); err != nil {
+		return XiequConfig{}, err
+	}
 	if patch.Enabled != nil {
 		c.Enabled = *patch.Enabled
 	}

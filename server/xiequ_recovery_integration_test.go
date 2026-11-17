@@ -60,6 +60,8 @@ func xiequIsolatedManager(t *testing.T) *Manager {
 
 func xiequConfigureFixture(t *testing.T, m *Manager, upstream *httptest.Server) db.XiequConfig {
 	t.Helper()
+	// 与生产直连客户端一致，避免 GET 连接重用后的自动重试掩盖断连分支。
+	upstream.Client().Transport.(*http.Transport).DisableKeepAlives = true
 	oldClient, oldProbe := newXiequClient, discoverXiequPublicIP
 	newXiequClient = func(base, uid, key string) *xiequ.Client {
 		return xiequ.NewWithHTTPClient(base, uid, key, upstream.Client())
@@ -131,13 +133,14 @@ func TestXiequPendingAddRecoversAfterLostResponsesAndRestart(t *testing.T) {
 	}
 	restarted := &Manager{pg: m.pg}
 	result, err = restarted.refreshXiequWhitelist(t.Context(), true)
-	if err != nil || !result.OK || len(result.ManagedIPs) != 1 || result.ManagedIPs[0] != "203.0.113.99" {
+	if err != nil || result.OK || result.Reason != "operation_unknown" || len(result.ManagedIPs) != 1 || result.ManagedIPs[0] != "203.0.113.99" {
 		t.Fatalf("重启未恢复provenance: %+v %v", result, err)
 	}
 	discoverXiequPublicIP = func(context.Context, *xiequ.Client) (string, error) { return "203.0.113.100", nil }
 	result, err = restarted.refreshXiequWhitelist(t.Context(), true)
-	if err != nil || len(deleted) != 1 || deleted[0] != "203.0.113.99" {
-		t.Fatalf("未只回收本安装添加: deleted=%v result=%+v err=%v", deleted, result, err)
+	// 原响应丢失，marker 只恢复归属；重启后也不能把它当作远端退出证明。
+	if err != nil || result.Reason != "operation_unknown" || len(deleted) != 0 {
+		t.Fatalf("未知操作期间发生后续变更: deleted=%v result=%+v err=%v", deleted, result, err)
 	}
 }
 
@@ -218,12 +221,12 @@ func TestXiequPendingRecoveryDoesNotClaimManualSameIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := m.refreshXiequWhitelist(t.Context(), true)
-	if err != nil || !result.OK || len(result.ManagedIPs) != 0 {
+	if err != nil || result.OK || result.Reason != "operation_unknown" || len(result.ManagedIPs) != 0 {
 		t.Fatalf("误认领手工同IP: %+v %v", result, err)
 	}
 	discoverXiequPublicIP = func(context.Context, *xiequ.Client) (string, error) { return "203.0.113.100", nil }
 	result, err = m.refreshXiequWhitelist(t.Context(), true)
-	if err != nil || result.Reason != "quota_full" || deletes.Load() != 0 {
+	if err != nil || result.Reason != "operation_unknown" || deletes.Load() != 0 {
 		t.Fatalf("手工满配额被误删: %+v %v deletes=%d", result, err, deletes.Load())
 	}
 }

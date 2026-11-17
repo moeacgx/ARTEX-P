@@ -91,6 +91,10 @@ func (s *Server) setXiequSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	config, err := s.m.pg.SetXiequConfig(r.Context(), patch)
+	if errors.Is(err, db.ErrXiequStateUnreadable) {
+		writeErr(w, 500, "谐趣白名单状态读取失败，请检查存储")
+		return
+	}
 	if errors.Is(err, db.ErrXiequConfig) {
 		writeErr(w, 400, err.Error())
 		return

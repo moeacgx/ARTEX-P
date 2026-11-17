@@ -2,25 +2,23 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/integrations/xiequ"
 )
 
 func TestXiequManagedIPHelpers(t *testing.T) {
-	entries := []xiequ.Entry{{IP: "203.0.113.7"}, {IP: "203.0.113.8"}}
 	managed := appendXiequManagedIP([]string{"203.0.113.7"}, "203.0.113.8")
 	if len(managed) != 2 {
 		t.Fatalf("追加管理 IP 失败: %#v", managed)
 	}
-	if got := pruneXiequManagedIPs(managed, entries[:1]); len(got) != 1 || got[0] != "203.0.113.7" {
-		t.Fatalf("未清理已消失的管理 IP: %#v", got)
-	}
-	if got := removeXiequManagedIPs(managed, []string{"203.0.113.7"}); len(got) != 1 || got[0] != "203.0.113.8" {
-		t.Fatalf("未移除已回收的管理 IP: %#v", got)
+	if got := appendXiequManagedIP(managed, "203.0.113.7"); len(got) != 2 {
+		t.Fatalf("管理 IP 重复追加: %#v", got)
 	}
 }
 
@@ -33,25 +31,38 @@ func TestXiequQuotaRulesAreExplicit(t *testing.T) {
 }
 
 func TestXiequQuotaCleanupOnlyDeletesManagedStaleIPs(t *testing.T) {
+	m := xiequIsolatedManager(t)
 	deleted := make([]string, 0, 1)
+	entries := []xiequ.Entry{
+		{IP: "203.0.113.10", Memo: "owned-current"},
+		{IP: "203.0.113.11", Memo: "owned-stale"},
+		{IP: "203.0.113.12", Memo: "manual"},
+		{IP: "203.0.113.13", Memo: "manual"},
+		{IP: "203.0.113.14", Memo: "manual"},
+	}
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("act") == "del" {
 			deleted = append(deleted, r.URL.Query().Get("ip"))
+			entries = append(entries[:1], entries[2:]...)
+			_, _ = w.Write([]byte("ok"))
+			return
 		}
-		_, _ = w.Write([]byte("ok"))
+		_ = json.NewEncoder(w).Encode(entries)
 	}))
 	defer upstream.Close()
-
+	config := xiequConfigureFixture(t, m, upstream)
 	client := xiequ.NewWithHTTPClient(upstream.URL, "uid-1", "key-1", upstream.Client())
-	entries := []xiequ.Entry{
-		{IP: "203.0.113.10"}, // current exit
-		{IP: "203.0.113.11"}, // managed stale
-		{IP: "203.0.113.12"}, // manual record
+	state := db.XiequWhitelistState{Scope: config.WhitelistScope(), ManagedRecords: []db.XiequManagedRecord{
+		{IP: "203.0.113.10", Memo: "owned-current", Scope: config.WhitelistScope()},
+		{IP: "203.0.113.11", Memo: "owned-stale", Scope: config.WhitelistScope()},
+	}}
+	if err := m.saveXiequRefreshState(t.Context(), &state); err != nil {
+		t.Fatal(err)
 	}
-	removed, err := (&Manager{}).removeStaleXiequManagedIPs(
+	removed, _, err := m.removeStaleXiequManagedIPs(
 		context.Background(),
 		client,
-		[]string{"203.0.113.10", "203.0.113.11"},
+		config, &state,
 		entries,
 		"203.0.113.10",
 	)

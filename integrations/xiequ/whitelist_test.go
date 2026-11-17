@@ -17,7 +17,7 @@ func TestClientListAddDeleteAndParameters(t *testing.T) {
 		}
 		switch r.URL.Query().Get("act") {
 		case "getjson":
-			_, _ = w.Write([]byte(`{"data":[{"IP":"203.0.113.7","MEMO":"manual"},{"IP":"not-an-ip","MEMO":"ignored"}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"IP":"203.0.113.7","MEMO":"manual"}]}`))
 		default:
 			_, _ = w.Write([]byte("ok"))
 		}
@@ -88,5 +88,42 @@ func TestClientRejectsUnsafeMemo(t *testing.T) {
 		if err := client.Add(context.Background(), "203.0.113.8", memo); err == nil {
 			t.Fatalf("不安全备注未被拒绝: %q", memo)
 		}
+	}
+}
+
+func TestClientMutationRequiresExplicitCompleteAcknowledgement(t *testing.T) {
+	for _, body := range []string{"", "quota full", "duplicate IP", "<html>ok</html>", `{"success":true}`, "ok"} {
+		t.Run(body, func(t *testing.T) {
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+			defer upstream.Close()
+			client := NewWithHTTPClient(upstream.URL, "synthetic-uid", "synthetic-key", upstream.Client())
+			for _, err := range []error{client.Add(t.Context(), "203.0.113.8", "owned"), client.Delete(t.Context(), "203.0.113.8")} {
+				if (err == nil) != (body == "ok") {
+					t.Fatalf("正文 %q 被错误分类: %v", body, err)
+				}
+			}
+		})
+	}
+}
+
+func TestClientEmptyListCannotProveDeletion(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	if _, err := NewWithHTTPClient(upstream.URL, "synthetic-uid", "synthetic-key", upstream.Client()).List(t.Context()); err == nil {
+		t.Fatal("空响应不能证明白名单为空或删除完成")
+	}
+}
+
+func TestClientMalformedListCannotProveDeletion(t *testing.T) {
+	for _, body := range []string{`{"data":null}`, `{"data":{"rows":null}}`, `[{}]`, `[{"IP":42}]`, `[{"IP":"bad-ip"}]`, `[{"IP":"203.0.113.99","MEMO":42}]`} {
+		t.Run(body, func(t *testing.T) {
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer upstream.Close()
+			if entries, err := NewWithHTTPClient(upstream.URL, "synthetic-uid", "synthetic-key", upstream.Client()).List(t.Context()); err == nil {
+				t.Fatalf("损坏列表被当作完成证据: %+v", entries)
+			}
+		})
 	}
 }

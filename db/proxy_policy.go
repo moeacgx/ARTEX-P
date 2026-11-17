@@ -583,6 +583,10 @@ func (x *ProxyPolicyExecutor) Complete(expected int64, token string) (ProxyPolic
 
 // 对话直连同样登记共享会话锁，取消不释放，真实资源清理完成后才解除原 token。
 func (d *DB) AcquireConversationOperation(id int64) (ProxyPolicy, string, error) {
+	if err := d.beginOperationAdmission(); err != nil {
+		return ProxyPolicy{}, "", err
+	}
+	defer d.endOperationAdmission()
 	s := ProxySubject{Kind: "conversation", ID: id}
 	var p ProxyPolicy
 	var token string

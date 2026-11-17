@@ -125,6 +125,10 @@ func waitFOFA(ctx context.Context, delay time.Duration) error {
 }
 
 func (d *DB) AcquireFOFARequest(ctx context.Context, key string, interval time.Duration) (*FOFARequestLease, error) {
+	if err := d.beginOperationAdmission(); err != nil {
+		return nil, err
+	}
+	defer d.endOperationAdmission()
 	if !ValidFOFAKey(key) || interval <= 0 {
 		return nil, ErrFOFAConfig
 	}

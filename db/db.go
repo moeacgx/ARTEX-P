@@ -582,10 +582,11 @@ func DSN() (dsn, source string, err error) {
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
 type DB struct {
 	*sql.DB
-	fofaPoolMu        sync.Mutex
-	fofaPool          *sql.DB
-	fofaPoolClosed    bool
-	operationReclaims taskOperationReclaims
+	fofaPoolMu         sync.Mutex
+	fofaPool           *sql.DB
+	fofaPoolClosed     bool
+	operationReclaims  taskOperationReclaims
+	operationLifecycle taskOperationLifecycle
 }
 
 // ensureDatabase connects to the postgres system database and creates the target
@@ -667,6 +668,7 @@ func openPostgresStore(dsn string) (*DB, error) {
 		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), err)
 	}
 	d := &DB{DB: sqlDB}
+	d.initOperationRecoveryIdentity(dsn)
 	// pgx runs multi-statement Exec via the simple protocol when there are no args.
 	// Keep the dedicated lock connection checked out until both DDL and seeding
 	// finish so concurrent application instances cannot initialize out of order.

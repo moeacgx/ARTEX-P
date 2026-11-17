@@ -49,6 +49,10 @@ func (d *DB) AcquireIdleTaskProxyActivity(taskID int64) error {
 }
 
 func (d *DB) acquireTaskProxyActivity(taskID int64, requireIdle bool) error {
+	if err := d.beginOperationAdmission(); err != nil {
+		return err
+	}
+	defer d.endOperationAdmission()
 	if taskID <= 0 {
 		return ErrProxyUnavailable
 	}

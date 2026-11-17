@@ -269,6 +269,10 @@ func ReleaseWarpHealthActivityTx(ctx context.Context, tx *sql.Tx, token string) 
 	return err
 }
 func (d *DB) AcquireWarpHealthActivity(ctx context.Context, id int64, token string) error {
+	if err := d.beginOperationAdmission(); err != nil {
+		return err
+	}
+	defer d.endOperationAdmission()
 	return d.withWarpHealth(ctx, func(tx *sql.Tx) error { return AcquireWarpHealthActivityTx(ctx, tx, id, token) })
 }
 func (d *DB) ReleaseWarpHealthActivity(ctx context.Context, token string) error {

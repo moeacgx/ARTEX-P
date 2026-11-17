@@ -129,6 +129,12 @@ func (d *DB) startTaskOperationReclaims() {
 }
 
 func (d *DB) closeTaskOperationReclaims() error {
+	ctx, stop := context.WithTimeout(context.Background(), postgresLifecycleTimeout)
+	defer stop()
+	return d.closeTaskOperationReclaimsContext(ctx)
+}
+
+func (d *DB) closeTaskOperationReclaimsContext(ctx context.Context) (err error) {
 	r := &d.operationReclaims
 	r.mu.Lock()
 	r.closed = true
@@ -137,12 +143,27 @@ func (d *DB) closeTaskOperationReclaims() error {
 		cancel()
 	}
 	r.mu.Unlock()
+	defer func() {
+		if err != nil {
+			r.mu.Lock()
+			r.closed = false
+			r.mu.Unlock()
+			d.startTaskOperationReclaims()
+		}
+	}()
 	if done != nil {
-		<-done
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// 已取消的循环可能尚在退出；结束后重新启动，避免丢失重试机会。
+			go func() {
+				<-done
+				d.startTaskOperationReclaims()
+			}()
+			return errors.Join(ErrProxySwitchRecovery, ctx.Err())
+		}
 	}
 	// 正常关闭仍尝试一次有界精确回收；未完成必须向调用者显式报告，不能静默丢弃。
-	ctx, stop := context.WithTimeout(context.Background(), postgresLifecycleTimeout)
-	defer stop()
 	var reclaimErr error
 	for token, id := range d.pendingTaskOperationReclaims() {
 		reclaimErr = errors.Join(reclaimErr, d.reclaimQueuedTaskOperation(ctx, id, token))

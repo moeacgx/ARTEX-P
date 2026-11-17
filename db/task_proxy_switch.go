@@ -79,6 +79,9 @@ func (d *DB) initTaskOperationLockPool(dsn string) error {
 }
 
 func (d *DB) taskOperationLockConn(ctx context.Context) (*sql.Conn, error) {
+	if err := d.operationAdmissionAllowed(); err != nil {
+		return nil, err
+	}
 	pool, ok := taskOperationLockPools.Load(d.DB)
 	if !ok {
 		return nil, ErrProxySwitchRecovery
@@ -88,15 +91,6 @@ func (d *DB) taskOperationLockConn(ctx context.Context) (*sql.Conn, error) {
 	return pool.(*sql.DB).Conn(bounded)
 }
 
-func (d *DB) Close() error {
-	var lockErr error
-	lockErr = errors.Join(d.closeTaskOperationReclaims(), d.closeFOFAThrottlePool())
-	if pool, ok := taskOperationLockPools.LoadAndDelete(d.DB); ok {
-		lockErr = errors.Join(lockErr, pool.(*sql.DB).Close())
-	}
-	return errors.Join(lockErr, d.DB.Close())
-}
-
 func taskProxySessionKey(id int64) int64 { return int64(0x5357500000000000) ^ id }
 
 func (d *DB) acquireTaskOperationSession(id int64) (*taskOperationLease, bool, error) {
@@ -104,6 +98,9 @@ func (d *DB) acquireTaskOperationSession(id int64) (*taskOperationLease, bool, e
 }
 
 func (d *DB) acquireTaskOperationSessionContext(ctx context.Context, id int64) (*taskOperationLease, bool, error) {
+	if err := d.operationAdmissionAllowed(); err != nil {
+		return nil, false, err
+	}
 	k := taskOperationLeaseKey{database: d.DB, taskID: id}
 	for attempt := 0; attempt < 2; attempt++ {
 		taskOperationLeases.Lock()
@@ -276,6 +273,10 @@ type TaskProxySwitchExecutor struct {
 }
 
 func (d *DB) AcquireTaskProxySwitchExecutor(ctx context.Context, id int64) (*TaskProxySwitchExecutor, error) {
+	if err := d.beginOperationAdmission(); err != nil {
+		return nil, err
+	}
+	defer d.endOperationAdmission()
 	conn, err := d.acquireTaskProxySwitchLockConn(ctx, id)
 	if err != nil {
 		return nil, err
@@ -463,6 +464,13 @@ func (d *DB) AcquireTaskOperation(id int64) (TaskProxyState, error) {
 }
 
 func (d *DB) AcquireTaskOperationContext(ctx context.Context, id int64) (TaskProxyState, error) {
+	if err := ctx.Err(); err != nil {
+		return TaskProxyState{}, err
+	}
+	if err := d.beginOperationAdmission(); err != nil {
+		return TaskProxyState{}, err
+	}
+	defer d.endOperationAdmission()
 	// 后续准入给已知失败 token 一次短协调机会；失败仍留队，由后台独立重试。
 	d.retryTaskOperationReclaimsBriefly(ctx)
 	var lastErr error
@@ -900,6 +908,11 @@ WHERE w.activity_token::text=a.token AND a.policy_id=p.id AND p.task_id=$1`, x.i
 // restored. It only removes owners whose dedicated advisory-lock backend is
 // gone; live sessions from another ARTEX instance remain protected.
 func (d *DB) RepairStaleTaskOperations() error {
+	reclaimCtx, cancel := context.WithTimeout(context.Background(), postgresLifecycleTimeout)
+	defer cancel()
+	if err := d.reclaimClosingTaskOperationDBs(reclaimCtx); err != nil {
+		return err
+	}
 	rows, err := d.Query(`SELECT task_id FROM task_operation_activity
 UNION
 SELECT p.task_id FROM proxy_subject_activity a

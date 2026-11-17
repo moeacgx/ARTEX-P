@@ -18,6 +18,10 @@ func checkProxyActivityOwnersTx(tx *sql.Tx, p ProxyPolicy) error {
 
 // 最终模型出口单独登记：inherit 渠道可能与工具不同，不能只用静态任务绑定保护。
 func (d *DB) AcquireProxyIOOperation(s ProxySubject, revision int64, proxyID *int64) (string, error) {
+	if err := d.beginOperationAdmission(); err != nil {
+		return "", err
+	}
+	defer d.endOperationAdmission()
 	lease, _, err := d.acquireTaskOperationSession(s.lockID())
 	if err != nil {
 		return "", err

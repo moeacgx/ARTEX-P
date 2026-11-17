@@ -54,6 +54,7 @@ type ptySession struct {
 	prompt  *regexp.Regexp
 
 	cmd  *exec.Cmd
+	tree *processTree
 	ptmx *os.File
 
 	mu       sync.Mutex
@@ -290,12 +291,14 @@ func (m *Manager) watchRetiredSession(s *ptySession) {
 func (s *ptySession) kill() {
 	s.mu.Lock()
 	s.state = "closed"
-	ptmx, cmd := s.ptmx, s.cmd
+	ptmx, cmd, tree := s.ptmx, s.cmd, s.tree
 	s.mu.Unlock()
 	if ptmx != nil {
 		_ = ptmx.Close()
 	}
-	if cmd != nil && cmd.Process != nil {
+	if tree != nil {
+		tree.kill()
+	} else if cmd != nil && cmd.Process != nil {
 		treeKill(cmd.Process)
 	}
 }
@@ -343,8 +346,8 @@ func (m *Manager) openSession(command, workDir string, env []string, rows, cols 
 	if e := withEnv(env); e != nil {
 		cmd.Env = e
 	}
-	ptmx, err := startPTY(cmd, rows, cols)
-	if err != nil {
+	ptmx, tree, err := startPTY(cmd, rows, cols)
+	if err != nil && ptmx == nil {
 		return nil, err
 	}
 	m.sessMu.Lock()
@@ -354,8 +357,15 @@ func (m *Manager) openSession(command, workDir string, env []string, rows, cols 
 
 	s := &ptySession{
 		id: id, command: command, rows: rows, cols: cols, mode: mode, prompt: prompt,
-		cmd: cmd, ptmx: ptmx, state: "running", lastOut: time.Now(),
+		cmd: cmd, tree: tree, ptmx: ptmx, state: "running", lastOut: time.Now(),
 		notifyCh: make(chan struct{}, 1), done: make(chan struct{}),
+	}
+	if err != nil {
+		// 已创建的收养者仍须留在严格清理集合中，不能因启动失败遗失退出门禁。
+		m.retireSession(id, s)
+		go m.readLoop(s)
+		s.kill()
+		return nil, err
 	}
 	m.sessMu.Lock()
 	m.sessions[id] = s
@@ -377,6 +387,7 @@ func (m *Manager) readLoop(s *ptySession) {
 		}
 	}
 	_ = s.cmd.Wait()
+	awaitProcessTree(s.tree)
 	s.mu.Lock()
 	if s.state != "closed" {
 		s.state = "exited"

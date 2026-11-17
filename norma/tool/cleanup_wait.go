@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -44,7 +45,7 @@ func (m *Manager) CleanupAndWait(ctx context.Context) error {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("任务进程或子孙退出尚未确认: %w", ctx.Err())
 		}
 	}
 	// 只有确认退出才删句柄，清理失败后的复查仍必须等待原进程。

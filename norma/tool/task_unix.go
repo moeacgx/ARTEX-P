@@ -1,8 +1,9 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package tool
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"syscall"
@@ -11,6 +12,8 @@ import (
 type processTree struct {
 	proc *os.Process
 }
+
+func preparePTYTree(cmd *exec.Cmd) (*processTree, error) { return nil, nil }
 
 // prepareProcessTree puts the child in its own process group so it survives the
 // per-turn context and can be killed as a whole tree.
@@ -31,7 +34,8 @@ func (t *processTree) kill() {
 		treeKill(t.proc)
 	}
 }
-func (t *processTree) close() {}
+func (t *processTree) close()                         {}
+func (t *processTree) wait(ctx context.Context) error { return nil }
 
 // treeKill terminates the process group, falling back to the lone process.
 func treeKill(p *os.Process) {

@@ -139,7 +139,9 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 	// full concurrency after the caller has already moved on.
 	out, _ := tc.Tasks.Output(t.ID, 0)
 	tc.Tasks.Kill(t.ID)
-	<-t.done
+	if _, done := tc.Tasks.Wait(context.Background(), t.ID, 5*time.Second); !done {
+		return Errorf(Capture(tc, out) + "\n\n[command timed out; 任务子孙退出尚未确认，保留任务与输出供清理重试]"), nil
+	}
 	tc.Tasks.Forget(t.ID)
 	return Errorf(Capture(tc, out) + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
 }

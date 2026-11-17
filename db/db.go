@@ -582,9 +582,10 @@ func DSN() (dsn, source string, err error) {
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
 type DB struct {
 	*sql.DB
-	fofaPoolMu     sync.Mutex
-	fofaPool       *sql.DB
-	fofaPoolClosed bool
+	fofaPoolMu        sync.Mutex
+	fofaPool          *sql.DB
+	fofaPoolClosed    bool
+	operationReclaims taskOperationReclaims
 }
 
 // ensureDatabase connects to the postgres system database and creates the target

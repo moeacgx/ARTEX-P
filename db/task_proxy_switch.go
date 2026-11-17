@@ -90,7 +90,7 @@ func (d *DB) taskOperationLockConn(ctx context.Context) (*sql.Conn, error) {
 
 func (d *DB) Close() error {
 	var lockErr error
-	lockErr = d.closeFOFAThrottlePool()
+	lockErr = errors.Join(d.closeTaskOperationReclaims(), d.closeFOFAThrottlePool())
 	if pool, ok := taskOperationLockPools.LoadAndDelete(d.DB); ok {
 		lockErr = errors.Join(lockErr, pool.(*sql.DB).Close())
 	}
@@ -188,6 +188,24 @@ func (d *DB) acquireTaskOperationSessionContext(ctx context.Context, id int64) (
 				return nil, false, err
 			}
 			return nil, false, ErrProxyInUse
+		}
+		if callerErr := ctx.Err(); callerErr != nil {
+			// 查询期间取消只撤销本次新锁，不能把 caller 的取消传进共享事务。
+			session.txMu.Lock()
+			undoCtx, undoCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			var unlocked bool
+			undoErr := session.conn.QueryRowContext(undoCtx, `SELECT pg_advisory_unlock_shared($1)`, taskProxySessionKey(id)).Scan(&unlocked)
+			undoCancel()
+			session.txMu.Unlock()
+			if undoErr != nil || !unlocked {
+				d.dropTaskOperationSessionLocked(session)
+				_ = session.conn.Raw(func(any) error { return driver.ErrBadConn })
+			}
+			taskOperationLeases.Unlock()
+			if session.tasks == 0 || undoErr != nil || !unlocked {
+				_ = session.conn.Close()
+			}
+			return nil, false, errors.Join(callerErr, undoErr)
 		}
 
 		lease := &taskOperationLease{conn: session.conn, refs: 1, txMu: session.txMu, session: session}
@@ -445,6 +463,8 @@ func (d *DB) AcquireTaskOperation(id int64) (TaskProxyState, error) {
 }
 
 func (d *DB) AcquireTaskOperationContext(ctx context.Context, id int64) (TaskProxyState, error) {
+	// 后续准入给已知失败 token 一次短协调机会；失败仍留队，由后台独立重试。
+	d.retryTaskOperationReclaimsBriefly(ctx)
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		state, retry, err := d.acquireTaskOperationOnce(ctx, id)
@@ -473,7 +493,16 @@ func (d *DB) acquireTaskOperationOnce(ctx context.Context, id int64) (TaskProxyS
 		return s, isTaskOperationConnectionError(err), err
 	}
 	lease.txMu.Lock()
-	err = d.withProxySwitchLifecycleContext(ctx, lease.conn, func(tx *sql.Tx) error {
+	if callerErr := ctx.Err(); callerErr != nil {
+		lease.txMu.Unlock()
+		return s, false, errors.Join(callerErr, d.releaseTaskOperationSession(id))
+	}
+	// 共享连接的 Begin/Rollback 不能继承单个请求取消；独立事务仍受原有十五秒上限约束。
+	// caller 取消在锁后、业务写入结束和提交后核对，取消准入的精确 token 才可回收。
+	err = d.withProxySwitchLifecycleContext(context.WithoutCancel(ctx), lease.conn, func(tx *sql.Tx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var err error
 		// 每次准入都检查一次。复用同一会话也不能把上一次异常退出留下的
 		// operation_owners 永久保留下来，否则暂停/删除会持续报活动占用。
@@ -532,15 +561,22 @@ operation_owners=jsonb_set(task_operation_activity.operation_owners,ARRAY[pg_bac
 			}
 		}
 		_, err = tx.Exec(`INSERT INTO proxy_subject_activity(token,policy_id,revision,proxy_id,backend_pid,kind) VALUES($1,$2,$3,$4,pg_backend_pid(),'task')`, s.OperationToken, policy.ID, s.Revision, s.ID)
-		return err
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
 	})
 	lease.txMu.Unlock()
+	committedButCanceled := err == nil && ctx.Err() != nil
+	if committedButCanceled {
+		err = ctx.Err()
+	}
 	if err != nil {
 		connectionError := isTaskOperationConnectionError(err)
-		if isTaskProxyLifecycleCommitError(err) && s.OperationToken != "" {
+		if (isTaskProxyLifecycleCommitError(err) || committedButCanceled) && s.OperationToken != "" {
 			// 准入尚未返回，业务不可能启动。本次 token 是唯一可安全回收的凭据；
 			// 使用独立连接核实提交结果，不能匿名释放或重放整个准入事务。
-			err = errors.Join(err, d.reclaimUnadmittedTaskOperation(id, s.OperationToken))
+			err = errors.Join(err, d.queueAndReclaimTaskOperation(id, s.OperationToken))
 		}
 		if connectionError {
 			taskOperationLeases.Lock()
@@ -558,7 +594,11 @@ operation_owners=jsonb_set(task_operation_activity.operation_owners,ARRAY[pg_bac
 }
 
 func (d *DB) reclaimUnadmittedTaskOperation(id int64, token string) error {
-	return d.withProxyLifecycle(func(tx *sql.Tx) error {
+	return d.reclaimUnadmittedTaskOperationContext(context.Background(), id, token)
+}
+
+func (d *DB) reclaimUnadmittedTaskOperationContext(ctx context.Context, id int64, token string) error {
+	return d.withProxyLifecycleContext(ctx, func(tx *sql.Tx) error {
 		var pid string
 		err := tx.QueryRow(`SELECT a.backend_pid::text FROM proxy_subject_activity a
 JOIN proxy_subject_policies p ON p.id=a.policy_id
@@ -750,6 +790,7 @@ func (d *DB) ReleaseTaskOperation(id int64) error {
 }
 
 func (d *DB) ReleaseTaskOperationToken(id int64, token string) error {
+	d.retryTaskOperationReclaimsBriefly(context.Background())
 	k := taskOperationLeaseKey{database: d.DB, taskID: id}
 	taskOperationLeases.Lock()
 	lease := taskOperationLeases.leases[k]

@@ -1122,7 +1122,7 @@ func (m *Manager) replaceTaskLLM(id string, mutation func(int64) error) (int64, 
 		return 0, nil
 	}
 	if task, ok := m.Task(id); ok {
-		reopened, reopenErr := task.Store.ReopenIntentsByBlockedReason(pgdb.IntentBlockedLLMQuota)
+		reopened, reopenErr := task.Store.ReopenIntentsByBlockedReasons(llmRecoverableStopReasons)
 		if reopenErr != nil {
 			return reopened, reopenErr
 		}

@@ -340,28 +340,30 @@ func trafficDTOs(ex []traffic.ExchangeMeta) []TrafficExchangeDTO {
 // ---- TaskNode (frontend "TaskNode") — frontier, intents, exploration graph nodes ----
 
 type TaskNodeDTO struct {
-	ID           string `json:"id"`
-	Type         string `json:"type"` // db Node.Kind
-	Payload      string `json:"payload,omitempty"`
-	Priority     int    `json:"priority"`
-	State        string `json:"state"`
-	Origin       string `json:"origin"`
-	TS           string `json:"ts"`
-	SourceTaskID string `json:"source_task_id,omitempty"`
-	Inherited    bool   `json:"inherited,omitempty"`
-	DeleteReason string `json:"delete_reason,omitempty"` // 意图假删除(state='deleted')时的删除原因
+	ID            string `json:"id"`
+	Type          string `json:"type"` // db Node.Kind
+	Payload       string `json:"payload,omitempty"`
+	Priority      int    `json:"priority"`
+	State         string `json:"state"`
+	Origin        string `json:"origin"`
+	TS            string `json:"ts"`
+	SourceTaskID  string `json:"source_task_id,omitempty"`
+	Inherited     bool   `json:"inherited,omitempty"`
+	DeleteReason  string `json:"delete_reason,omitempty"`  // 意图假删除(state='deleted')时的删除原因
+	BlockedReason string `json:"blocked_reason,omitempty"` // 意图 blocked/exhausted 时的终止原因代码；历史数据可为空
 }
 
 func taskNodeDTO(n *db.Node) TaskNodeDTO {
 	d := TaskNodeDTO{
-		ID:           i64s(n.ID),
-		Type:         n.Kind,
-		Payload:      rawString(n.Payload),
-		DeleteReason: n.DeleteReason,
-		Priority:     n.Priority,
-		State:        n.State,
-		Origin:       n.Origin,
-		TS:           rfc3339(n.CreatedAt),
+		ID:            i64s(n.ID),
+		Type:          n.Kind,
+		Payload:       rawString(n.Payload),
+		DeleteReason:  n.DeleteReason,
+		BlockedReason: n.BlockedReason,
+		Priority:      n.Priority,
+		State:         n.State,
+		Origin:        n.Origin,
+		TS:            rfc3339(n.CreatedAt),
 	}
 	if n.SourceTaskID > 0 {
 		d.SourceTaskID = i64s(n.SourceTaskID)

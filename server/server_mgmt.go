@@ -2019,7 +2019,7 @@ func (s *Server) restoreTasksAfterProfileDelete(pg *db.DB) {
 				// Resume only intents that were blocked by the exhausted chain; a
 				// paused task remains paused and terminal tasks remain immutable.
 				if !isTerminalStatus(task.lifecycleSnapshot().Status) && s.taskRuntimeAvailable(task, "planner", "worker") {
-					if _, reopenErr := task.Store.ReopenIntentsByBlockedReason(db.IntentBlockedLLMQuota); reopenErr != nil {
+					if _, reopenErr := task.Store.ReopenIntentsByBlockedReasons(llmRecoverableStopReasons); reopenErr != nil {
 						log.Printf("[llm-profile] task %s reopen quota-blocked intents after profile delete: %v", task.ID, reopenErr)
 					}
 				}

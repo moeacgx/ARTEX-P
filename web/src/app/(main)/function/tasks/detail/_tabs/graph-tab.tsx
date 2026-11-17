@@ -25,7 +25,7 @@ export function GraphTab({ taskId }: { taskId: string }) {
           const ns = g.nodes ?? [];
           const es = g.edges ?? [];
           const sig = JSON.stringify([
-            ns.map((n) => [n.id, n.type, n.state, n.priority, n.payload]),
+            ns.map((n) => [n.id, n.type, n.state, n.priority, n.payload, n.blocked_reason]),
             es.map((e) => [e.src, e.dst, e.rel]),
           ]);
           if (sig === sigRef.current) return; // 无变化 → 不重建

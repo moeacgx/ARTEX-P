@@ -17,6 +17,8 @@ import (
 
 const createNewProcessGroup = 0x00000200 // CREATE_NEW_PROCESS_GROUP
 
+var isProcessInJob = windows.NewLazySystemDLL("kernel32.dll").NewProc("IsProcessInJob")
+
 // Windows JOBOBJECT_BASIC_ACCOUNTING_INFORMATION，字段布局来自 winnt.h。
 type jobAccounting struct {
 	TotalUserTime, TotalKernelTime, PeriodUserTime, PeriodKernelTime int64
@@ -31,8 +33,22 @@ type processTree struct {
 	job     windows.Handle
 	port    windows.Handle
 	proc    *os.Process
-	members []windows.Handle
+	members map[uint32]*processMember
 	seen    uint32
+}
+
+type processIdentity struct {
+	pid     uint32
+	created uint64
+}
+
+type processMember struct {
+	identity processIdentity
+	known    bool
+	gone     bool
+	pin      windows.Handle
+	wait     windows.Handle
+	err      error
 }
 
 type jobCompletionPort struct {
@@ -72,7 +88,11 @@ func prepareProcessTree(cmd *exec.Cmd) (*processTree, error) {
 		_ = windows.CloseHandle(job)
 		return nil, fmt.Errorf("绑定 Job 进程通知: %w", err)
 	}
-	return &processTree{job: job, port: port}, nil
+	return &processTree{
+		job:     job,
+		port:    port,
+		members: make(map[uint32]*processMember),
+	}, nil
 }
 
 func (t *processTree) attach(p *os.Process) error {
@@ -165,8 +185,8 @@ func (t *processTree) close() {
 		_ = windows.CloseHandle(t.job)
 		t.job = 0
 	}
-	for _, h := range t.members {
-		_ = windows.CloseHandle(h)
+	for _, member := range t.members {
+		member.close()
 	}
 	t.members = nil
 	if t.port != 0 {
@@ -175,16 +195,108 @@ func (t *processTree) close() {
 	}
 }
 
-// NEW_PROCESS 通知可能丢失，必须用累计创建数核对完整性；缺失时保守返回未完成。
-// 打开后保留的进程句柄既防 PID 复用，也能证明退出，不能用 Job 活动数替代。
+func (m *processMember) close() {
+	if m.pin != 0 {
+		_ = windows.CloseHandle(m.pin)
+		m.pin = 0
+	}
+	if m.wait != 0 {
+		_ = windows.CloseHandle(m.wait)
+		m.wait = 0
+	}
+}
+
+func processCreationTime(handle windows.Handle) (uint64, error) {
+	var created, exited, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(handle, &created, &exited, &kernel, &user); err != nil {
+		return 0, err
+	}
+	return uint64(created.HighDateTime)<<32 | uint64(created.LowDateTime), nil
+}
+
+func (t *processTree) addMember(pid uint32) error {
+	if member, exists := t.members[pid]; exists {
+		// 持有句柄时固定原对象；消失对象无法区分代次，只能保守去重。
+		return member.err
+	}
+	member := &processMember{identity: processIdentity{pid: pid}}
+	t.members[pid] = member
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err == windows.ERROR_INVALID_PARAMETER {
+		// 通知已证明该 PID 曾属于 Job，当前已不存在相应进程对象。
+		member.gone = true
+		t.seen++
+		return nil
+	}
+	if err != nil {
+		member.err = err
+		return err
+	}
+	member.pin = h
+	return t.acquireWaitHandle(member)
+}
+
+func (t *processTree) acquireWaitHandle(member *processMember) error {
+	if member.gone || member.wait != 0 || member.pin == 0 {
+		return member.err
+	}
+	if !member.known {
+		// 失败后仅从已固定的对象重试查询，绝不重新相信裸 PID。
+		var inJob int32
+		ok, _, err := isProcessInJob.Call(uintptr(member.pin), uintptr(t.job), uintptr(unsafe.Pointer(&inJob)))
+		if ok == 0 {
+			member.err = err
+			return err
+		}
+		if inJob == 0 {
+			member.err = fmt.Errorf("PID %d 无法确认属于原 Job", member.identity.pid)
+			return member.err
+		}
+		created, err := processCreationTime(member.pin)
+		if err != nil {
+			member.err = err
+			return err
+		}
+		member.identity.created = created
+		member.known = true
+		t.seen++
+	}
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, member.identity.pid)
+	if err != nil {
+		member.err = err
+		return err
+	}
+	created, err := processCreationTime(h)
+	if err != nil {
+		_ = windows.CloseHandle(h)
+		member.err = err
+		return err
+	}
+	if created != member.identity.created {
+		_ = windows.CloseHandle(h)
+		member.err = fmt.Errorf("PID %d 已复用，拒绝替代原 Job 成员", member.identity.pid)
+		return member.err
+	}
+	member.wait = h
+	member.err = nil
+	if member.pin != 0 {
+		_ = windows.CloseHandle(member.pin)
+		member.pin = 0
+	}
+	return nil
+}
+
+// 每条 NEW_PROCESS 通知先保存为成员或待解析项；失败不丢失恢复状态。
+// 查询句柄固定进程对象并记录创建时间，防止重试时把复用 PID 当作原成员。
 func (t *processTree) collectMembers() error {
+	var firstErr error
 	for batch := 0; batch < 1024; batch++ {
 		var message uint32
 		var key uintptr
 		var pidValue *windows.Overlapped
 		err := windows.GetQueuedCompletionStatus(t.port, &message, &key, &pidValue, 0)
 		if err == windows.WAIT_TIMEOUT {
-			return nil
+			break
 		}
 		if err != nil {
 			return err
@@ -193,20 +305,16 @@ func (t *processTree) collectMembers() error {
 			continue
 		} // JOB_OBJECT_MSG_NEW_PROCESS
 		pid := uint32(uintptr(unsafe.Pointer(pidValue)))
-		h, err := windows.OpenProcess(windows.SYNCHRONIZE, false, pid)
-		if err == windows.ERROR_INVALID_PARAMETER {
-			t.seen++
-			continue
-		} // 进程对象已消失。
-		if err != nil {
-			return err
+		if err := t.addMember(pid); err != nil && firstErr == nil {
+			firstErr = err
 		}
-		// 进程退出期间可能已不在 Job 活动表中，但句柄尚未收到退出信号。
-		// 延迟通知遇到 PID 复用时只会保守延长等待，绝不用这些句柄发出 kill。
-		t.members = append(t.members, h)
-		t.seen++
 	}
-	return nil
+	for _, member := range t.members {
+		if err := t.acquireWaitHandle(member); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // TerminateJobObject 会先移除活动成员再完成异步退出，因此还需逐个等待进程句柄。
@@ -222,9 +330,12 @@ func (t *processTree) wait(ctx context.Context) error {
 		}
 		confirmed := err == nil && info.ActiveProcesses == 0 && info.TotalProcesses == t.seen
 		if confirmed {
-			for _, h := range t.members {
+			for _, member := range t.members {
+				if member.gone {
+					continue
+				}
 				var state uint32
-				state, err = windows.WaitForSingleObject(h, 0)
+				state, err = windows.WaitForSingleObject(member.wait, 0)
 				if err != nil || state != windows.WAIT_OBJECT_0 {
 					confirmed = false
 					break

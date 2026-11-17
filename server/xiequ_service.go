@@ -15,7 +15,7 @@ import (
 	"github.com/Autumn-27/artex/integrations/xiequ"
 )
 
-const xiequQuotaMessage = "谐趣账户最多添加 5 个白名单，且对账户下所有产品生效。账户下仅存在按次计费或流量计费产品时，可向客服免费申请增加白名单配额；账户下存在包时、包日或包月计费产品时无法增加白名单限额，可以注册新账户并购买同类型产品来增加配额。"
+const xiequQuotaMessage = "谐趣账户最多添加 5 个白名单，且对账户下所有产品生效。配额已满，请由用户在供应商后台人工处理后重试；本工具不会自动删除或回收任何远端条目。账户下仅存在按次计费或流量计费产品时，可向客服免费申请增加白名单配额；账户下存在包时、包日或包月计费产品时无法增加白名单限额，可以注册新账户并购买同类型产品来增加配额。"
 
 type xiequRefreshResult struct {
 	OK             bool       `json:"ok"`
@@ -24,7 +24,7 @@ type xiequRefreshResult struct {
 	PublicIP       string     `json:"public_ip,omitempty"`
 	WhitelistCount int        `json:"whitelist_count"`
 	Added          bool       `json:"added"`
-	Removed        []string   `json:"removed,omitempty"`
+	Removed        []string   `json:"removed"`
 	ManagedIPs     []string   `json:"managed_ips,omitempty"`
 	CheckedAt      time.Time  `json:"checked_at"`
 	LastSuccessAt  *time.Time `json:"last_success_at,omitempty"`
@@ -73,6 +73,18 @@ func (m *Manager) refreshXiequWhitelist(ctx context.Context, force bool) (xiequR
 		return result, err
 	}
 	if !locked {
+		// 同一账号的请求可能已发送；即使互斥锁仍在，也应准确显示持久未知屏障。
+		readCtx, cancelRead := context.WithTimeout(ctx, 3*time.Second)
+		op, readErr := m.pg.XiequOperation(readCtx, config)
+		cancelRead()
+		if readErr != nil {
+			return result, readErr
+		}
+		if op != nil {
+			result.Reason = "operation_unknown"
+			result.Message = "账号存在未确认完成的远端操作；已阻止后续变更，需可验证的完成证据"
+			return result, nil
+		}
 		result.Reason = "busy"
 		result.Message = "已有一次谐趣白名单刷新正在执行，本次刷新已跳过"
 		return result, nil
@@ -166,18 +178,10 @@ func (m *Manager) refreshXiequWhitelist(ctx context.Context, force bool) (xiequR
 		return result, nil
 	}
 
-	// 满额时先回收一条有完整归属证据的旧记录，绝不先发结果未知的 Add。
+	// 供应商仅按 IP 删除，没有原子身份条件；重新读列表仍无法保护手工重建条目。
+	// 保留归属跟踪，但满额时不再发出任何 Add/Del。
 	if len(entries) >= 5 {
-		var removed []string
-		removed, entries, err = m.removeStaleXiequManagedIPs(ctx, client, config, &state, entries, ip)
-		result.Removed = removed
-		result.WhitelistCount = len(entries)
-		if err != nil {
-			return m.finishXiequRefreshError(ctx, state, result, "operation_unknown", "回收结果尚未完整确认，已阻止后续变更", err)
-		}
-		if len(entries) >= 5 {
-			return m.finishXiequRefreshError(ctx, state, result, "quota_full", xiequQuotaMessage, nil)
-		}
+		return m.finishXiequRefreshError(ctx, state, result, "quota_full", xiequQuotaMessage, nil)
 	}
 	if err := m.prepareXiequAdd(ctx, &state, ip, config.Memo); err != nil {
 		return result, err
@@ -366,55 +370,6 @@ func pruneXiequManagedRecords(state *db.XiequWhitelistState, entries []xiequ.Ent
 		}
 	}
 	state.ManagedRecords, state.ManagedIPs = records, ips
-}
-
-func (m *Manager) removeStaleXiequManagedIPs(ctx context.Context, client *xiequ.Client, config db.XiequConfig, state *db.XiequWhitelistState, entries []xiequ.Entry, current string) ([]string, []xiequ.Entry, error) {
-	for _, record := range state.ManagedRecords {
-		if record.IP == current || record.Scope != config.WhitelistScope() {
-			continue
-		}
-		// 删除前重新获取列表并核对完整 marker，IP-only 历史记录没有权限。
-		fresh, err := client.List(ctx)
-		if err != nil {
-			return nil, entries, err
-		}
-		entries = fresh
-		if len(fresh) < 5 {
-			return []string{}, entries, nil
-		}
-		if !xiequPendingEntryPresent(&db.XiequPendingAdd{IP: record.IP, Memo: record.Memo}, fresh) {
-			continue
-		}
-		token, err := xiequOperationToken()
-		if err != nil {
-			return nil, entries, err
-		}
-		op := db.XiequOperation{Token: token, Scope: config.WhitelistScope(), Kind: "del", IP: record.IP, Memo: record.Memo}
-		if err := m.pg.ClaimXiequOperation(ctx, config, *state, op); err != nil {
-			return nil, entries, err
-		}
-		state.Revision++
-		deleteErr := client.Delete(ctx, record.IP)
-		verified, verifyErr := client.List(ctx)
-		if verifyErr != nil {
-			return nil, entries, verifyErr
-		}
-		entries = verified
-		if deleteErr != nil {
-			return nil, entries, deleteErr
-		}
-		if entryPresent(verified, record.IP) {
-			return nil, entries, errors.New("删除后仍存在该 IP，操作未确认")
-		}
-		completed := *state
-		pruneXiequManagedRecords(&completed, verified)
-		if err := m.completeXiequOperation(ctx, config, &completed, op); err != nil {
-			return nil, entries, err
-		}
-		*state = completed
-		return []string{record.IP}, entries, nil
-	}
-	return []string{}, entries, nil
 }
 
 func entryPresent(entries []xiequ.Entry, ip string) bool {

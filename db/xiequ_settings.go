@@ -78,7 +78,7 @@ type xiequStoredConfig struct {
 	ProxyDomains           []string `json:"proxy_domains"`
 }
 
-// ManagedIPs 用于展示；自动删除必须另有 ManagedRecords 中的完整归属证据。
+// ManagedIPs 和 ManagedRecords 仅跟踪归属，不授权自动删除远端条目。
 type XiequWhitelistState struct {
 	Revision       uint64               `json:"state_revision,omitempty"`
 	Scope          string               `json:"scope,omitempty"`
@@ -102,7 +102,7 @@ type XiequPendingAdd struct {
 }
 
 // XiequManagedRecord 保留本安装在该配置代次确认的完整归属证据。
-// 旧版只有 IP 的记录不具有自动删除权限。
+// 旧版只有 IP 的记录不自动补标接管。
 type XiequManagedRecord struct {
 	IP    string `json:"ip"`
 	Memo  string `json:"memo"`
@@ -456,6 +456,15 @@ ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`, settingXi
 }
 
 func (c XiequConfig) accountIdentity() string {
+	return c.xiequIdentity(true)
+}
+
+// 旧版本摘要保留 RawPath；仅用于证明并兼容历史 journal，不能作为新准入键。
+func (c XiequConfig) legacyAccountIdentity() string {
+	return c.xiequIdentity(false)
+}
+
+func (c XiequConfig) xiequIdentity(canonical bool) string {
 	endpoint, err := url.Parse(strings.TrimSpace(c.BaseURL))
 	if err == nil {
 		endpoint.Scheme = strings.ToLower(endpoint.Scheme)
@@ -468,6 +477,11 @@ func (c XiequConfig) accountIdentity() string {
 		}
 		if endpoint.Path == "" {
 			endpoint.Path = "/"
+		}
+		if canonical {
+			// 使用有效解码路径的统一转义拼写，避免 /api 与 /%61pi 分成两个账号。
+			// 合并可能过于保守，但不能让仅编码变化绕过未知操作屏障。
+			endpoint.RawPath = ""
 		}
 	}
 	address := strings.TrimSpace(c.BaseURL)
@@ -513,10 +527,23 @@ func (d *DB) TryXiequRefreshLock(ctx context.Context, scope string) (func(), boo
 }
 
 func (s XiequWhitelistState) ForConfig(c XiequConfig) XiequWhitelistState {
-	if s.Scope != c.WhitelistScope() {
-		return XiequWhitelistState{Scope: c.WhitelistScope()}
+	if s.Scope == c.WhitelistScope() {
+		return s
 	}
-	return s
+	if s.Scope == c.legacyAccountIdentity()+":"+c.Revision {
+		oldScope := s.Scope
+		s.Scope = c.WhitelistScope()
+		records := make([]XiequManagedRecord, len(s.ManagedRecords))
+		copy(records, s.ManagedRecords)
+		for i := range records {
+			if records[i].Scope == oldScope {
+				records[i].Scope = s.Scope
+			}
+		}
+		s.ManagedRecords = records
+		return s
+	}
+	return XiequWhitelistState{Scope: c.WhitelistScope()}
 }
 
 // SetXiequConfig merges a patch into one locked settings row so changing the

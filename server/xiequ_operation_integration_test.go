@@ -185,12 +185,18 @@ func TestXiequOperationCompleteResponseAllowsNormalNextRefresh(t *testing.T) {
 	}
 	discoverXiequPublicIP = func(context.Context, *xiequ.Client) (string, error) { return "203.0.113.100", nil }
 	next, err := (&Manager{pg: m.pg}).refreshXiequWhitelist(t.Context(), true)
-	if err != nil || !next.OK || adds != 2 || deletes != 1 || len(next.Removed) != 1 {
-		t.Fatalf("明确完成后的回收添加失败: %+v %v adds=%d deletes=%d", next, err, adds, deletes)
+	if err != nil || next.OK || next.Reason != "quota_full" || adds != 1 || deletes != 0 || len(next.Removed) != 0 {
+		t.Fatalf("满额时不应自动回收: %+v %v adds=%d deletes=%d", next, err, adds, deletes)
+	}
+	// 用户在供应商人工管理腾出配额后，正常完整响应允许后续添加。
+	entries = entries[1:]
+	next, err = (&Manager{pg: m.pg}).refreshXiequWhitelist(t.Context(), true)
+	if err != nil || !next.OK || adds != 2 || deletes != 0 {
+		t.Fatalf("人工处理后正常添加失败: %+v %v adds=%d deletes=%d", next, err, adds, deletes)
 	}
 	op, err = m.pg.XiequOperation(t.Context(), c)
 	if err != nil || op != nil {
-		t.Fatalf("正常 Del/Add 未释放: %+v %v", op, err)
+		t.Fatalf("正常 Add 未释放: %+v %v", op, err)
 	}
 }
 
@@ -234,8 +240,9 @@ func TestXiequUnknownDeleteBlocksRestartAndCredentialRotation(t *testing.T) {
 		entries = append(entries, xiequ.Entry{IP: ip, Memo: "manual"})
 	}
 	discoverXiequPublicIP = func(context.Context, *xiequ.Client) (string, error) { return "203.0.113.100", nil }
+	seedXiequUnknownLegacyDelete(t, m, c)
 	second, err := m.refreshXiequWhitelist(t.Context(), true)
-	if err != nil || second.Reason != "operation_unknown" || deletes != 1 || adds != 1 {
+	if err != nil || second.Reason != "operation_unknown" || deletes != 0 || adds != 1 {
 		t.Fatalf("未知删除继续添加: %+v %v", second, err)
 	}
 	for _, patch := range []db.XiequConfigPatch{{}, {UKEY: xiequStringPtr("rotated-key")}, {UID: xiequStringPtr("other-account")}, {UID: &c.UID}} {
@@ -245,7 +252,7 @@ func TestXiequUnknownDeleteBlocksRestartAndCredentialRotation(t *testing.T) {
 		}
 		if current.UID == c.UID {
 			r, err := (&Manager{pg: m.pg}).refreshXiequWhitelist(t.Context(), true)
-			if err != nil || r.Reason != "operation_unknown" || deletes != 1 || adds != 1 {
+			if err != nil || r.Reason != "operation_unknown" || deletes != 0 || adds != 1 {
 				t.Fatalf("重启/换密钥/ABA绕过删除屏障: %+v %v", r, err)
 			}
 		}
@@ -254,7 +261,7 @@ func TestXiequUnknownDeleteBlocksRestartAndCredentialRotation(t *testing.T) {
 
 func xiequStringPtr(value string) *string { return &value }
 
-func TestXiequDeleteRechecksFreshMarkerAndIgnoresLegacyIPOnly(t *testing.T) {
+func TestXiequQuotaDoesNotDeleteOwnedOrLegacyIPOnly(t *testing.T) {
 	for _, legacy := range []bool{false, true} {
 		t.Run(map[bool]string{false: "fresh-list-replacement", true: "legacy-ip-only"}[legacy], func(t *testing.T) {
 			m := xiequIsolatedManager(t)

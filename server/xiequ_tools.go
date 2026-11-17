@@ -96,7 +96,7 @@ func (s *Server) xiequStatusTool() actool.CoreTool {
 func (s *Server) xiequRefreshTool() actool.CoreTool {
 	return actool.Build(actool.Spec{
 		Name:        "xiequ_whitelist_refresh",
-		Description: "读取当前公网 IPv4，并确保它存在于谐趣代理池白名单中。只使用服务端保存的 UID/UKEY，不接受令牌参数；先读取白名单，缺失时添加并再次读取验证。配额满时只会删除本工具先前添加且已不在当前出口的 IP，绝不删除手工记录或 all。账户最多 5 个白名单；按次/流量计费产品可按客服规则申请增加，包时/包日/包月产品不能增加。",
+		Description: "读取当前公网 IPv4，并在配额允许时添加到谐趣代理池白名单，再次读取验证。只使用服务端保存的 UID/UKEY，不接受令牌参数。本工具不会自动删除或回收任何远端条目；配额满时返回 quota_full，需用户在供应商后台人工处理。未知 Add/Del 结果持续阻断后续变更，不提供无证据解除。账户最多 5 个白名单；按次/流量计费产品可按客服规则申请增加，包时/包日/包月产品不能增加。",
 		Schema:      xiequSchema(),
 		ReadOnly:    func(json.RawMessage) bool { return false },
 		Concurrent:  func(json.RawMessage) bool { return false },

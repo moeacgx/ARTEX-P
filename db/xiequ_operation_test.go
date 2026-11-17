@@ -14,7 +14,7 @@ func TestXiequOperationMissingStateStillReportsBarrier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	op := XiequOperation{Token: "pending-token", Scope: c.WhitelistScope(), Kind: "add", IP: "203.0.113.99", Memo: "pending-marker"}
+	op := XiequOperation{Token: "pending-token", Scope: c.WhitelistScope(), Kind: "add", IP: "203.0.113.99", Memo: "pending-marker", Account: c.accountIdentity()}
 	payload, _ := json.Marshal(op)
 	if _, err := d.Exec("INSERT INTO settings(key,value) VALUES($1,$2)", xiequOperationKey(c), string(payload)); err != nil {
 		t.Fatal(err)
@@ -41,7 +41,7 @@ func TestXiequLegacyPendingReplacesCompletedJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := XiequOperation{Token: "old-token", Scope: c.WhitelistScope(), Kind: "add", IP: "203.0.113.98", Memo: "old-marker", Completed: true}
+	old := XiequOperation{Token: "old-token", Scope: c.WhitelistScope(), Kind: "add", IP: "203.0.113.98", Memo: "old-marker", Completed: true, Account: c.accountIdentity()}
 	payload, _ := json.Marshal(old)
 	if _, err := d.Exec("INSERT INTO settings(key,value) VALUES($1,$2)", xiequOperationKey(c), string(payload)); err != nil {
 		t.Fatal(err)

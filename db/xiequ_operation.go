@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -28,11 +29,43 @@ func xiequOperationKey(c XiequConfig) string {
 }
 
 func readXiequOperation(raw string) (*XiequOperation, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil || fields == nil {
+		return nil, errors.New("谐趣远端操作屏障无法读取，已阻止变更")
+	}
+	for name, accountRaw := range fields {
+		if !strings.EqualFold(name, "account") {
+			continue
+		}
+		var account string
+		if name != "account" || json.Unmarshal(accountRaw, &account) != nil || !validXiequAccountDigest(account) {
+			return nil, errors.New("谐趣远端操作屏障账号摘要无效，已阻止变更")
+		}
+	}
 	var op XiequOperation
 	if err := json.Unmarshal([]byte(raw), &op); err != nil || op.Token == "" || op.Scope == "" || (op.Kind != "add" && op.Kind != "del") || op.IP == "" || op.Memo == "" {
 		return nil, errors.New("谐趣远端操作屏障无法读取，已阻止变更")
 	}
 	return &op, nil
+}
+
+func validXiequAccountDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && hex.EncodeToString(decoded) == value
+}
+
+func readXiequAccountOperation(raw string, c XiequConfig) (*XiequOperation, error) {
+	op, err := readXiequOperation(raw)
+	if err != nil {
+		return nil, err
+	}
+	if op.Account == "" || op.Account != c.accountIdentity() {
+		return nil, ErrXiequLegacyAccountUnknown
+	}
+	return op, nil
 }
 
 func (d *DB) XiequOperation(ctx context.Context, c XiequConfig) (*XiequOperation, error) {
@@ -48,12 +81,9 @@ func (d *DB) XiequOperation(ctx context.Context, c XiequConfig) (*XiequOperation
 	if err != nil {
 		return nil, err
 	}
-	op, err := readXiequOperation(raw)
+	op, err := readXiequAccountOperation(raw, c)
 	if err != nil {
 		return nil, err
-	}
-	if op.Account != "" && op.Account != c.accountIdentity() {
-		return nil, ErrXiequLegacyAccountUnknown
 	}
 	if !op.Completed {
 		return op, err
@@ -102,7 +132,11 @@ func xiequLegacyAccount(record xiequLegacyOperation, c XiequConfig) (string, err
 		return "", ErrXiequLegacyAccountUnknown
 	}
 	if record.op.Account != "" {
-		if len(record.op.Account) != 64 {
+		if !validXiequAccountDigest(record.op.Account) {
+			return "", ErrXiequLegacyAccountUnknown
+		}
+		// 格式合格不等于身份已证明。已有本地绑定不能与当前可重算的旧键证明矛盾。
+		if (hash == c.legacyAccountIdentity() || hash == c.accountIdentity()) && record.op.Account != c.accountIdentity() {
 			return "", ErrXiequLegacyAccountUnknown
 		}
 		return record.op.Account, nil
@@ -220,7 +254,7 @@ func (d *DB) transitionXiequOperation(ctx context.Context, c XiequConfig, state 
 	}
 	var existing *XiequOperation
 	if err == nil {
-		existing, err = readXiequOperation(raw)
+		existing, err = readXiequAccountOperation(raw, c)
 		if err != nil {
 			return err
 		}
@@ -312,7 +346,7 @@ func preserveXiequLegacyPending(ctx context.Context, tx *sql.Tx, c XiequConfig) 
 		return err
 	}
 	if err == nil {
-		existing, err := readXiequOperation(raw)
+		existing, err := readXiequAccountOperation(raw, c)
 		if err != nil {
 			return err
 		}

@@ -153,7 +153,8 @@ const intentStopReasons: Record<string, IntentStopReasonText> = {
   },
   llm_quota_exhausted: {
     title: "模型额度不足",
-    detail: "上游明确返回了额度或余额不足的信息，且所选模型配置已无可用项。请为该模型配置充值或更换后重跑。",
+    detail:
+      "上游明确返回了额度或余额不足的信息。若任务还配置了其他可用模型，系统会自动切换；仍停止时，请为该模型配置充值或更换后重跑。",
   },
   llm_auth_failed: {
     title: "模型认证失败",

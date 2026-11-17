@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/norma/harness"
 )
 
@@ -23,6 +24,12 @@ func TestClassifyIntentStopUpstreamErrors(t *testing.T) {
 		{"401 即使正文含额度字样也不算额度", harness.ReasonModelError, errors.New("status 401 unauthorized: insufficient_quota"), "blocked", intentStopAuthFailed},
 		{"普通 429 限流", harness.ReasonModelError, errors.New("status 429: rate limit reached, too many requests"), "blocked", intentStopRateLimited},
 		{"5xx 上游错误", harness.ReasonModelError, errors.New("upstream status 503: service unavailable"), "blocked", intentStopUpstreamError},
+		{"403 禁止访问按认证失败处理", harness.ReasonModelError, errors.New("provider returned status 403: forbidden"), "blocked", intentStopAuthFailed},
+		{"403 正文含额度字样也不算额度", harness.ReasonModelError, errors.New("status 403 forbidden: insufficient_quota"), "blocked", intentStopAuthFailed},
+		{"501 属于 5xx", harness.ReasonModelError, errors.New("upstream status 501: not implemented"), "blocked", intentStopUpstreamError},
+		{"507 属于 5xx", harness.ReasonModelError, errors.New("upstream status 507: insufficient storage"), "blocked", intentStopUpstreamError},
+		{"599 属于 5xx", harness.ReasonModelError, errors.New("http 599: network connect timeout"), "blocked", intentStopUpstreamError},
+		{"五位数状态码不是 5xx", harness.ReasonModelError, errors.New("status 5030 weird"), "blocked", intentStopLLMError},
 		{"明确额度不足", harness.ReasonModelError, errors.New("insufficient_quota: you exceeded your current quota, please check your plan and billing details"), "blocked", testQuotaCode},
 		{"响应等待超时", harness.ReasonModelError, fmt.Errorf("wait response: %w", context.DeadlineExceeded), "blocked", intentStopResponseTimout},
 		{"无法识别的错误", harness.ReasonModelError, errors.New("something odd happened"), "blocked", intentStopLLMError},
@@ -84,5 +91,17 @@ func TestIntentStopErrorCodeChainExhausted(t *testing.T) {
 	}
 	if got := intentStopErrorCode(errors.New("boom")); got != "" {
 		t.Fatalf("unknown: got %q", got)
+	}
+}
+
+func TestClassifyIntentStopTaskDeadline(t *testing.T) {
+	// 任务绝对截止夹逼运行时限：属于任务超时，不得写成 Worker 自身的 run_time_limit
+	deadline := fmt.Errorf("run: %w", agent.ErrTaskDeadline)
+	if s, c := classifyIntentStop(harness.ReasonTimeout, deadline); s != "exhausted" || c != intentStopTaskTimeout {
+		t.Fatalf("task deadline: got (%s,%s)", s, c)
+	}
+	// 没有任务截止标记的硬截止仍是 Worker 自身的运行时限
+	if s, c := classifyIntentStop(harness.ReasonTimeout, harness.ErrHardDeadlineExceeded); s != "exhausted" || c != intentStopRunTimeLimit {
+		t.Fatalf("own hard deadline: got (%s,%s)", s, c)
 	}
 }

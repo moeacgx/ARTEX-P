@@ -14,7 +14,16 @@ var errWorkerHardDeadline = errors.Join(errors.New("Worker 运行及收尾硬截
 
 // 正常预算仍负责触发收尾；外层绝对截止也覆盖工具装配、模型等待及压缩。
 // 显式不限保持不限，不能因为默认收尾宽限而悄悄增加运行上限。
+// ErrTaskDeadline 标记硬截止来自任务绝对截止(被夹逼后的运行时限)，而不是 Worker 自身的单次运行上限。
+var ErrTaskDeadline = errors.New("任务绝对截止已到达")
+
+var errWorkerTaskDeadline = errors.Join(ErrTaskDeadline, harness.ErrHardDeadlineExceeded, context.DeadlineExceeded)
+
 func workerRunContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	return workerRunContextCause(ctx, budget, errWorkerHardDeadline)
+}
+
+func workerRunContextCause(ctx context.Context, budget time.Duration, cause error) (context.Context, context.CancelFunc) {
 	if budget <= 0 {
 		return context.WithCancel(ctx)
 	}
@@ -24,7 +33,7 @@ func workerRunContext(ctx context.Context, budget time.Duration) (context.Contex
 	if budget <= maxDuration-allowance {
 		hardBudget = budget + allowance
 	}
-	return context.WithTimeoutCause(ctx, hardBudget, errWorkerHardDeadline)
+	return context.WithTimeoutCause(ctx, hardBudget, cause)
 }
 
 func workerRemainingBudget(start time.Time, budget time.Duration) time.Duration {

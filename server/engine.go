@@ -99,10 +99,32 @@ const (
 	intentStopChainUnavailable = "llm_chain_unavailable" // 所选模型配置均不可用（无明确额度证据）
 )
 
+// llmRecoverableStopReasons 是模型链被保存/重置/删除恢复后可以安全重开的停止原因：
+// 明确额度不足，以及无额度证据的“整条链暂不可用”。认证/限流/5xx 等不在其中，不会被自动重开。
+var llmRecoverableStopReasons = []string{db.IntentBlockedLLMQuota, intentStopChainUnavailable}
+
 func intentStopMsgHasAny(msg string, needles ...string) bool {
 	for _, n := range needles {
 		if strings.Contains(msg, n) {
 			return true
+		}
+	}
+	return false
+}
+
+// intentStopHasHTTP5xx 识别 "status 5xx" / "http 5xx"（500-599）。只匹配状态码，不扩大额度判定。
+func intentStopHasHTTP5xx(msg string) bool {
+	for _, p := range []string{"status ", "http "} {
+		for i := 0; ; {
+			j := strings.Index(msg[i:], p)
+			if j < 0 {
+				break
+			}
+			k := i + j + len(p)
+			if k+3 <= len(msg) && msg[k] == '5' && msg[k+1] >= '0' && msg[k+1] <= '9' && msg[k+2] >= '0' && msg[k+2] <= '9' && (k+3 == len(msg) || msg[k+3] < '0' || msg[k+3] > '9') {
+				return true
+			}
+			i = k
 		}
 	}
 	return false
@@ -126,11 +148,11 @@ func intentStopErrorCode(err error) string {
 	}
 	msg := strings.ToLower(err.Error())
 	switch {
-	case intentStopMsgHasAny(msg, "status 401", "http 401", "unauthorized", "invalid api key", "invalid_api_key", "authentication"):
+	case intentStopMsgHasAny(msg, "status 401", "http 401", "status 403", "http 403", "forbidden", "unauthorized", "invalid api key", "invalid_api_key", "authentication"):
 		return intentStopAuthFailed
 	case intentStopMsgHasAny(msg, "status 429", "http 429", "rate limit", "rate_limit", "too many requests"):
 		return intentStopRateLimited
-	case intentStopMsgHasAny(msg, "status 500", "status 502", "status 503", "status 504", "status 529", "http 500", "http 502", "http 503", "http 504", "http 529"):
+	case intentStopHasHTTP5xx(msg):
 		return intentStopUpstreamError
 	}
 	return ""
@@ -141,7 +163,10 @@ func classifyIntentStop(reason harness.TerminalReason, err error) (state, code s
 	switch {
 	case reason == harness.ReasonTimeout:
 		state, code = "exhausted", intentStopRunTimeLimit
-		if err != nil && !errors.Is(err, harness.ErrHardDeadlineExceeded) && !errors.Is(err, harness.ErrHardDeadlineCleanup) {
+		if errors.Is(err, agent.ErrTaskDeadline) {
+			// 硬截止来自任务绝对截止(夹逼后的时限)，不是 agents.run_seconds。
+			code = intentStopTaskTimeout
+		} else if err != nil && !errors.Is(err, harness.ErrHardDeadlineExceeded) && !errors.Is(err, harness.ErrHardDeadlineCleanup) {
 			if c := intentStopErrorCode(err); c != "" {
 				state, code = "blocked", c
 			}

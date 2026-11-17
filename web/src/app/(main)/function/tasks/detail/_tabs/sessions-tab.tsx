@@ -1857,7 +1857,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
               );
             })()}
             {(() => {
-              if (active.role !== "worker" || active.inherited) return null;
+              if (active.role !== "worker") return null;
               const stop = intentStopReason(active.status, active.blocked_reason);
               if (!stop) return null;
               const isBlocked = active.status === "blocked";

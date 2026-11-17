@@ -98,3 +98,11 @@ test("llm_chain_unavailable 只说明模型配置不可用，不暗示余额问�
   const text = (stop.title + stop.detail).replace(/没有明确的额度不足证据|不能认定为余额问题/g, "");
   assert.ok(!/余额|额度不足|充值/.test(text));
 });
+
+test("单个模型额度不足不断言整条模型链无可用项（后继可能仍可用）", () => {
+  const stop = intentStopReason("blocked", "llm_quota_exhausted");
+  assert.ok(stop);
+  assert.ok(stop.detail.includes("额度或余额不足"));
+  assert.ok(!stop.detail.includes("已无可用项"));
+  assert.ok(stop.detail.includes("其他可用模型"));
+});

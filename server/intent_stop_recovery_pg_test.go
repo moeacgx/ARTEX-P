@@ -29,6 +29,16 @@ func intentStopPGManager(t *testing.T) *Manager {
 	return m
 }
 
+// 在 profile 之后登记清理，按 LIFO 保证任务 → profile → Manager.Close。
+func cleanupIntentStopTask(t *testing.T, m *Manager, task *Task) {
+	t.Helper()
+	t.Cleanup(func() {
+		if _, err := m.DeleteTask(task.ID, DeleteTaskOptions{DeleteFiles: true}); err != nil {
+			t.Errorf("清理测试任务 %s: %v", task.ID, err)
+		}
+	})
+}
+
 // 链不可用(无额度证据)的阻塞意图必须随真实的模型链保存/重置重开；
 // 认证失败不重开；终态任务不重开。
 func TestReplaceTaskLLMProfilesReopensChainUnavailablePG(t *testing.T) {
@@ -39,13 +49,18 @@ func TestReplaceTaskLLMProfilesReopensChainUnavailablePG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM llm_profiles WHERE id=$1`, profile) })
+	t.Cleanup(func() {
+		if _, err := m.pg.Exec(`DELETE FROM llm_profiles WHERE id=$1`, profile); err != nil {
+			t.Errorf("清理测试 profile: %v", err)
+		}
+	})
 
 	newTask := func(name string) (*Task, int64) {
 		task, err := m.CreateTaskWithOptions(name, "intent stop recovery", db.TaskCreateOptions{LLMProfileIDs: []int64{profile}})
 		if err != nil {
 			t.Fatal(err)
 		}
+		cleanupIntentStopTask(t, m, task)
 		n, _ := parseTaskID(task.ID)
 		if _, err := m.pg.MarkTaskLLMProfileQuotaExhausted(n, profile, "insufficient_quota"); err != nil {
 			t.Fatal(err)
@@ -146,6 +161,7 @@ func TestRunIntentTaskDeadlineIsNotWorkerRunLimitPG(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			cleanupIntentStopTask(t, m, task)
 			e := NewEngine(m)
 			e.deadline.Store(task.ID, time.Now().Add(2*time.Second).Unix())
 			wait := tool.Build(tool.Spec{Name: "DeadlineWait", Schema: map[string]any{"type": "object"}, Run: func(ctx context.Context, _ json.RawMessage, _ *tool.ToolContext) (tool.Result, error) {

@@ -3722,12 +3722,6 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, err.Error())
 			return
 		}
-		// 已启动任务也立即扩缩容；未启动任务仍会在 Engine.Run 读取新值。
-		if s.engine != nil {
-			for _, task := range s.m.List() {
-				s.engine.ScaleWorkers(task, *req.Workers)
-			}
-		}
 	}
 	if req.ConcurrencyEnabled != nil || req.ConcurrencyLimit != nil {
 		// 部分 PUT:未给的字段用当前值兜底,避免只改一个把另一个重置。

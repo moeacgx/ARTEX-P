@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,7 +21,7 @@ import (
 const (
 	settingXiequ                = "integration.xiequ.v1"
 	settingXiequWhitelistState  = "integration.xiequ.whitelist.v1"
-	DefaultXiequBaseURL         = "http://op.xiequ.cn/IpWhiteList.aspx"
+	DefaultXiequBaseURL         = "https://op.xiequ.cn/IpWhiteList.aspx"
 	DefaultXiequMemo            = "ARTEX auto"
 	DefaultXiequRefreshInterval = 300
 	minXiequRefreshInterval     = 30
@@ -32,6 +34,8 @@ const (
 var (
 	ErrXiequConfig          = errors.New("谐趣白名单配置无效")
 	ErrXiequConfigChanged   = errors.New("谐趣白名单配置已变更，拒绝旧刷新状态")
+	ErrXiequStateChanged    = errors.New("谐趣白名单状态已变更，拒绝并发刷新状态")
+	ErrXiequStateUnreadable = errors.New("谐趣白名单状态无法读取")
 	ErrXiequUID             = fmt.Errorf("%w：请填写有效的 UID", ErrXiequConfig)
 	ErrXiequUKEY            = fmt.Errorf("%w：请填写有效的 UKEY", ErrXiequConfig)
 	ErrXiequBaseURL         = fmt.Errorf("%w：接口地址无效", ErrXiequConfig)
@@ -74,17 +78,35 @@ type xiequStoredConfig struct {
 	ProxyDomains           []string `json:"proxy_domains"`
 }
 
-// ManagedIPs contains only records this installation added. It is the deletion
-// allow-list used when the account reaches its whitelist quota.
+// ManagedIPs 和 ManagedRecords 仅跟踪归属，不授权自动删除远端条目。
 type XiequWhitelistState struct {
-	Scope          string     `json:"scope,omitempty"`
-	ManagedIPs     []string   `json:"managed_ips,omitempty"`
-	LastIP         string     `json:"last_ip,omitempty"`
-	LastStatus     string     `json:"last_status,omitempty"`
-	LastError      string     `json:"last_error,omitempty"`
-	WhitelistCount int        `json:"whitelist_count,omitempty"`
-	LastAttemptAt  *time.Time `json:"last_attempt_at,omitempty"`
-	LastSuccessAt  *time.Time `json:"last_success_at,omitempty"`
+	Revision       uint64               `json:"state_revision,omitempty"`
+	Scope          string               `json:"scope,omitempty"`
+	ManagedIPs     []string             `json:"managed_ips,omitempty"`
+	ManagedRecords []XiequManagedRecord `json:"managed_records,omitempty"`
+	PendingAdd     *XiequPendingAdd     `json:"pending_add,omitempty"`
+	LastIP         string               `json:"last_ip,omitempty"`
+	LastStatus     string               `json:"last_status,omitempty"`
+	LastError      string               `json:"last_error,omitempty"`
+	WhitelistCount int                  `json:"whitelist_count,omitempty"`
+	LastAttemptAt  *time.Time           `json:"last_attempt_at,omitempty"`
+	LastSuccessAt  *time.Time           `json:"last_success_at,omitempty"`
+}
+
+// XiequPendingAdd 仅记录当前安装、账号及配置代次发出的待确认添加。
+// Memo 包含随机操作标记，恢复时不能仅凭同一个 IP 认领手工记录。
+type XiequPendingAdd struct {
+	IP       string `json:"ip"`
+	Memo     string `json:"memo"`
+	Prepared bool   `json:"prepared,omitempty"`
+}
+
+// XiequManagedRecord 保留本安装在该配置代次确认的完整归属证据。
+// 旧版只有 IP 的记录不自动补标接管。
+type XiequManagedRecord struct {
+	IP    string `json:"ip"`
+	Memo  string `json:"memo"`
+	Scope string `json:"scope"`
 }
 
 func defaultXiequProxyDomains() []string {
@@ -218,7 +240,7 @@ func validXiequBaseURL(raw string) bool {
 		return false
 	}
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
 		return false
 	}
 	return true
@@ -323,6 +345,29 @@ func normalizeXiequState(state XiequWhitelistState) XiequWhitelistState {
 		ips = ips[:maxXiequManagedStateIPs]
 	}
 	state.ManagedIPs = ips
+	if pending := state.PendingAdd; pending != nil {
+		ip := net.ParseIP(pending.IP)
+		if ip == nil || ip.To4() == nil || pending.Memo == "" || !validXiequMemo(pending.Memo) {
+			state.PendingAdd = nil
+		} else {
+			state.PendingAdd = &XiequPendingAdd{IP: ip.String(), Memo: pending.Memo, Prepared: pending.Prepared}
+		}
+	}
+	records := make([]XiequManagedRecord, 0, len(state.ManagedRecords))
+	owned := map[string]bool{}
+	for _, record := range state.ManagedRecords {
+		ip := net.ParseIP(record.IP)
+		if ip == nil || ip.To4() == nil || record.Scope != state.Scope || record.Memo == "" || !validXiequMemo(record.Memo) || owned[ip.String()] {
+			continue
+		}
+		record.IP = ip.String()
+		owned[record.IP] = true
+		records = append(records, record)
+		if len(records) == maxXiequManagedStateIPs {
+			break
+		}
+	}
+	state.ManagedRecords = records
 	if ip := net.ParseIP(strings.TrimSpace(state.LastIP)); ip != nil && ip.To4() != nil {
 		state.LastIP = ip.String()
 	} else {
@@ -336,18 +381,31 @@ func normalizeXiequState(state XiequWhitelistState) XiequWhitelistState {
 
 func (d *DB) XiequWhitelistState() (XiequWhitelistState, error) {
 	raw, ok, err := d.GetSetting(settingXiequWhitelistState)
-	if err != nil || !ok {
+	if err != nil {
 		return XiequWhitelistState{}, err
 	}
 	var state XiequWhitelistState
-	if err := json.Unmarshal([]byte(raw), &state); err != nil {
-		return XiequWhitelistState{}, errors.New("谐趣白名单状态无法读取")
+	if ok {
+		if err := json.Unmarshal([]byte(raw), &state); err != nil {
+			return XiequWhitelistState{}, ErrXiequStateUnreadable
+		}
 	}
 	config, err := d.XiequConfig()
 	if err != nil {
 		return XiequWhitelistState{}, err
 	}
-	return normalizeXiequState(state).ForConfig(config), nil
+	state = normalizeXiequState(state).ForConfig(config)
+	readCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	op, err := d.XiequOperation(readCtx, config)
+	if err != nil {
+		return XiequWhitelistState{}, err
+	}
+	if op != nil {
+		state.LastStatus = "operation_unknown"
+		state.LastError = "账号存在未确认完成的远端操作；已阻止后续变更，需可验证的完成证据"
+	}
+	return state, nil
 }
 
 func (d *DB) SetXiequWhitelistState(ctx context.Context, state XiequWhitelistState) error {
@@ -367,6 +425,22 @@ func (d *DB) SetXiequWhitelistState(ctx context.Context, state XiequWhitelistSta
 	if state.Scope == "" || state.Scope != config.WhitelistScope() {
 		return ErrXiequConfigChanged
 	}
+	var previousRaw string
+	err = tx.QueryRowContext(ctx, "SELECT value FROM settings WHERE key=$1", settingXiequWhitelistState).Scan(&previousRaw)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var previous XiequWhitelistState
+	if err == nil {
+		if err := json.Unmarshal([]byte(previousRaw), &previous); err != nil {
+			return errors.New("谐趣白名单状态无法读取")
+		}
+	}
+	previous = previous.ForConfig(config)
+	if state.Revision != previous.Revision {
+		return ErrXiequStateChanged
+	}
+	state.Revision++
 	state = normalizeXiequState(state)
 	b, err := json.Marshal(state)
 	if err != nil {
@@ -382,6 +456,15 @@ ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`, settingXi
 }
 
 func (c XiequConfig) accountIdentity() string {
+	return c.xiequIdentity(true)
+}
+
+// 旧版本摘要保留 RawPath；仅用于证明并兼容历史 journal，不能作为新准入键。
+func (c XiequConfig) legacyAccountIdentity() string {
+	return c.xiequIdentity(false)
+}
+
+func (c XiequConfig) xiequIdentity(canonical bool) string {
 	endpoint, err := url.Parse(strings.TrimSpace(c.BaseURL))
 	if err == nil {
 		endpoint.Scheme = strings.ToLower(endpoint.Scheme)
@@ -394,6 +477,11 @@ func (c XiequConfig) accountIdentity() string {
 		}
 		if endpoint.Path == "" {
 			endpoint.Path = "/"
+		}
+		if canonical {
+			// 使用有效解码路径的统一转义拼写，避免 /api 与 /%61pi 分成两个账号。
+			// 合并可能过于保守，但不能让仅编码变化绕过未知操作屏障。
+			endpoint.RawPath = ""
 		}
 	}
 	address := strings.TrimSpace(c.BaseURL)
@@ -408,11 +496,54 @@ func (c XiequConfig) WhitelistScope() string {
 	return c.accountIdentity() + ":" + c.Revision
 }
 
-func (s XiequWhitelistState) ForConfig(c XiequConfig) XiequWhitelistState {
-	if s.Scope != c.WhitelistScope() {
-		return XiequWhitelistState{Scope: c.WhitelistScope()}
+// TryXiequRefreshLock 仅优化同一身份代次的刷新互斥，不能证明远端操作已退出。
+// 真正的远端变更准入必须另外取得持久账号操作屏障。
+// 会话锁使用独占连接，释放失败时丢弃连接，禁止把残留锁放回连接池。
+func (d *DB) TryXiequRefreshLock(ctx context.Context, scope string) (func(), bool, error) {
+	conn, err := d.Conn(ctx)
+	if err != nil {
+		return nil, false, err
 	}
-	return s
+	key := "xiequ-refresh:" + scope
+	var locked bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, key).Scan(&locked); err != nil {
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		conn.Close()
+		return nil, false, err
+	}
+	if !locked {
+		conn.Close()
+		return nil, false, nil
+	}
+	return func() {
+		defer conn.Close()
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		var unlocked bool
+		if err := conn.QueryRowContext(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, key).Scan(&unlocked); err != nil || !unlocked {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+	}, true, nil
+}
+
+func (s XiequWhitelistState) ForConfig(c XiequConfig) XiequWhitelistState {
+	if s.Scope == c.WhitelistScope() {
+		return s
+	}
+	if s.Scope == c.legacyAccountIdentity()+":"+c.Revision {
+		oldScope := s.Scope
+		s.Scope = c.WhitelistScope()
+		records := make([]XiequManagedRecord, len(s.ManagedRecords))
+		copy(records, s.ManagedRecords)
+		for i := range records {
+			if records[i].Scope == oldScope {
+				records[i].Scope = s.Scope
+			}
+		}
+		s.ManagedRecords = records
+		return s
+	}
+	return XiequWhitelistState{Scope: c.WhitelistScope()}
 }
 
 // SetXiequConfig merges a patch into one locked settings row so changing the
@@ -455,6 +586,10 @@ func (d *DB) SetXiequConfig(ctx context.Context, patch XiequConfigPatch) (XiequC
 		c = defaultXiequConfig()
 	}
 	previous := c
+	// 配置变更前把旧版已发送 pending 纳入账号屏障，不能靠换代次丢弃。
+	if err := preserveXiequLegacyPending(ctx, tx, previous); err != nil {
+		return XiequConfig{}, err
+	}
 	if patch.Enabled != nil {
 		c.Enabled = *patch.Enabled
 	}

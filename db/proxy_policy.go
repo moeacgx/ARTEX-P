@@ -454,6 +454,11 @@ func (x *ProxyPolicyExecutor) BeginMigration(expected, from, target int64) (Prox
 }
 
 func (x *ProxyPolicyExecutor) begin(expected int64, patch ProxyPolicyPatch, migrationFrom int64) (ProxyPolicy, string, error) {
+	// Begin 与 BeginMigration 共用实际准入边界，不能只在借执行器时检查关闭状态。
+	if err := x.x.d.beginOperationAdmission(); err != nil {
+		return ProxyPolicy{}, "", err
+	}
+	defer x.x.d.endOperationAdmission()
 	var old ProxyPolicy
 	var token string
 	err := x.x.d.withProxySwitchLifecycle(x.x.conn, func(tx *sql.Tx) error {
@@ -583,6 +588,10 @@ func (x *ProxyPolicyExecutor) Complete(expected int64, token string) (ProxyPolic
 
 // 对话直连同样登记共享会话锁，取消不释放，真实资源清理完成后才解除原 token。
 func (d *DB) AcquireConversationOperation(id int64) (ProxyPolicy, string, error) {
+	if err := d.beginOperationAdmission(); err != nil {
+		return ProxyPolicy{}, "", err
+	}
+	defer d.endOperationAdmission()
 	s := ProxySubject{Kind: "conversation", ID: id}
 	var p ProxyPolicy
 	var token string

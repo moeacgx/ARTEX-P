@@ -70,7 +70,7 @@ func (c *Client) List(ctx context.Context) ([]Entry, error) {
 		return nil, err
 	}
 	if len(strings.TrimSpace(string(body))) == 0 {
-		return []Entry{}, nil
+		return nil, errors.New("谐趣白名单列表响应为空，无法核验操作结果")
 	}
 	entries, err := decodeEntries(body)
 	if err != nil {
@@ -80,7 +80,7 @@ func (c *Client) List(ctx context.Context) ([]Entry, error) {
 	for _, entry := range entries {
 		ip, ok := publicIPv4(entry.IP)
 		if !ok {
-			continue
+			return nil, errors.New("谐趣白名单列表包含无效 IP，无法核验操作结果")
 		}
 		out = append(out, Entry{IP: ip, Memo: strings.TrimSpace(entry.Memo)})
 	}
@@ -89,10 +89,8 @@ func (c *Client) List(ctx context.Context) ([]Entry, error) {
 
 type entryWire map[string]json.RawMessage
 
-// decodeEntries accepts the response shapes seen across Xiequ deployments:
-// a root array, {"data":[...]}, or a nested list object. Field names are
-// matched case-insensitively, with "meno" kept as an alias for the documented
-// management API spelling.
+// decodeEntries 支持根数组、data 数组和嵌套列表。字段名忽略大小写，
+// 保留 meno 别名；损坏字段不能被过滤成空列表作为删除完成证据。
 func decodeEntries(body []byte) ([]Entry, error) {
 	var root json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil {
@@ -117,7 +115,7 @@ func decodeEntries(body []byte) ([]Entry, error) {
 			}
 			value = json.RawMessage(strings.TrimSpace(string(value)))
 			if len(value) == 0 || string(value) == "null" {
-				return []Entry{}, nil
+				return nil, errors.New("白名单列表字段不是数组")
 			}
 			if value[0] == '[' {
 				return decodeEntryArray(value)
@@ -131,7 +129,7 @@ func decodeEntries(body []byte) ([]Entry, error) {
 					if nestedValue, ok := nested[nestedKey]; ok {
 						nestedValue = json.RawMessage(strings.TrimSpace(string(nestedValue)))
 						if len(nestedValue) == 0 || string(nestedValue) == "null" {
-							return []Entry{}, nil
+							return nil, errors.New("白名单列表字段不是数组")
 						}
 						if nestedValue[0] == '[' {
 							return decodeEntryArray(nestedValue)
@@ -160,12 +158,24 @@ func decodeEntryArray(raw json.RawMessage) ([]Entry, error) {
 	for _, value := range values {
 		if entry, ok := decodeEntry(value); ok {
 			out = append(out, entry)
+		} else {
+			return nil, errors.New("白名单条目格式无效")
 		}
 	}
 	return out, nil
 }
 
 func decodeEntry(value entryWire) (Entry, bool) {
+	for key, raw := range value {
+		for _, field := range []string{"ip", "memo", "meno", "remark"} {
+			if strings.EqualFold(key, field) {
+				var text string
+				if string(raw) == "null" || json.Unmarshal(raw, &text) != nil {
+					return Entry{}, false
+				}
+			}
+		}
+	}
 	ip := entryString(value, "ip")
 	if ip == "" {
 		return Entry{}, false
@@ -199,8 +209,8 @@ func (c *Client) Add(ctx context.Context, ip, memo string) error {
 	if len(memo) > 80 || strings.ContainsFunc(memo, func(r rune) bool { return r == '\r' || r == '\n' || r == '\x00' }) {
 		return errors.New("白名单备注无效")
 	}
-	_, err := c.get(ctx, "add", map[string]string{"ip": ip, "meno": memo})
-	return err
+	body, err := c.get(ctx, "add", map[string]string{"ip": ip, "meno": memo})
+	return mutationAcknowledged(body, err)
 }
 
 func (c *Client) Delete(ctx context.Context, ip string) error {
@@ -210,8 +220,20 @@ func (c *Client) Delete(ctx context.Context, ip string) error {
 	if !ValidIPv4(ip) {
 		return errors.New("白名单 IP 无效")
 	}
-	_, err := c.get(ctx, "del", map[string]string{"ip": ip})
-	return err
+	body, err := c.get(ctx, "del", map[string]string{"ip": ip})
+	return mutationAcknowledged(body, err)
+}
+
+// 只接受完整、明确的成功字面量；任意 2xx、空响应或错误正文都不是完成证据。
+// 该响应还必须与调用方的后续列表核验结合，单独不能解除操作屏障。
+func mutationAcknowledged(body []byte, err error) error {
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(body)) != "ok" {
+		return errors.New("谐趣白名单操作响应未明确确认完成")
+	}
+	return nil
 }
 
 func (c *Client) get(ctx context.Context, act string, extra map[string]string) ([]byte, error) {
@@ -219,8 +241,8 @@ func (c *Client) get(ctx context.Context, act string, extra map[string]string) (
 		return nil, errors.New("谐趣白名单配置不完整")
 	}
 	u, err := url.Parse(c.BaseURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, errors.New("谐趣白名单接口地址无效")
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return nil, errors.New("谐趣白名单接口必须使用证书验证有效的 HTTPS 地址")
 	}
 	q := u.Query()
 	q.Set("uid", c.UID)
@@ -241,7 +263,18 @@ func (c *Client) get(ctx context.Context, act string, extra map[string]string) (
 	if client == nil {
 		client = DirectHTTPClient()
 	}
-	resp, err := client.Do(req)
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	tr, ok := transport.(*http.Transport)
+	if !ok || tr.DialTLS != nil || tr.DialTLSContext != nil || (tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify) {
+		return nil, errors.New("谐趣白名单传输必须验证 TLS 证书")
+	}
+	// 不修改调用者客户端，也不允许其重定向策略把凭据转发到其他地址。
+	safeClient := *client
+	safeClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := safeClient.Do(req)
 	if err != nil {
 		return nil, errors.New("谐趣白名单接口连接失败")
 	}

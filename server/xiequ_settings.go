@@ -29,7 +29,7 @@ func xiequSettingsDTO(config db.XiequConfig, state db.XiequWhitelistState) map[s
 		"quota_hint":                xiequQuotaMessage,
 		"auto_refresh_on_proxy_use": true,
 		"state": map[string]any{
-			"managed_ips":     state.ManagedIPs,
+			"managed_ips":     append([]string{}, state.ManagedIPs...),
 			"last_ip":         state.LastIP,
 			"last_status":     state.LastStatus,
 			"last_error":      state.LastError,
@@ -91,6 +91,10 @@ func (s *Server) setXiequSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	config, err := s.m.pg.SetXiequConfig(r.Context(), patch)
+	if errors.Is(err, db.ErrXiequStateUnreadable) {
+		writeErr(w, 500, "谐趣白名单状态读取失败，请检查存储")
+		return
+	}
 	if errors.Is(err, db.ErrXiequConfig) {
 		writeErr(w, 400, err.Error())
 		return
@@ -101,7 +105,8 @@ func (s *Server) setXiequSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	state, stateErr := s.m.pg.XiequWhitelistState()
 	if stateErr != nil {
-		state = db.XiequWhitelistState{}
+		writeErr(w, 500, "谐趣白名单状态读取失败，请检查存储")
+		return
 	}
 	writeJSON(w, 200, xiequSettingsDTO(config, state))
 }

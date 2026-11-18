@@ -49,6 +49,10 @@ func (d *DB) AcquireIdleTaskProxyActivity(taskID int64) error {
 }
 
 func (d *DB) acquireTaskProxyActivity(taskID int64, requireIdle bool) error {
+	if err := d.beginOperationAdmission(); err != nil {
+		return err
+	}
+	defer d.endOperationAdmission()
 	if taskID <= 0 {
 		return ErrProxyUnavailable
 	}
@@ -284,7 +288,11 @@ func (d *DB) MigrateLegacyProxy() error {
 const postgresLifecycleTimeout = 20 * time.Second
 
 func (d *DB) withProxyLifecycle(fn func(*sql.Tx) error) error {
-	ctx, cancel := context.WithTimeout(context.Background(), postgresLifecycleTimeout)
+	return d.withProxyLifecycleContext(context.Background(), fn)
+}
+
+func (d *DB) withProxyLifecycleContext(parent context.Context, fn func(*sql.Tx) error) error {
+	ctx, cancel := context.WithTimeout(parent, postgresLifecycleTimeout)
 	defer cancel()
 	conn, err := d.Conn(ctx)
 	if err != nil {

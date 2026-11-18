@@ -118,7 +118,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { api } from "@/lib/api";
+import { api, RequestTimeoutError, TASK_LIST_TIMEOUT_MS } from "@/lib/api";
 import { chainValidationError, emptyModelCache, needModels } from "@/lib/llm-selection";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { proxyErrorText, proxySelectable, taskProxyError } from "@/lib/proxy-center";
@@ -460,15 +460,35 @@ export default function TasksPage() {
   // POLL_MS but usually comes back unchanged, and setTasks on an identical payload would
   // re-render the whole page for nothing. Bail out when it matches.
   const lastRef = React.useRef<string>("");
+  // Single-flight guard for the task list. Each request carries a deadline covering headers
+  // and body (TASK_LIST_TIMEOUT_MS), so a stalled request always reaches catch/finally and
+  // releases the guard. requestRef identifies the in-flight request: unmount aborts it and
+  // clears the guard so a stale completion can never touch state or release a newer request.
   const loadingRef = React.useRef(false);
+  const requestRef = React.useRef<{ id: number; controller: AbortController } | null>(null);
+  const requestSeqRef = React.useRef(0);
+  // queuedRef records an explicit refresh (mutation, retry button) that arrived while a
+  // request was in flight; it runs once afterwards instead of overlapping. Polls never queue.
+  const queuedRef = React.useRef(false);
+  const mountedRef = React.useRef(false);
 
-  const load = React.useCallback(() => {
-    if (loadingRef.current) return;
+  const runLoad = React.useCallback((queueIfBusy: boolean) => {
+    if (!mountedRef.current) return;
+    if (loadingRef.current) {
+      if (queueIfBusy) queuedRef.current = true;
+      return;
+    }
     loadingRef.current = true;
+    queuedRef.current = false;
+    const id = ++requestSeqRef.current;
+    const controller = new AbortController();
+    requestRef.current = { id, controller };
+    const current = () => requestRef.current?.id === id;
     setTasksLoading(true);
     api
-      .tasks()
+      .tasks({ signal: controller.signal, timeoutMs: TASK_LIST_TIMEOUT_MS })
       .then((r) => {
+        if (!current()) return;
         const next = r.tasks.map((t) => (t.id === r.active ? { ...t, active: true } : t));
         const sig = JSON.stringify(next);
         if (sig !== lastRef.current) {
@@ -479,13 +499,27 @@ export default function TasksPage() {
         setTasksError("");
       })
       .catch((error: unknown) => {
+        if (!current()) return;
+        if (error instanceof RequestTimeoutError) {
+          setTasksError("任务列表请求超时，将在下次轮询时自动重试");
+          return;
+        }
         setTasksError(error instanceof Error && error.message ? error.message : "任务列表暂时无法加载");
       })
       .finally(() => {
+        if (!current()) return;
+        requestRef.current = null;
         loadingRef.current = false;
         setTasksLoading(false);
+        if (queuedRef.current) {
+          queuedRef.current = false;
+          runLoad(true);
+        }
       });
   }, []);
+
+  const load = React.useCallback(() => runLoad(true), [runLoad]);
+  const pollLoad = React.useCallback(() => runLoad(false), [runLoad]);
 
   const loadCategories = React.useCallback(() => {
     api
@@ -500,11 +534,20 @@ export default function TasksPage() {
   }, []);
 
   React.useEffect(() => {
+    mountedRef.current = true;
     load();
     loadCategories();
-    const i = setInterval(load, POLL_MS);
-    return () => clearInterval(i);
-  }, [load, loadCategories]);
+    const i = setInterval(pollLoad, POLL_MS);
+    return () => {
+      clearInterval(i);
+      mountedRef.current = false;
+      queuedRef.current = false;
+      const inflight = requestRef.current;
+      requestRef.current = null;
+      loadingRef.current = false;
+      inflight?.controller.abort();
+    };
+  }, [load, pollLoad, loadCategories]);
 
   const refreshCategoriesAndTasks = React.useCallback(() => {
     lastRef.current = "";

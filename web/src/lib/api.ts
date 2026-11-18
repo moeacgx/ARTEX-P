@@ -174,6 +174,72 @@ export async function http<T>(path: string, init?: RequestInit, acceptedIsPendin
   return r.json();
 }
 
+// RequestTimeoutError marks a request that missed its explicit deadline. Callers can tell it
+// apart from a caller-initiated abort (unmount/cancel), which rejects with the abort reason.
+export class RequestTimeoutError extends Error {
+  constructor(
+    public path: string,
+    public timeoutMs: number,
+  ) {
+    super(`请求超时（${Math.round(timeoutMs / 1000)} 秒未完成）`);
+    this.name = "RequestTimeoutError";
+  }
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("请求已取消", "AbortError");
+}
+
+// httpWithDeadline is an opt-in bounded variant of http: one deadline covers connecting,
+// waiting for headers and reading/parsing the body. The deadline aborts the underlying
+// fetch (which also cancels a pending body read) and independently rejects the returned
+// promise, so the caller's catch/finally always runs even if a fetch implementation
+// ignores the signal. Plain http() keeps its existing unbounded behaviour.
+export function httpWithDeadline<T>(
+  path: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+  acceptedIsPending = false,
+): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return Promise.reject(new Error(`无效的请求期限：${timeoutMs}`));
+  }
+  const outer = init?.signal ?? undefined;
+  if (outer?.aborted) return Promise.reject(abortReason(outer));
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onOuterAbort: (() => void) | undefined;
+  const stopped = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new RequestTimeoutError(path, timeoutMs);
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+    if (outer) {
+      onOuterAbort = () => {
+        const reason = abortReason(outer);
+        controller.abort(reason);
+        reject(reason);
+      };
+      outer.addEventListener("abort", onOuterAbort, { once: true });
+    }
+  });
+  // Swallow the rejection when the request wins the race, so it never surfaces as unhandled.
+  stopped.catch(() => {
+    // The race below observes this rejection; nothing else to do here.
+  });
+  return Promise.race([http<T>(path, { ...init, signal: controller.signal }, acceptedIsPending), stopped]).finally(
+    () => {
+      clearTimeout(timer);
+      if (outer && onOuterAbort) outer.removeEventListener("abort", onOuterAbort);
+    },
+  );
+}
+
+// TASK_LIST_TIMEOUT_MS bounds one task-list request (headers + body). It is well above the
+// normal response time but short enough that a stalled request cannot block polling for long.
+export const TASK_LIST_TIMEOUT_MS = 15_000;
+
 // sseUrl builds a URL for Server-Sent Events streams.
 //
 // Production (static export / Docker): the Go backend serves the web UI *and* the
@@ -289,8 +355,13 @@ export const api = {
   mcpAccessCalls: (query: URLSearchParams) => get<MCPAccessCalls>(`/mcp-access/calls?${query}`),
 
   // ---- tasks ----
-  tasks: () =>
-    get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
+  // tasks: without options this is the original unbounded GET; the task list poller passes
+  // a signal and timeoutMs so a stalled request cannot hold its single-flight guard forever.
+  tasks: (options?: { signal?: AbortSignal; timeoutMs?: number }) =>
+    (options?.timeoutMs !== undefined
+      ? httpWithDeadline<{ tasks: Task[]; active: string }>("/tasks", { signal: options.signal }, options.timeoutMs)
+      : http<{ tasks: Task[]; active: string }>("/tasks", options?.signal ? { signal: options.signal } : undefined)
+    ).then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
   task: (id: string) => http<Task>(`/tasks/${encodeURIComponent(id)}`, { cache: "no-store" }),
   updateTaskProxy: (id: string, input: TaskProxyInput) => {
     if (!validProxyRevision(input.expected_revision)) throw new Error("任务代理版本缺失或无效，请重新读取任务");

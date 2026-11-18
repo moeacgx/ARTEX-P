@@ -504,6 +504,7 @@ export interface TaskNode {
   source_task_id?: string;
   inherited?: boolean;
   delete_reason?: string; // 意图假删除(state='deleted')时的删除原因
+  blocked_reason?: string; // 意图 blocked/exhausted 时的终止原因代码；历史数据为空
 }
 
 // 播报板一页:按创建顺序分页的节点 + 这一页涉及的边 + 边另一端的节点(refs,按 id 索引),
@@ -948,6 +949,7 @@ export interface Session {
   intent_id?: string;
   source_task_id?: string;
   inherited?: boolean;
+  blocked_reason?: string; // worker 会话对应意图 blocked/exhausted 时的终止原因代码；历史数据为空
   seg?: number; // main-agent session: which conversation segment (0 = original)
 }
 
@@ -1019,7 +1021,7 @@ export interface Settings {
   // MITM 上游；关闭捕获时直接注入 agent 的 bash/WebFetch。空=直连。
   global_proxy?: string;
   python_interpreter?: string; // 自定义脚本工具的 python 解释器路径(空=运行时检测)
-  workers?: number; // 并发工作 agent 数(默认3)；对之后启动的任务生效
+  workers?: number; // 并发工作 agent 数(默认3)；运行中的任务会即时扩缩容
   // 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
   task_concurrency_enabled?: boolean; // 默认 false
   task_concurrency_limit?: number; // 开启后默认 5

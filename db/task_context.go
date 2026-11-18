@@ -563,6 +563,22 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, reason, id, s.expID)
 	return err
 }
 
+// ReopenIntentsByBlockedReasons 重开 blocked 且原因属于给定集合的意图（一次 UPDATE）。
+// 旧的单值方法保持不变，额度语义仍然严格。
+func (s *ExplorationStore) ReopenIntentsByBlockedReasons(reasons []string) (int64, error) {
+	if len(reasons) == 0 {
+		return 0, nil
+	}
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='open', blocked_reason=NULL, completed_at=NULL
+WHERE exploration_id=$1 AND kind='intent' AND state='blocked' AND blocked_reason = ANY($2::text[])`, s.expID, reasons)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 func (s *ExplorationStore) ReopenIntentsByBlockedReason(reason string) (int64, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes
 SET state='open', blocked_reason=NULL, completed_at=NULL

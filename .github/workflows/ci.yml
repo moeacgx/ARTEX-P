@@ -182,3 +182,4 @@ jobs:
           timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/catalog-api.test.mjs
           timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/warp-health-api.test.mjs src/lib/proxy-center.test.mjs src/lib/warp-create-intent.test.mjs src/lib/warp-create-api.test.mjs src/lib/proxy-warp-register.test.mjs
           timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/update-flow.test.mjs src/lib/update-api.test.mjs src/lib/fofa-settings.test.mjs src/lib/skill-download-api.test.mjs src/lib/chat-mentions.test.mjs src/lib/chat-mentions-api.test.mjs
+          timeout 60s node --import ./scripts/test-api-loader.mjs --test --test-timeout=60000 src/lib/task-list-deadline.test.mjs src/lib/xiequ-api.test.mjs

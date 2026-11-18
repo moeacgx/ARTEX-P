@@ -147,6 +147,24 @@ func TestPlannerPGRestartWakesWithActiveIntent(t *testing.T) {
 	}
 }
 
+func TestPlannerPGRestartSkipsCreatedTask(t *testing.T) {
+	previous := newTriggerRegressionServer(t)
+	task := plannerRestartTask(t, previous, db.TaskCreateOptions{ProxyMode: db.TaskProxyModeDirect})
+	if _, err := previous.m.pg.Exec(`UPDATE tasks SET status='created' WHERE id=$1`, mustPlannerID(t, task.ID)); err != nil {
+		t.Fatal(err)
+	}
+	s := restartedPlannerServer(t, previous)
+	requests := make(chan llm.CompletionRequest, 4)
+	planner := restartCountingPlanner(t, s, requests)
+	s.engine.SetAuthoritativeAgentResolver(func(*Task) (*agent.Planner, *agent.Worker) { return planner, new(agent.Worker) })
+	s.restoreTaskRuntimes()
+	select {
+	case <-requests:
+		t.Fatal("restart admitted a created task without an explicit run request")
+	case <-time.After(time.Second):
+	}
+}
+
 func TestPlannerPGUnavailableResolverRetriesWithoutNewNotification(t *testing.T) {
 	previous := newTriggerRegressionServer(t)
 	task := plannerRestartTask(t, previous, db.TaskCreateOptions{ProxyMode: db.TaskProxyModeDirect})

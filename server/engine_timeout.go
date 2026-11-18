@@ -118,8 +118,9 @@ func (e *Engine) beginTaskOperationState(ctx context.Context, taskID string, adm
 		if err != nil {
 			return taskOperationAdmissionError{cause: err}
 		}
-		state, err := e.m.pg.AcquireTaskOperation(id)
+		state, err := e.m.pg.AcquireTaskOperationContext(ctx, id)
 		if err != nil {
+			// 数据库准入层按本次 token 核实并回收歧义提交；这里不能匿名释放他人引用。
 			log.Printf("[proxy] 任务 %s 操作准入失败: %v", taskID, err)
 			return taskOperationAdmissionError{cause: err}
 		}

@@ -12,7 +12,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/stdlib"
 )
 
 var (
@@ -270,6 +269,10 @@ func ReleaseWarpHealthActivityTx(ctx context.Context, tx *sql.Tx, token string) 
 	return err
 }
 func (d *DB) AcquireWarpHealthActivity(ctx context.Context, id int64, token string) error {
+	if err := d.beginOperationAdmission(); err != nil {
+		return err
+	}
+	defer d.endOperationAdmission()
 	return d.withWarpHealth(ctx, func(tx *sql.Tx) error { return AcquireWarpHealthActivityTx(ctx, tx, id, token) })
 }
 func (d *DB) ReleaseWarpHealthActivity(ctx context.Context, token string) error {
@@ -652,18 +655,18 @@ func (d *DB) TryWarpHealthExecution(ctx context.Context, id int64) (*WarpHealthE
 	}
 	var config *pgx.ConnConfig
 	err = source.Raw(func(raw any) error {
-		conn, ok := raw.(*stdlib.Conn)
+		cfg, ok := postgresConfigFromRaw(raw)
 		if !ok {
 			return ErrWarpHealthBlocked
 		}
-		config = conn.Conn().Config().Copy()
+		config = cfg
 		return nil
 	})
 	_ = source.Close()
 	if err != nil {
 		return nil, err
 	}
-	pool := sql.OpenDB(stdlib.GetConnector(*config))
+	pool := openPostgresDBConfig(*config)
 	pool.SetMaxOpenConns(1)
 	pool.SetMaxIdleConns(0)
 	conn, err := pool.Conn(ctx)

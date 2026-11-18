@@ -70,10 +70,12 @@ type Task struct {
 	OutputPath  string
 
 	// internal, guarded by Manager.mu
-	backgrounded bool // surfaced as a background task: notify on exit
-	notified     bool // completion already enqueued into pending
-	oversize     bool // terminated by the size watchdog
+	backgrounded bool       // surfaced as a background task: notify on exit
+	notified     bool       // completion already enqueued into pending
+	oversize     bool       // terminated by the size watchdog
+	stopStatus   TaskStatus // 终止请求不能提前成为终态
 	cmd          *exec.Cmd
+	tree         *processTree
 	done         chan struct{} // closed by watch when the process exits
 }
 
@@ -237,12 +239,22 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	}
 	cmd.Stdout = f
 	cmd.Stderr = f
-	setDetached(cmd)
-
-	if err := cmd.Start(); err != nil {
+	tree, err := prepareProcessTree(cmd)
+	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(outPath)
 		return nil, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		tree.close()
+		_ = f.Close()
+		_ = os.Remove(outPath)
+		return nil, err
+	}
+	attachErr := tree.attach(cmd.Process)
+	if attachErr != nil {
+		tree.kill()
 	}
 
 	t := &Task{
@@ -254,7 +266,11 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 		StartTime:   time.Now(),
 		OutputPath:  outPath,
 		cmd:         cmd,
+		tree:        tree,
 		done:        make(chan struct{}),
+	}
+	if attachErr != nil {
+		t.stopStatus = TaskFailed
 	}
 	m.mu.Lock()
 	m.tasks[id] = t
@@ -262,6 +278,10 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	m.mu.Unlock()
 
 	go m.watch(t, f)
+	// 失败的启动也由 Manager 保留，直到所有已启动进程被真正回收。
+	if attachErr != nil {
+		return nil, attachErr
+	}
 	return t, nil
 }
 
@@ -271,11 +291,15 @@ func (m *Manager) watch(t *Task, f *os.File) {
 	go func() { defer close(sizeDone); m.watchSize(t, stop) }()
 
 	err := t.cmd.Wait()
+	awaitProcessTree(t.tree)
 	close(stop)
 	<-sizeDone
 	_ = f.Close()
 
 	m.mu.Lock()
+	if t.stopStatus != "" {
+		t.Status = t.stopStatus
+	}
 	if t.Status == TaskRunning { // not pre-empted by Kill / watchdog
 		if err == nil {
 			t.Status = TaskCompleted
@@ -295,6 +319,25 @@ func (m *Manager) watch(t *Task, f *os.File) {
 	}
 	m.mu.Unlock()
 	close(t.done) // output file与状态全部收尾后，才对严格清理方宣告真退出。
+}
+
+// 失败时保持输出、内核归属句柄和 done；调用方通过 context 有界返回未完成。
+func awaitProcessTree(tree *processTree) {
+	if tree == nil {
+		return
+	}
+	tree.kill()
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := tree.wait(ctx)
+		cancel()
+		if err == nil {
+			tree.close()
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+		tree.kill()
+	}
 }
 
 // watchSize terminates a task whose output file grows past the cap.
@@ -322,11 +365,14 @@ func (m *Manager) terminate(t *Task, status TaskStatus, oversize bool) {
 		m.mu.Unlock()
 		return
 	}
-	t.Status = status
+	t.stopStatus = status
 	t.oversize = oversize
 	proc := t.cmd.Process
+	tree := t.tree
 	m.mu.Unlock()
-	if proc != nil {
+	if tree != nil {
+		tree.kill()
+	} else if proc != nil {
 		treeKill(proc)
 	}
 }
@@ -369,6 +415,14 @@ func (m *Manager) Forget(id string) {
 	m.mu.Lock()
 	t, ok := m.tasks[id]
 	if ok {
+		select {
+		case <-t.done:
+		default:
+			m.mu.Unlock()
+			return
+		}
+	}
+	if ok {
 		delete(m.tasks, id)
 		for i, n := range m.order {
 			if n == id {
@@ -405,7 +459,9 @@ func (m *Manager) RunForeground(ctx context.Context, spec SpawnSpec, timeout tim
 		return t, false, "", nil
 	case <-ctx.Done():
 		m.Kill(t.ID)
-		<-t.done
+		if _, done := m.Wait(context.Background(), t.ID, 5*time.Second); !done {
+			return t, false, "", fmt.Errorf("%w；任务子孙退出尚未确认", ctx.Err())
+		}
 		return t, false, "", ctx.Err()
 	}
 }
@@ -524,34 +580,7 @@ func (m *Manager) Cleanup() {
 
 // CleanupContext 只有进程 Wait 及交互 shell 退出后才返回成功；取消不等于退出。
 func (m *Manager) CleanupContext(ctx context.Context) error {
-	if m == nil {
-		return nil
-	}
-	m.mu.Lock()
-	done := make([]<-chan struct{}, 0, len(m.tasks))
-	for _, task := range m.tasks {
-		done = append(done, task.done)
-	}
-	m.mu.Unlock()
-	m.sessMu.Lock()
-	for _, session := range m.sessions {
-		done = append(done, session.done)
-	}
-	m.sessMu.Unlock()
-	m.KillAll()
-	m.closeAllSessions()
-	if m.rootCancel != nil {
-		m.rootCancel()
-	}
-	for _, exited := range done {
-		select {
-		case <-exited:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>
-	return nil
+	return m.CleanupAndWait(ctx)
 }
 
 // tailFile reads the last maxBytes of a file, prefixing a notice when earlier

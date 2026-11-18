@@ -497,7 +497,10 @@ func TestSideRestoredWorkerRuntimePublishesNewCheckpoint(t *testing.T) {
 	}
 	id, _ := strconv.ParseInt(task.ID, 10, 64)
 	t.Cleanup(func() { _ = f.m.pg.DeleteTask(id) })
-	if err := f.m.pg.SetPaused(id, true); err != nil {
+	if err := f.m.SetTaskStatus(task.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.m.SetTaskPaused(task.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	iid, err := task.Store.AddNode(db.KindIntent, map[string]any{"summary": "restored worker"}, 1, "paused", "planner", nil)

@@ -28,6 +28,10 @@ type PlannerRunLease struct {
 // AcquirePlannerRun 在现有生命周期事务锁下串行化 Planner 准入与暂停/继续变更，
 // 随后持有独立会话锁直到真实退出。
 func (d *DB) AcquirePlannerRun(ctx context.Context, id int64, allowPaused bool) (*PlannerRunLease, error) {
+	if err := d.beginOperationAdmission(); err != nil {
+		return nil, err
+	}
+	defer d.endOperationAdmission()
 	conn, err := d.taskOperationLockConn(ctx)
 	if err != nil {
 		return nil, err

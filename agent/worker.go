@@ -385,7 +385,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	started := time.Now()
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
-	ctx, cancel := workerRunContext(ctx, maxDur)
+	hardCause := errWorkerHardDeadline
+	if clamped && tc.DeadlineUnix > 0 {
+		hardCause = errWorkerTaskDeadline // 夹逼生效：截止来自任务，而非 agents.run_seconds
+	}
+	ctx, cancel := workerRunContextCause(ctx, maxDur, hardCause)
 	defer cancel()
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
@@ -575,5 +579,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// SDK 的正常预算先尝试收尾；心跳空转或收尾卡住最终由外层硬截止打断。
 	_, reason, err = captureRunSession(ctx, s, input, emitWrap)
 	reason, err = workerTerminal(ctx, reason, err)
+	if reason == harness.ReasonTimeout && err == nil && clamped && tc.DeadlineUnix > 0 {
+		err = errWorkerTaskDeadline // 回合边界触发的时限来自任务绝对截止，而非 agents.run_seconds
+	}
 	return reason, tsx.Writes(), err
 }
